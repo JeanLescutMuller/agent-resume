@@ -35,7 +35,7 @@ The hub goes first: install.sh rewrites the spoke's `remote_index_dir` from `~/o
 | remove old links | every link in `~/.local/bin/`, `~/.claude/skills/`, `~/.agents/skills/` that points into `~/opt/agent-session-manager/` |
 | move data | `data/indexes/`, `data/settings.json`, `data/sync-log.jsonl` → `~/opt/agent-resume/data/` (only if not already there; else left, with a WARN) |
 | remove old code | everything in `~/opt/agent-session-manager/` but `data/` |
-| keep | `~/opt/agent-session-manager/data/lifecycles/`, `close-log.jsonl`, `close-tombstones/`: nothing reads them now; printed as kept |
+| keep | `~/opt/agent-session-manager/data/lifecycles/`, `close-log.jsonl`, `close-tombstones/`: nothing reads them now; printed as kept (2026-11-07: archived to `~/opt/agent-resume/data/archive/2026_11_07_agent-session-manager_data_<machine>.tar.gz`, then removed, with the user's yes) |
 | settings | string values `…/opt/agent-session-manager/…` → `…/opt/agent-resume/…`; `lifecycle_dir` removed |
 | hooks | asm's two `lifecycle_generation.sh` groups removed, the `session_start.py` and `session_end.sh` groups added; other groups untouched |
 | Codex plugin | `agent-resume@agent-resume-local` added through `~/opt/agent-resume/codex-marketplace` (if Codex is detected) |
@@ -61,7 +61,7 @@ Do **not** run `ares reindex --force` right after the move: index entries of ses
 |---|---|
 | rename the GitHub repo and `~/dev/agent-session-manager` → `agent-resume` | the deploy step |
 | job-runner dashboard: remove the job `agent-session-manager` (its conf on the VM) once `agent-resume` reports | job-runner |
-| delete `~/opt/agent-session-manager/data/` (lifecycles, close files) once checked; agent-auto-close may want `close-log.jsonl` | the user |
+| ~~delete `~/opt/agent-session-manager/data/` (lifecycles, close files) once checked~~ done 2026-11-07: archived (`~/opt/agent-resume/data/archive/`, `close-log.jsonl` included), then removed | the user |
 | my-setup's skill `config-ownership`: the `hooks` line still names agent-session-manager's SessionStart/SessionEnd groups; now agent-resume owns one SessionStart group (`opt/agent-resume/session_start.py`) and one SessionEnd group (`opt/agent-resume/session_end.sh`) | my-setup |
 | other references to `asm` / `~/opt/agent-session-manager` (my-setup's `terminal_snapshot.py` is removed by its own branch; the Todoist project name) | each repo |
 
