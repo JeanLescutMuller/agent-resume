@@ -1,13 +1,12 @@
 {
   "local_projects_dir": "~/.claude/projects",
-  "local_index_dir": "~/opt/agent-session-manager/data/indexes",
-  "lifecycle_dir": "~/opt/agent-session-manager/data/lifecycles",
+  "local_index_dir": "~/opt/agent-resume/data/indexes",
   "ignore_path_substrings": [],
   "sync_stale_warning_hours": 24,
   "remote_ssh_host": "",
   "remote_ssh_user": "",
   "remote_ssh_port": "22",
-  "remote_index_dir": "~/opt/agent-session-manager/data/indexes",
+  "remote_index_dir": "~/opt/agent-resume/data/indexes",
   "codex_sessions_dir": "~/.codex/sessions",
   "codex_session_index_file": "~/.codex/session_index.jsonl",
   "codex_enabled": null

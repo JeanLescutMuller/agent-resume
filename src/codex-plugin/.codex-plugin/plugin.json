@@ -1,14 +1,14 @@
 {
-  "name": "asm",
-  "version": "1.0.0",
-  "description": "Session lifecycle tracking for agent-session-manager (asm).",
+  "name": "agent-resume",
+  "version": "2.0.0",
+  "description": "agent-resume's SessionStart and SessionEnd hooks for Codex: resume warnings, re-index and push of the ended session.",
   "author": {
     "name": "Jean Lescut-Muller"
   },
   "interface": {
-    "displayName": "ASM Lifecycle",
-    "shortDescription": "Session lifecycle tracking for asm",
-    "longDescription": "Writes session lifecycle sidecars (start/resume/end events, hostname, cwd, tmux context) that asm uses for cross-directory and cross-machine session search, resume, and monitoring.",
+    "displayName": "agent-resume",
+    "shortDescription": "Resume warnings and index refresh for ares",
+    "longDescription": "SessionStart: warns when the session is already running in another process, was last run on another machine, or in another folder (read from agent-tracker's lifecycle). SessionEnd: re-indexes the ended session for `ares resume` and pushes its index entry to the hub.",
     "developerName": "Jean Lescut-Muller",
     "category": "Productivity",
     "capabilities": [
