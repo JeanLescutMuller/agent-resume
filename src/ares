@@ -1779,7 +1779,10 @@ def iterm_script(l_sessions: List[str]) -> str:
     for i, name in enumerate(l_sessions):
         if i:
             l_osa.append("  tell w to create tab with default profile")
-        cmd = f"tmux attach -t {shlex.quote('=' + name)}"
+        # Always quoted: in zsh an unquoted word starting with '=' is "the path of that command" (=name -> "zsh: name
+        # not found"), and shlex.quote leaves '=name' bare (2026-11-07, the first real ares tmux).
+        target = "=" + name
+        cmd = "tmux attach -t '" + target.replace("'", "'\\''") + "'"
         l_osa.append(f"  tell current session of w to write text {_applescript_str(cmd)}")
     return "\n".join(l_osa + ["end tell"])
 
