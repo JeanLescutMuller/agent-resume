@@ -111,4 +111,16 @@ session("I", boot=OLDER, ts=OLDER + 9000, tmux=("old", 0, "old", "%1", 0, L_LOGS
 session("J", boot=NOW_BOOT, ts=NOW_BOOT + 100, tmux=("now", 0, "now", "%1", 0, L_LOGS))
 session("K", agent="codex", ts=T_END - 10, tmux=("codexs", 0, "c", "%11", 0, L_LOGS))
 session("M", last_seen=False, tmux=("nols", 0, "n", "%12", 0, L_LOGS))
+# One Codex rollout (not in agent-tracker's files): for the codex backend checks of smoke_test.sh
+CODEX_UUID = "0c0d0e0f-0000-4000-8000-000000000099"
+proj = os.path.join(HOME, "dev", "codex_proj")
+os.makedirs(proj, exist_ok=True)
+rollout = os.path.join(HOME, ".codex", "sessions", "2026", "11", "05", f"rollout-2026-11-05T10-00-00-{CODEX_UUID}.jsonl")
+os.makedirs(os.path.dirname(rollout), exist_ok=True)
+with open(rollout, "w") as f:
+    f.write(json.dumps({"timestamp": dt(T_END - 50), "type": "session_meta",
+                        "payload": {"id": CODEX_UUID, "cwd": proj, "source": "cli"}}) + "\n")
+    f.write(json.dumps({"timestamp": dt(T_END - 40), "type": "response_item", "payload": {
+        "type": "message", "role": "user", "content": [{"type": "input_text", "text": "codex fixture prompt"}]}}) + "\n")
+d_expected["codex_uuid"] = CODEX_UUID
 print(json.dumps(d_expected))

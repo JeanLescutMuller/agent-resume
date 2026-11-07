@@ -41,7 +41,7 @@ ares is **local-first**: everything it writes lives on local disk, and it works 
 
 - Configure a remote host once in `~/opt/agent-resume/data/settings.json` (`remote_ssh_host`, `remote_ssh_user`, `remote_ssh_port`, `remote_index_dir`).
 - **Hub and spoke, not mesh.** Point every machine's `remote_ssh_host` at whichever one is reliably reachable (a VM with a public IP, typically - not a laptop behind home NAT). That machine (the hub) leaves its own `remote_ssh_host` empty; it never needs to dial out. Every other machine (a spoke) pushes and pulls to the hub.
-- Two triggers keep the hub's copy fresh: (1) `ares resume` opportunistically pulls before searching (rate-limited, hard-capped at a few seconds, never blocks or crashes if you're offline); (2) a scheduled job (`launchd`/`systemd`, every 30 min) reindexes then syncs both directions. (The third one, asm's `SessionEnd` hook pushing the session that just ended, went with that hook on 2026-11-07: a just-ended session reaches the hub within 30 min.)
+- Three independent triggers keep the index fresh: (1) the `SessionEnd` hook (`session_end.sh`) reindexes and pushes the session that just ended, in the background; (2) `ares resume` opportunistically pulls before searching (rate-limited, hard-capped at a few seconds, never blocks or crashes if you're offline); (3) a scheduled job (`launchd`/`systemd`, every 30 min) reindexes then syncs both directions.
 - **Offline-resilient by design**, not by accident: every sync attempt is logged to `~/opt/agent-resume/data/sync-log.jsonl`. `ares resume` reads it and prints a one-line warning if the last successful sync is stale or missing - instead of either crashing when you're offline (a laptop won't always have internet) or silently searching data that's quietly out of date.
 - If no remote is configured, `ares-sync` exits silently. Nothing about local indexing or resume depends on it.
 
@@ -103,7 +103,7 @@ The JSON index stores structured metadata for every session: conversation messag
 | Fork (`/rename` on resume) | ✅ | ✅ `codex fork` |
 | Cross-machine sync | ✅ | ✅ |
 | Session state (from agent-tracker) | ✅ | ✅ if agent-tracker records Codex |
-| Duplicate warning (SessionStart hook) | ✅ | ❌ (no hook registered for Codex) |
+| Resume warnings (SessionStart) and re-index + push (SessionEnd) | ✅ native hooks | ✅ via a `codex plugin` (one-time hook-trust approval on first use) |
 | `ares tmux` (crash restore) | ✅ | ❌ (Claude sessions only) |
 | `/inject-session` skill | ✅ | ✅ |
 
@@ -126,11 +126,16 @@ Codex sessions (`~/.codex/sessions/**/*.jsonl`) feed into the same local index a
 
 Everything is local-first: `ares reindex` and `ares resume` never touch the network by themselves (except the opportunistic pull when a remote is configured). `ares-sync` is a separate, optional, index-only step.
 
-### agent-tracker's files, and the one hook
+### agent-tracker's files, and the two hooks
 
-The facts a transcript lacks (host, tmux pane, start and end) come from agent-tracker (`~/opt/agent-tracker/data/sessions/<uuid>/`), its only writer: `lifecycle.jsonl` (one line per start and end) and `last_seen.json` (where the Claude session runs, rewritten by the statusline). agent-resume reads them; it no longer has a lifecycle hook of its own.
+The facts a transcript lacks (host, tmux pane, start and end) come from agent-tracker (`~/opt/agent-tracker/data/sessions/<uuid>/`), its only writer: `lifecycle.jsonl` (one line per start and end) and `last_seen.json` (where the Claude session runs, rewritten by the statusline). agent-resume reads them; its own hooks record no lifecycle.
 
-Its one hook is `duplicate_warning.py` on SessionStart: when the Claude session you start is already running in another live process (an earlier start line of this machine and boot whose pid is alive with the same start time), it shows an orange banner on the terminal for 3 s (Ctrl+C aborts) and adds the warning to Claude's context. Otherwise it prints nothing.
+Its two hooks, for Claude Code and (through the Codex plugin) Codex:
+
+| Hook | Does |
+|---|---|
+| `session_start.py` (SessionStart) | warns, as asm did, when the session you start is already running in another live process (an earlier start line of this machine and boot whose pid is alive with the same start time), when its previous start ran on another machine, or in another folder: an orange banner on the terminal for 3 s (Ctrl+C aborts) and the warning in the agent's context. Otherwise it prints nothing. |
+| `session_end.sh` (SessionEnd) | prints the ended session's name, id and folder on the terminal, then in the background (2 s later, so agent-tracker's end line is written) `ares reindex --uuid` and `ares-sync --push` of that one session. |
 
 ## Usage
 
@@ -218,10 +223,11 @@ Requires `fzf` and `python3`, and agent-tracker for the session state, the dupli
 | Artifact | Destination |
 |---|---|
 | `ares`, `ares-sync` | `~/opt/agent-resume/bin/`, linked from `~/.local/bin/` as `ares`, `ares-sync` and the aliases `asm`, `asm-sync` |
-| `duplicate_warning.py` (SessionStart hook), `ares-reindex-and-rsync.sh`, `entrypoint.sh` + `entrypoint.conf` (the job), `install.sh`, `uninstall.sh` | `~/opt/agent-resume/` |
+| `session_start.py`, `session_end.sh` (the hooks), `codex-plugin/` + `codex-marketplace/`, `ares-reindex-and-rsync.sh`, `entrypoint.sh` + `entrypoint.conf` (the job), `install.sh`, `uninstall.sh` | `~/opt/agent-resume/` |
 | settings, index, sync log | `~/opt/agent-resume/data/{settings.json,indexes/,sync-log.jsonl}` |
 | `skills/inject-session/` | read-only copy in `~/opt/agent-resume/skills/`, linked from `~/.claude/skills/` and `~/.agents/skills/` |
-| the SessionStart hook group | `~/.claude/settings.json` (install.sh replaces only its own group) |
+| the SessionStart and SessionEnd hook groups | `~/.claude/settings.json` (install.sh replaces only its own groups) |
+| the same two hooks for Codex, if detected | plugin `agent-resume@agent-resume-local` in `~/.codex/config.toml` (`codex plugin marketplace add` / `codex plugin add`, idempotent); Codex asks once to trust its hooks |
 | the job: reindex + rsync every 30 min (job-runner) | `com.jeanlescut.agent-resume`: a LaunchAgent (macOS) or a `systemd --user` timer (Linux); real files in `~/opt/agent-resume/`, links where the OS looks |
 
 ## Settings (`~/opt/agent-resume/data/settings.json`)

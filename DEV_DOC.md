@@ -117,7 +117,7 @@ loop, which previously had no branch for JSON booleans at all.
 | Fork | ✅ | ✅ `codex fork` |
 | `--agent`/`--host`/`--print-cmd` | ✅ | ✅ |
 | Cross-machine sync (index-only) | ✅ | ✅ - same index, agent-agnostic |
-| Lifecycle hooks | ✅ native | ✅ via `codex plugin` (one-time hook-trust approval) |
+| Hooks (since 2026-11-07: resume warnings, re-index + push) | ✅ native | ✅ via `codex plugin` (one-time hook-trust approval) |
 | `/inject-session` | ✅ | ✅ |
 | `asm close` | ✅ | ❌ descoped - no stable public live-session surface (finding #4); fails with an explicit message rather than a misleading generic one, and is unreachable from the interactive picker since `live_only` filtering keys off Claude's `~/.claude/sessions/*.json` exclusively |
 
@@ -176,7 +176,7 @@ The facts absent from transcripts (host, tmux pane, pid, start and end) are reco
 
 | File | Read by | Used for |
 |---|---|---|
-| `lifecycle.jsonl`: `{"ts","event":"start","source","agent","machine","boot_ts","pid","pid_start","pane_id","pane","cwd"}` and `{"ts","event":"end","reason","pid"}` | `read_lifecycle` in `src/ares`, `src/duplicate_warning.py` | `session_state`, hosts, tmux place, folders (R1); the duplicate warning (R6.3); the candidates of `ares tmux` (R4) |
+| `lifecycle.jsonl`: `{"ts","event":"start","source","agent","machine","boot_ts","pid","pid_start","pane_id","pane","cwd"}` and `{"ts","event":"end","reason","pid"}` | `read_lifecycle` in `src/ares`, `src/session_start.py` | `session_state`, hosts, tmux place, folders (R1); the duplicate warning (R6.3); the candidates of `ares tmux` (R4) |
 | `last_seen.json`: where the Claude session runs (tmux session, window index and name, `pane_id`, `window_layout`, `cwd`, `transcript`), `ts`, `boot_ts` | `tmux_plan` in `src/ares` | `ares tmux` (R4) |
 
 Reading rules: a `lifecycle.jsonl` line without its final newline is still being appended and is ignored; a start is **open** while no later end line has its pid (`open_start`), so a resume that starts while the old process ends stays pending; an end line without a pid closes every start before it.
@@ -251,8 +251,10 @@ The window's name and layout come from its newest Claude session's `last_seen.js
 | Component | Type | When invoked |
 |---|---|---|
 | `ares` (`resume`, `tmux`, `reindex`; alias `asm`) | Python script | terminal; `reindex` also scheduled, by `ares-reindex-and-rsync.sh` |
-| `duplicate_warning.py` | Python script | Claude Code SessionStart hook (R6.3) |
-| `ares-sync` (alias `asm-sync`) | shell script | trigger 1: opportunistically at the start of `ares resume`; trigger 2: scheduled, by `ares-reindex-and-rsync.sh`; always a no-op if no remote configured |
+| `session_start.py` | Python script | SessionStart hook, Claude Code and Codex (R6.3) |
+| `session_end.sh` | shell script | SessionEnd hook, Claude Code and Codex (R6.3) |
+| `codex-plugin/` | Codex plugin | registered as `agent-resume@agent-resume-local` through a local marketplace (`codex plugin`); wires Codex's SessionStart/SessionEnd to the two scripts above |
+| `ares-sync` (alias `asm-sync`) | shell script | trigger 1: backgrounded by `session_end.sh`; trigger 2: opportunistically at the start of `ares resume`; trigger 3: scheduled, by `ares-reindex-and-rsync.sh`; always a no-op if no remote configured |
 | `ares-reindex-and-rsync.sh` | shell script | scheduled through job-runner (`entrypoint.sh`, every 30 min) - runs `ares reindex` then unconditionally `ares-sync` |
 | `~/.claude/skills/inject-session`, `~/.agents/skills/inject-session` (links to the read-only copy `~/opt/agent-resume/skills/inject-session/`) | skill | inside an active Claude Code or Codex session |
 
@@ -265,9 +267,21 @@ Scans all local session files and writes the local JSON index. Purely local - ne
 - Writes are atomic (temp file, then rename) to avoid partial reads by `ares resume`
 - The same two steps (`plan_reindex`, `run_reindex`) serve the search-time refresh (R6.5)
 
-### R6.3: `duplicate_warning.py` (SessionStart)
+### R6.3: the hooks: `session_start.py` (SessionStart), `session_end.sh` (SessionEnd)
 
-The only hook of agent-resume. It reads agent-tracker's `lifecycle.jsonl` of the starting Claude session and warns when an earlier start line of this machine and this boot has a pid that is still alive with the same start time (`ps lstart` vs `pid_start`, 2 s slack) and is not this session's own process (an ancestor of the hook). Then, and only then, it prints an orange banner on `/dev/tty` (3 s to press Ctrl+C) and the same text as `hookSpecificOutput.additionalContext` on stdout. Otherwise it prints nothing. It never writes and always exits 0. asm's former cross-machine and changed-folder warnings were dropped with its lifecycle hook.
+Kept from asm's lifecycle hook (only the recording of the lifecycle moved to agent-tracker); both run for Claude Code (`~/.claude/settings.json`) and Codex (the plugin), never write a lifecycle, and always exit 0.
+
+`session_start.py` reads agent-tracker's `lifecycle.jsonl` of the starting session and warns:
+
+| Warning | When |
+|---|---|
+| DUPLICATE SESSION | an earlier start line of this machine and this boot has a pid still alive with the same start time (`ps lstart` vs `pid_start`, 2 s slack) that is not this session's own process (an ancestor of the hook) |
+| Cross-machine resume | the previous start (the newest start line of another process: agent-tracker's own hook may already have written this one) ran on another `machine` |
+| Working directory changed | the previous start's `cwd` differs from this one by realpath (and says so when it does not exist here) |
+
+Then, and only then, it prints an orange banner on `/dev/tty` (3 s to press Ctrl+C) and the same text as `hookSpecificOutput.additionalContext` on stdout. Otherwise it prints nothing.
+
+`session_end.sh` prints the ended session's name, id and folder on `/dev/tty` (nothing on stdout), then in the background, after `$ARES_END_DELAY` s (default 2: agent-tracker's end line comes first), `ares reindex --uuid <uuid>` and `ares-sync --push <uuid>` (trigger 1 of R6.4).
 
 ### R6.4: `ares-sync` (optional, cross-machine, index-only)
 
@@ -281,7 +295,8 @@ Reconciles **only** `~/opt/agent-resume/data/indexes/*.json` between the local m
 
 **Offline resilience.** Every real (non-`--check`) run that reaches the SSH reachability check appends one line to `~/opt/agent-resume/data/sync-log.jsonl`: `{"timestamp": ..., "outcome": "success", "synced": N, "errors": N}` or `{"timestamp": ..., "outcome": "unreachable"}`. `ares-sync` always exits cleanly either way. `ares resume` (R6.5) reads this log to warn when the local index hasn't synced in a while.
 
-**Two triggers** (the third, asm's SessionEnd push, went with its lifecycle hook on 2026-11-07: a just-ended session reaches the hub within 30 min):
+**Three triggers, kept independent on purpose** (separate failure modes, easy to tell apart in logs):
+1. `session_end.sh` (SessionEnd) - reindex the session that just ended, push its one index entry. Backgrounded, non-blocking.
 1. Start of `ares resume` - rate-limited (skipped if attempted <60s ago) opportunistic pull, hard-capped at 5 s, never fatal.
 2. `ares-reindex-and-rsync.sh`, scheduled by its job-runner entrypoint (every 30 min) - `ares reindex` then unconditionally `ares-sync` (both directions). Whether the VM sync still needs this job now that `ares resume` refreshes the index itself is an open point (agent-tracker `DESIGN.md` "Open points").
 
@@ -318,7 +333,7 @@ Skill for context injection when true resume is not possible, identical content 
 | File | Purpose |
 |---|---|
 | `src/ares` | R1/R3/R4/R6.2/R6.5: index (both backends + agent-tracker's lifecycle), refresh, search, fzf, resume; `ares tmux` |
-| `src/duplicate_warning.py` | R6.3: the SessionStart hook |
+| `src/session_start.py`, `src/session_end.sh`, `src/codex-plugin/` | R6.3: the two hooks, and the Codex plugin that registers them for Codex |
 | `src/ares-sync` | R6.4: optional SSH sync of the index only |
 | `src/ares-reindex-and-rsync.sh`, `src/entrypoint.sh`, `src/entrypoint.conf` | R6.4: the scheduled job (job-runner), its dashboard settings |
 | `skills/inject-session/` | R6.6 |
@@ -331,11 +346,15 @@ Skill for context injection when true resume is not possible, identical content 
 | macOS | `~/Library/LaunchAgents/com.jeanlescut.agent-resume.plist` (symlink to `~/opt/agent-resume/`) | starts `~/opt/agent-resume/entrypoint.sh` every 30 min; it runs `ares-reindex-and-rsync.sh` through job-runner with a 20-min timeout |
 | Linux | `~/.config/systemd/user/com.jeanlescut.agent-resume.{service,timer}` (symlinks to `~/opt/agent-resume/`) | the same, every 30 min; `install.sh` also best-effort runs `loginctl enable-linger` |
 
-Claude Code hook registration in `~/.claude/settings.json` (install.sh replaces only this group):
+Claude Code hook registration in `~/.claude/settings.json` (install.sh replaces only these groups):
 ```json
 "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "timeout": 10,
-                  "command": "python3 \"$HOME/opt/agent-resume/duplicate_warning.py\""}]}]
+                  "command": "python3 \"$HOME/opt/agent-resume/session_start.py\""}]}],
+"SessionEnd":   [{"matcher": "", "hooks": [{"type": "command", "timeout": 5,
+                  "command": "bash \"$HOME/opt/agent-resume/session_end.sh\""}]}]
 ```
+
+Codex (if detected: `codex_enabled`, or `~/.codex/sessions` exists, and `codex` on the PATH): `codex plugin marketplace add ~/opt/agent-resume/codex-marketplace` then `codex plugin add agent-resume@agent-resume-local`, both idempotent; `src/codex-plugin/hooks/hooks.json` runs the same two commands. Codex asks once to trust the plugin's hooks. In a sandbox `HOME`, install.sh sets `CODEX_HOME=$HOME/.codex`.
 
 ### Data files
 
@@ -351,7 +370,7 @@ Claude Code hook registration in `~/.claude/settings.json` (install.sh replaces 
 | Path | What it is |
 |---|---|
 | `~/.claude/projects/`, `~/.codex/sessions/` | written by Claude Code and Codex CLI; only read |
-| `~/opt/agent-resume/` | deployment: `bin/{ares,ares-sync}`, `duplicate_warning.py`, the job files, `install.sh`/`uninstall.sh`, `skills/`, and `data/` (above) |
+| `~/opt/agent-resume/` | deployment: `bin/{ares,ares-sync}`, `session_start.py`, `session_end.sh`, `codex-plugin/`, `codex-marketplace/`, the job files, `install.sh`/`uninstall.sh`, `skills/`, and `data/` (above) |
 | `~/.local/bin/{ares,ares-sync,asm,asm-sync}` | symlinks into `~/opt/agent-resume/bin/` (`asm*` = aliases) |
 
 `uninstall.sh` removes everything under `~/opt/agent-resume/` **except** `data/`. Moving from `~/opt/agent-session-manager/`: `doc/deploy_migration.md`.

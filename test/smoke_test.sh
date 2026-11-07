@@ -87,7 +87,7 @@ for pair in ares:ares ares-sync:ares-sync asm:ares asm-sync:ares-sync; do
     fi
 done
 
-for f in duplicate_warning.py ares-reindex-and-rsync.sh entrypoint.sh install.sh uninstall.sh; do
+for f in session_start.py session_end.sh ares-reindex-and-rsync.sh entrypoint.sh install.sh uninstall.sh; do
     [[ -f "$DEPLOY_DIR/$f" ]] && pass "$DEPLOY_DIR/$f present" || fail "$DEPLOY_DIR/$f missing"
 done
 [[ ! -e "$HOME/opt/agent-session-manager/bin" ]] \
@@ -107,7 +107,7 @@ if [[ -d "$REPO_DIR/src" ]]; then
             diff -q "$REPO_DIR/src/$f" "$BIN_DIR/$f" &>/dev/null || drift=1
         fi
     done
-    for f in duplicate_warning.py ares-reindex-and-rsync.sh entrypoint.sh install.sh uninstall.sh; do
+    for f in session_start.py session_end.sh ares-reindex-and-rsync.sh entrypoint.sh install.sh uninstall.sh; do
         if [[ -f "$REPO_DIR/src/$f" && -f "$DEPLOY_DIR/$f" ]]; then
             diff -q "$REPO_DIR/src/$f" "$DEPLOY_DIR/$f" &>/dev/null || drift=1
         elif [[ -f "$REPO_DIR/$f" && -f "$DEPLOY_DIR/$f" ]]; then
@@ -127,13 +127,14 @@ if [[ -f "$CLAUDE_SETTINGS" ]]; then
 import json
 hooks = json.load(open('$CLAUDE_SETTINGS')).get('hooks', {})
 cmds = lambda evt: [h.get('command', '') for e in hooks.get(evt, []) for h in e.get('hooks', [])]
-ours = sum('agent-resume/duplicate_warning.py' in c for c in cmds('SessionStart'))
+start = sum('agent-resume/session_start.py' in c for c in cmds('SessionStart'))
+end = sum('agent-resume/session_end.sh' in c for c in cmds('SessionEnd'))
 old = any('lifecycle_generation.sh' in c for c in cmds('SessionStart') + cmds('SessionEnd'))
-print('1' if ours == 1 and not old else '0')
+print('1' if start == 1 and end == 1 and not old else '0')
 " 2>/dev/null)
     [[ "$hook_ok" == "1" ]] \
-        && pass "SessionStart hook duplicate_warning.py registered once; no old lifecycle hook" \
-        || fail "SessionStart hook duplicate_warning.py missing or doubled, or asm's lifecycle_generation.sh still registered"
+        && pass "hooks session_start.py (SessionStart) and session_end.sh (SessionEnd) registered once; no old lifecycle hook" \
+        || fail "hook session_start.py or session_end.sh missing or doubled, or asm's lifecycle_generation.sh still registered"
 else
     fail "~/.claude/settings.json not found"
 fi
@@ -531,7 +532,7 @@ print(round((datetime.now(timezone.utc) - t).total_seconds() / 3600, 1))
 fi
 
 # ---------------------------------------------------------------------------
-section "Duplicate warning hook (temporary AGENT_TRACKER_HOME, never the real one)"
+section "SessionStart hook: duplicate warning (temporary AGENT_TRACKER_HOME, never the real one)"
 
 DUP_HOME=$(mktemp -d)
 DUP_UUID="00000000-test-smoke-0000-$(date +%s)"
@@ -540,12 +541,12 @@ cleanup_dup() { kill "$DUP_PID" 2>/dev/null; rm -rf "$DUP_HOME"; }
 trap cleanup_dup EXIT
 mkdir -p "$DUP_HOME/data/sessions/$DUP_UUID"
 printf '{"ts":1,"event":"start","agent":"claude","pid":%s}\n' "$DUP_PID" > "$DUP_HOME/data/sessions/$DUP_UUID/lifecycle.jsonl"
-out=$(echo "{\"session_id\": \"$DUP_UUID\"}" | AGENT_TRACKER_HOME="$DUP_HOME" ARES_NO_TTY=1 python3 "$DEPLOY_DIR/duplicate_warning.py")
+out=$(echo "{\"session_id\": \"$DUP_UUID\"}" | AGENT_TRACKER_HOME="$DUP_HOME" ARES_NO_TTY=1 python3 "$DEPLOY_DIR/session_start.py")
 [[ "$out" == *"DUPLICATE SESSION"*"PID $DUP_PID"* ]] \
     && pass "SessionStart hook warns about a session already running in another live pid" \
-    || fail "duplicate_warning.py did not warn: $out"
-out=$(echo '{"session_id": "no-such-session"}' | AGENT_TRACKER_HOME="$DUP_HOME" ARES_NO_TTY=1 python3 "$DEPLOY_DIR/duplicate_warning.py")
-[[ -z "$out" ]] && pass "SessionStart hook prints nothing when there is nothing to warn about" || fail "duplicate_warning.py printed: $out"
+    || fail "session_start.py did not warn: $out"
+out=$(echo '{"session_id": "no-such-session"}' | AGENT_TRACKER_HOME="$DUP_HOME" ARES_NO_TTY=1 python3 "$DEPLOY_DIR/session_start.py")
+[[ -z "$out" ]] && pass "SessionStart hook prints nothing when there is nothing to warn about" || fail "session_start.py printed: $out"
 cleanup_dup
 trap - EXIT
 

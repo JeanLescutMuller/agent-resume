@@ -4,20 +4,24 @@
 # Installs agent-resume from this source checkout:
 #   ~/opt/agent-resume/bin/              - ares, ares-sync (the deployed copies)
 #   ~/.local/bin/                        - links: ares, ares-sync, and the aliases asm -> ares, asm-sync -> ares-sync
-#   ~/opt/agent-resume/                  - duplicate_warning.py (SessionStart hook), the job (entrypoint.sh, its .conf,
+#   ~/opt/agent-resume/                  - the hooks session_start.py (SessionStart) and session_end.sh (SessionEnd),
+#                                          codex-plugin/ + codex-marketplace/, the job (entrypoint.sh, its .conf,
 #                                          ares-reindex-and-rsync.sh), install.sh, uninstall.sh, skills/
 #   ~/opt/agent-resume/data/             - settings.json, indexes/, sync-log.jsonl
 #   ~/.claude/skills/inject-session, ~/.agents/skills/inject-session - links to the read-only copy in ~/opt/agent-resume/skills/
 #   ~/Library/LaunchAgents/ (macOS) or ~/.config/systemd/user/ (Linux) - links to the job's plist / units in ~/opt/agent-resume/
-#   ~/.claude/settings.json              - one SessionStart hook group (duplicate_warning.py); this file owns only that group
+#   ~/.claude/settings.json              - one SessionStart group (session_start.py), one SessionEnd group (session_end.sh);
+#                                          this file owns only those two groups
+#   ~/.codex/config.toml                 - the same two hooks for Codex, as the plugin agent-resume@agent-resume-local
+#                                          (`codex plugin`), if Codex is detected; a one-time hook-trust approval in Codex
 #
 # Self-migrating (shell-scripting skill): a former ~/opt/agent-session-manager/ install is taken apart here - its job,
 # its SessionStart/SessionEnd lifecycle hook, its Codex plugin, its links - and its data moved over (indexes,
 # settings.json, sync-log.jsonl). Its data/lifecycles/ and close-* files are left in ~/opt/agent-session-manager/data/
 # (nothing reads them now). Steps and checks: doc/deploy_migration.md.
 #
-# Sandbox: when $HOME is not the user's real home (tests), nothing outside $HOME is touched: no launchctl, systemctl,
-# loginctl or codex call.
+# Sandbox: when $HOME is not the user's real home (tests), nothing outside $HOME is touched: no launchctl, systemctl
+# or loginctl call, and codex runs with CODEX_HOME=$HOME/.codex.
 #
 # First install:  git clone <repo-url> agent-resume && bash agent-resume/install.sh
 # Re-install:     bash ~/dev/agent-resume/install.sh   (or ~/opt/agent-resume/install.sh)
@@ -33,9 +37,10 @@ LABEL=com.jeanlescut.agent-resume   # the trigger's name: com.jeanlescut.<repo>,
 IS_MACOS=$( [[ "$(uname -s)" == "Darwin" ]] && echo true || echo false )
 REAL_HOME=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
 SANDBOX=$( [[ "$HOME" != "$REAL_HOME" ]] && echo true || echo false )
+$SANDBOX && export CODEX_HOME="$HOME/.codex"   # never the real ~/.codex/config.toml from a sandbox
 
 echo "Installing agent-resume..."
-$SANDBOX && echo "  (sandbox HOME=$HOME: no launchctl / systemctl / codex call)"
+$SANDBOX && echo "  (sandbox HOME=$HOME: no launchctl / systemctl call; CODEX_HOME=$CODEX_HOME)"
 
 # -- Pre-flight ------------------------------------------------------------------
 for tool in fzf python3; do
@@ -69,7 +74,7 @@ if [ -d "$OLD_DIR" ]; then
                 com.asm.reindex-sync com.csm.reindex-sync; do
         unload_job "$name" "$OLD_DIR"
     done
-    if ! $SANDBOX && command -v codex &>/dev/null; then   # asm's Codex plugin wrote the old lifecycle sidecars
+    if command -v codex &>/dev/null; then   # asm's Codex plugin wrote the old lifecycle sidecars
         codex plugin remove asm@asm-local >/dev/null 2>&1 || true
         codex plugin marketplace remove asm-local >/dev/null 2>&1 || true
         echo "  removed the Codex plugin asm@asm-local (if present)"
@@ -96,11 +101,11 @@ fi
 
 # -- Scripts -> ~/opt/agent-resume/, bin/ -> linked from ~/.local/bin/ ---------------
 mkdir -p "$SERVICE_DIR/bin" "$SERVICE_DIR/data" "$HOME/.local/bin"
-for f in duplicate_warning.py ares-reindex-and-rsync.sh entrypoint.sh entrypoint.conf; do
+for f in session_start.py session_end.sh ares-reindex-and-rsync.sh entrypoint.sh entrypoint.conf; do
     cp "$SRC_DIR/$f" "$SERVICE_DIR/$f"
 done
 cp "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/uninstall.sh" "$SERVICE_DIR/"
-chmod +x "$SERVICE_DIR"/{duplicate_warning.py,ares-reindex-and-rsync.sh,install.sh,uninstall.sh}
+chmod +x "$SERVICE_DIR"/{session_start.py,session_end.sh,ares-reindex-and-rsync.sh,install.sh,uninstall.sh}
 for bin in ares ares-sync; do
     cp "$SRC_DIR/$bin" "$SERVICE_DIR/bin/$bin" && chmod +x "$SERVICE_DIR/bin/$bin"
 done
@@ -208,7 +213,7 @@ else
 fi
 [ -f "$HOME/opt/job-runner/lib.sh" ] || echo "  NOTE: job-runner is not installed (~/opt/job-runner/lib.sh missing): every check fails until it is (github.com/JeanLescutMuller/job-runner)."
 
-# -- ~/.claude/settings.json: the duplicate warning on SessionStart; asm's lifecycle hook removed ----
+# -- ~/.claude/settings.json: the two hooks; asm's lifecycle hook removed -------------------------
 # The lifecycle (start / end lines) is agent-tracker's now: its own install.sh registers `agent-tracker hook start|end`.
 if [ -f "$SETTINGS_JSON" ]; then
     python3 - "$SETTINGS_JSON" <<'PY'
@@ -216,24 +221,56 @@ import json, sys
 path = sys.argv[1]
 d_settings = json.load(open(path))
 d_hooks = d_settings.setdefault("hooks", {})
-OURS = ("agent-resume/duplicate_warning.py", "agent-session-manager/lifecycle_generation.sh")
-for event in ("SessionStart", "SessionEnd"):   # replace only our own groups (config-ownership skill)
+OURS = ("agent-resume/session_start.py", "agent-resume/session_end.sh",
+        "agent-session-manager/lifecycle_generation.sh")
+d_new = {"SessionStart": {"type": "command", "timeout": 10, "command": 'python3 "$HOME/opt/agent-resume/session_start.py"'},
+         "SessionEnd": {"type": "command", "timeout": 5, "command": 'bash "$HOME/opt/agent-resume/session_end.sh"'}}
+for event, hook in d_new.items():   # replace only our own groups (config-ownership skill)
     l_kept = [g for g in d_hooks.get(event, [])
               if not any(o in h.get("command", "") for h in g.get("hooks", []) for o in OURS)]
-    if event == "SessionStart":
-        l_kept.append({"matcher": "", "hooks": [{"type": "command", "timeout": 10,
-                       "command": 'python3 "$HOME/opt/agent-resume/duplicate_warning.py"'}]})
-    if l_kept:
-        d_hooks[event] = l_kept
-    else:
-        d_hooks.pop(event, None)
+    d_hooks[event] = l_kept + [{"matcher": "", "hooks": [hook]}]
 with open(path, "w") as f:
     json.dump(d_settings, f, indent=2)
     f.write("\n")
 PY
-    echo "  $SETTINGS_JSON: SessionStart hook duplicate_warning.py (asm's lifecycle hook removed, if it was there)"
+    echo "  $SETTINGS_JSON: SessionStart session_start.py, SessionEnd session_end.sh (asm's lifecycle hook removed, if it was there)"
 else
-    echo "  WARNING: $SETTINGS_JSON not found: SessionStart hook not registered (re-run install.sh once Claude Code is set up)"
+    echo "  WARNING: $SETTINGS_JSON not found: hooks not registered (re-run install.sh once Claude Code is set up)"
+fi
+
+# -- Codex: the same two hooks, as a plugin in a local marketplace (`codex plugin`, idempotent) -----
+# Codex has no settings.json to edit; its hook payload has the same shape as Claude Code's (session_id, cwd on stdin).
+CODEX_ENABLED=$(python3 -c "
+from importlib.machinery import SourceFileLoader
+print('true' if SourceFileLoader('ares_mod', '$SERVICE_DIR/bin/ares').load_module().CODEX_ENABLED else 'false')
+" 2>/dev/null || echo false)
+if [ "$CODEX_ENABLED" = true ] && command -v codex &>/dev/null; then
+    rm -rf "$SERVICE_DIR/codex-plugin" && cp -R "$SRC_DIR/codex-plugin" "$SERVICE_DIR/codex-plugin"
+    MARKET="$SERVICE_DIR/codex-marketplace"
+    mkdir -p "$MARKET/.agents/plugins" "$MARKET/plugins"
+    ln -sfn "$SERVICE_DIR/codex-plugin" "$MARKET/plugins/agent-resume"
+    cat > "$MARKET/.agents/plugins/marketplace.json" <<EOF
+{
+  "name": "agent-resume-local",
+  "interface": {"displayName": "agent-resume (local)"},
+  "plugins": [
+    {
+      "name": "agent-resume",
+      "source": {"source": "local", "path": "./plugins/agent-resume"},
+      "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+      "category": "Productivity"
+    }
+  ]
+}
+EOF
+    if out=$(codex plugin marketplace add "$MARKET" 2>&1 && codex plugin add agent-resume@agent-resume-local 2>&1); then
+        echo "  Codex plugin agent-resume@agent-resume-local registered; approve its hooks once in a codex session (hook trust)"
+    else
+        echo "  WARNING: Codex plugin not registered:"; echo "$out" | sed 's/^/    /'
+        echo "  by hand: codex plugin marketplace add \"$MARKET\" && codex plugin add agent-resume@agent-resume-local"
+    fi
+else
+    echo "  Codex not detected or disabled: no Codex plugin"
 fi
 
 echo "Done."

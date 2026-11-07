@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # sandbox_test.sh - agent-resume's tests, all in a sandbox (agent-tracker IMPLEMENTATION.md §1): a temporary HOME,
 # fake transcripts and fake agent-tracker files (test/make_fixtures.py), a separate tmux server (TMUX_TMPDIR), a fake
-# `claude` that only logs its arguments and sleeps, and fake launchctl / systemctl / codex / ssh / osascript that
-# log and fail, so nothing can reach the real machine. The user's tmux server, ~/opt, ~/.claude are never touched.
+# `claude` that only logs its arguments and sleeps, fake launchctl / systemctl / ssh / osascript that log and fail,
+# and a fake `codex` that logs (with its CODEX_HOME) and succeeds, so nothing can reach the real machine. When a real
+# `codex` is installed, one section also runs it, with CODEX_HOME in the sandbox, for the plugin round trip. The user's tmux server, ~/opt, ~/.claude are never touched.
 #
 # Covers: install.sh (incl. the migration from ~/opt/agent-session-manager, twice for idempotency) and uninstall.sh;
 # test/smoke_test.sh on the sandbox install; reindex and session_state from agent-tracker's lifecycle; the index
-# refreshed at search time; the duplicate warning hook; `ares close`'s pointer; `ares tmux` end to end.
+# refreshed at search time; the SessionStart hook (duplicate, cross-machine and changed-folder warnings); the SessionEnd
+# hook (re-index + push); the Codex plugin (its two hooks); `ares close`'s pointer; `ares tmux` end to end.
 #
 # Usage:  bash test/sandbox_test.sh            # prints PASS/FAIL lines and the totals; details in the log
 # Log:    $S/test.log (its path is printed at the end); the sandbox is left in place for reading, under $TMPDIR.
@@ -21,8 +23,9 @@ unset TMUX TMUX_PANE CLAUDE_CODE_SESSION_ID   # inside the user's tmux, $TMUX wo
 export HOME="$S/home" CLAUDE_CONFIG_DIR="$S/home/.claude" AGENT_TRACKER_HOME="$S/home/opt/agent-tracker" \
        AGENT_RESUME_HOME="$S/home/opt/agent-resume" TMUX_TMPDIR="$S/tmux" JR_MACHINE_NAME=test-machine \
        AGENT_TRACKER_BOOT_TS=1794046382 ARES_NO_TTY=1 SHELL=/bin/bash FAKE_LOG="$S/fake-calls.log"
+REAL_CODEX=$(command -v codex || true)   # before the fakes shadow it
 export PATH="$S/fakebin:$HOME/.local/bin:$PATH"
-mkdir -p "$HOME/.claude" "$TMUX_TMPDIR" "$S/fakebin"
+mkdir -p "$HOME/.claude" "$HOME/.codex/sessions" "$TMUX_TMPDIR" "$S/fakebin"
 chmod 700 "$TMUX_TMPDIR"
 
 PASS=0; FAIL=0
@@ -37,9 +40,10 @@ cat > "$S/fakebin/claude" <<'EOF'
 echo "claude|$TMUX_PANE|$PWD|$*" >> "$FAKE_LOG"
 exec sleep 600
 EOF
-for tool in launchctl systemctl loginctl codex ssh osascript; do
+for tool in launchctl systemctl loginctl ssh osascript; do
     printf '#!/bin/bash\necho "%s|$*" >> "$FAKE_LOG"\nexit 1\n' "$tool" > "$S/fakebin/$tool"
 done
+printf '#!/bin/bash\necho "codex|$CODEX_HOME|$*" >> "$FAKE_LOG"\n' > "$S/fakebin/codex"
 chmod +x "$S/fakebin"/*
 # Panes start a plain bash: no profile (macOS path_helper would put /usr/local/bin before the fake claude)
 printf 'set -g default-command "/bin/bash --noprofile --norc"\n' > "$HOME/.tmux.conf"
@@ -92,17 +96,27 @@ for pair in ares:ares ares-sync:ares-sync asm:ares asm-sync:ares-sync; do
 done
 check "inject-session skill linked to the read-only copy" \
     bash -c "[ \"\$(readlink '$HOME/.claude/skills/inject-session')\" = '$NEW/skills/inject-session' ] && [ \"\$(readlink '$HOME/.agents/skills/inject-session')\" = '$NEW/skills/inject-session' ] && [ ! -w '$NEW/skills/inject-session/SKILL.md' ]"
-check "hooks: one duplicate_warning group, asm's lifecycle groups gone, others kept" python3 - <<EOF
+check "hooks: one session_start / session_end group each, asm's lifecycle groups gone, others kept" python3 - <<EOF
 import json
 h = json.load(open("$HOME/.claude/settings.json"))["hooks"]
 cmds = lambda ev: [x["command"] for g in h.get(ev, []) for x in g["hooks"]]
-assert sum("agent-resume/duplicate_warning.py" in c for c in cmds("SessionStart")) == 1, cmds("SessionStart")
+assert sum("agent-resume/session_start.py" in c for c in cmds("SessionStart")) == 1, cmds("SessionStart")
+assert cmds("SessionEnd") == ['bash "\$HOME/opt/agent-resume/session_end.sh"'], cmds("SessionEnd")
 assert "agent-tracker hook start" in cmds("SessionStart") and not any("lifecycle_generation" in c for c in cmds("SessionStart"))
-assert "SessionEnd" not in h, h.get("SessionEnd")
 assert cmds("Stop") == ["python3 ~/opt/my-setup/chrome/hook.py"]
 EOF
 check "LaunchAgent com.jeanlescut.agent-resume written (not loaded)" test -L "$HOME/Library/LaunchAgents/com.jeanlescut.agent-resume.plist"
-check "no launchctl / systemctl / codex call (sandbox)" bash -c "! grep -qE '^(launchctl|systemctl|loginctl|codex)\|' '$FAKE_LOG' 2>/dev/null"
+check "no launchctl / systemctl / loginctl call (sandbox)" bash -c "! grep -qE '^(launchctl|systemctl|loginctl)\|' '$FAKE_LOG' 2>/dev/null"
+check "codex, with CODEX_HOME in the sandbox: asm@asm-local removed, agent-resume@agent-resume-local added" \
+    bash -c "grep -qx 'codex|$HOME/.codex|plugin remove asm@asm-local' '$FAKE_LOG' && grep -qx 'codex|$HOME/.codex|plugin marketplace add $HOME/opt/agent-resume/codex-marketplace' '$FAKE_LOG' && grep -qx 'codex|$HOME/.codex|plugin add agent-resume@agent-resume-local' '$FAKE_LOG' && ! grep '^codex|' '$FAKE_LOG' | grep -qv '^codex|$HOME/.codex|'"
+check "Codex plugin deployed: its marketplace lists it, its hooks.json runs session_start.py and session_end.sh" python3 - <<EOF
+import json
+m = json.load(open("$NEW/codex-marketplace/.agents/plugins/marketplace.json"))
+assert m["name"] == "agent-resume-local" and m["plugins"][0]["name"] == "agent-resume"
+h = json.load(open("$NEW/codex-marketplace/plugins/agent-resume/hooks/hooks.json"))["hooks"]
+assert "session_start.py" in h["SessionStart"][0]["hooks"][0]["command"]
+assert "session_end.sh" in h["SessionEnd"][0]["hooks"][0]["command"]
+EOF
 check "asm alias: asm --version says ares" bash -c "asm --version | grep -q '^ares v'"
 
 section "smoke_test.sh on the sandbox install (--offline)"
@@ -120,10 +134,25 @@ assert not os.path.lexists("$HOME/.claude/skills/inject-session")
 assert not os.path.lexists("$HOME/Library/LaunchAgents/com.jeanlescut.agent-resume.plist")
 assert os.listdir("$NEW") == ["data"], os.listdir("$NEW")
 h = json.load(open("$HOME/.claude/settings.json"))["hooks"]
-assert not any("duplicate_warning" in x["command"] for g in h.get("SessionStart", []) for x in g["hooks"])
+assert not any("agent-resume/" in x["command"] for ev in ("SessionStart", "SessionEnd") for g in h.get(ev, []) for x in g["hooks"])
 assert "Stop" in h
 EOF
+check "uninstall: the Codex plugin removed (sandbox CODEX_HOME)" grep -qx "codex|$HOME/.codex|plugin remove agent-resume@agent-resume-local" "$FAKE_LOG"
 bash "$REPO/install.sh" >>"$LOG" 2>&1; check "install.sh again exits 0" test $? -eq 0
+
+section "Codex plugin round trip with the real codex (CODEX_HOME in the sandbox)"
+if [ -z "$REAL_CODEX" ]; then
+    echo "  SKIP  codex not installed" | tee -a "$LOG"
+else
+    mkdir -p "$S/realcodex" && ln -sfn "$REAL_CODEX" "$S/realcodex/codex"
+    cfg="$HOME/.codex/config.toml"
+    PATH="$S/realcodex:$PATH" bash "$REPO/install.sh" >>"$LOG" 2>&1 && PATH="$S/realcodex:$PATH" bash "$REPO/install.sh" >>"$LOG" 2>&1
+    check "real codex: two installs leave one marketplace and one plugin entry in the sandbox config.toml" \
+        bash -c "[ \$(grep -c '^\[marketplaces\.agent-resume-local\]' '$cfg') -eq 1 ] && [ \$(grep -c '^\[plugins\.\"agent-resume@agent-resume-local\"\]' '$cfg') -eq 1 ]"
+    PATH="$S/realcodex:$PATH" bash "$NEW/uninstall.sh" >>"$LOG" 2>&1
+    check "real codex: uninstall removes both entries" bash -c "! grep -q 'agent-resume-local' '$cfg'"
+    bash "$REPO/install.sh" >>"$LOG" 2>&1   # back to the fake codex for the rest
+fi
 
 # ---------------------------------------------------------------------------------------------------------
 section "reindex: session_state and tmux place from agent-tracker's lifecycle"
@@ -163,8 +192,8 @@ check "ares close prints the one-line pointer to agent-auto-close, exit 1" \
     bash -c "[ $rc -eq 1 ] && [ \$(wc -l < '$S/close.out') -eq 1 ] && grep -q agent-auto-close '$S/close.out'"
 
 # ---------------------------------------------------------------------------------------------------------
-section "duplicate warning hook (SessionStart)"
-HOOK="$NEW/duplicate_warning.py"
+section "SessionStart hook: duplicate, cross-machine and changed-folder warnings"
+HOOK="$NEW/session_start.py"
 DUP=dddddddd-0000-4000-8000-000000000001
 mkdir -p "$AGENT_TRACKER_HOME/data/sessions/$DUP"
 sleep 300 & SLEEP_PID=$!
@@ -186,6 +215,45 @@ kill "$SLEEP_PID"; wait "$SLEEP_PID" 2>/dev/null
 write_lc "$SLEEP_PID" "$PSTART"
 check "the earlier process has exited -> nothing printed" test -z "$(run_hook)"
 check "no lifecycle at all -> nothing printed, exit 0" bash -c "[ -z \"\$(echo '{\"session_id\": \"nope\"}' | python3 '$HOOK')\" ]"
+lc_line() {   # lc_line <pid> <machine> <cwd>: one start line of this boot
+    printf '{"ts":1,"event":"start","agent":"claude","machine":"%s","boot_ts":%s,"pid":%s,"cwd":"%s"}\n' "$2" "$AGENT_TRACKER_BOOT_TS" "$1" "$3"
+}
+run_hook_in() { echo "{\"session_id\": \"$DUP\", \"cwd\": \"$1\"}" | python3 "$HOOK"; }
+LC="$AGENT_TRACKER_HOME/data/sessions/$DUP/lifecycle.jsonl"
+lc_line 999991 other-host "$HOME" > "$LC"
+has() { grep -qF -- "$1" <<<"$out"; }          # has <text>: the hook's last output contains it
+out=$(run_hook_in "$HOME"); echo "$out" >>"$LOG"
+check "previous start on another machine -> Cross-machine warning" \
+    has "Cross-machine resume: previous session ran on 'other-host', now resuming on 'test-machine'"
+check "same folder -> no folder warning" bash -c "! grep -q 'Working directory' <<<\"\$0\"" "$out"
+lc_line 999991 test-machine /no/such/dir > "$LC"
+out=$(run_hook_in "$HOME"); echo "$out" >>"$LOG"
+check "previous start in another folder -> Working directory changed" has "Working directory changed: was '/no/such/dir', now '$HOME'"
+check "... and says the previous folder does not exist here; no Cross-machine" \
+    bash -c "grep -q 'does not exist on this machine' <<<\"\$0\" && ! grep -q Cross-machine <<<\"\$0\"" "$out"
+{ lc_line 999991 test-machine "$HOME"; lc_line $$ other-host /no/such/dir; } > "$LC"
+check "this process's own start line (written first by agent-tracker) is not the previous start -> nothing" test -z "$(run_hook_in "$HOME")"
+lc_line 999991 other-host "$HOME" > "$LC"
+codex_cmd=$(python3 -c "import json; print(json.load(open('$NEW/codex-plugin/hooks/hooks.json'))['hooks']['SessionStart'][0]['hooks'][0]['command'])")
+out=$(echo "{\"session_id\": \"$DUP\", \"cwd\": \"$HOME\"}" | bash -c "$codex_cmd"); echo "codex hook: $out" >>"$LOG"
+check "the Codex plugin's SessionStart command runs the same hook (Cross-machine warning)" has "Cross-machine resume"
+
+section "SessionEnd hook: re-index that session, push it to the hub"
+UE=$(uuid H)
+python3 -c "import json; p='$NEW/data/settings.json'; d=json.load(open(p)); d['remote_ssh_host']='fakehub'; json.dump(d, open(p, 'w'))"
+TE=$(python3 -c "import json; print(json.load(open('$IDX/$UE.json'))['jsonl_path'])"); TE=${TE/#\~/$HOME}
+sleep 1
+echo "{\"type\": \"user\", \"sessionId\": \"$UE\", \"timestamp\": \"2026-11-07T13:00:00Z\", \"message\": {\"content\": \"endhookword\"}}" >> "$TE"
+: > "$S/ssh-before"; grep '^ssh|' "$FAKE_LOG" > "$S/ssh-before" 2>/dev/null
+out=$(echo "{\"session_id\": \"$UE\", \"transcript_path\": \"$TE\", \"cwd\": \"$HOME\"}" | ARES_END_DELAY=0 bash "$NEW/session_end.sh"); rc=$?
+check "session_end.sh exits 0 at once and prints nothing on stdout" bash -c "[ $rc -eq 0 ] && [ -z '$out' ]"
+for _ in $(seq 1 20); do grep -q endhookword "$IDX/$UE.json" && tail -1 "$NEW/data/sync-log.jsonl" | grep -q unreachable && break; sleep 0.5; done
+check "its index entry is re-indexed in the background" grep -q endhookword "$IDX/$UE.json"
+check "ares-sync --push is run: ssh to the hub tried, sync-log records it" \
+    bash -c "[ \$(grep -c '^ssh|' '$FAKE_LOG') -gt \$(wc -l < '$S/ssh-before') ] && grep -q fakehub '$FAKE_LOG' && tail -1 '$NEW/data/sync-log.jsonl' | grep -q unreachable"
+codex_end=$(python3 -c "import json; print(json.load(open('$NEW/codex-plugin/hooks/hooks.json'))['hooks']['SessionEnd'][0]['hooks'][0]['command'])")
+check "the Codex plugin's SessionEnd command is session_end.sh" test "$codex_end" = 'bash "$HOME/opt/agent-resume/session_end.sh"'
+python3 -c "import json; p='$NEW/data/settings.json'; d=json.load(open(p)); d['remote_ssh_host']=''; json.dump(d, open(p, 'w'))"
 
 # ---------------------------------------------------------------------------------------------------------
 section "ares tmux, end to end in the sandbox tmux server"

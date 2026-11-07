@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # uninstall.sh - agent-resume
 #
-# Removes what install.sh made: the job, the links, the skill copies, the SessionStart hook group and
+# Removes what install.sh made: the job, the links, the skill copies, the two hook groups, the Codex plugin and
 # ~/opt/agent-resume/ except data/ (index, settings, sync log). Does NOT touch this source folder, the session
 # transcripts (~/.claude/projects/, ~/.codex/sessions/) or agent-tracker's files.
-# Sandbox: when $HOME is not the user's real home (tests), no launchctl / systemctl call.
+# Sandbox: when $HOME is not the user's real home (tests), no launchctl / systemctl call; codex gets CODEX_HOME=$HOME/.codex.
 #
 # Run: bash uninstall.sh (from the repo root), or ~/opt/agent-resume/uninstall.sh
 
@@ -40,7 +40,7 @@ for link in "$HOME/.local/bin"/{ares,ares-sync,asm,asm-sync} "$HOME/.claude/skil
 done
 [ -d "$SERVICE_DIR/skills" ] && chmod -R u+w "$SERVICE_DIR/skills"
 
-# -- The SessionStart hook group (duplicate_warning.py) ------------------------------
+# -- The two hook groups in ~/.claude/settings.json ---------------------------------------
 SETTINGS_JSON="$HOME/.claude/settings.json"
 if [ -f "$SETTINGS_JSON" ]; then
     python3 - "$SETTINGS_JSON" <<'PY'
@@ -48,21 +48,33 @@ import json, sys
 path = sys.argv[1]
 d_settings = json.load(open(path))
 d_hooks = d_settings.get("hooks", {})
-l_start = d_hooks.get("SessionStart", [])
-l_kept = [g for g in l_start
-          if not any("agent-resume/duplicate_warning.py" in h.get("command", "") for h in g.get("hooks", []))]
-if len(l_kept) != len(l_start):
-    if l_kept:
-        d_hooks["SessionStart"] = l_kept
-    else:
-        d_hooks.pop("SessionStart")
+OURS = ("agent-resume/session_start.py", "agent-resume/session_end.sh")
+changed = False
+for event in ("SessionStart", "SessionEnd"):
+    l_all = d_hooks.get(event, [])
+    l_kept = [g for g in l_all if not any(o in h.get("command", "") for h in g.get("hooks", []) for o in OURS)]
+    if len(l_kept) != len(l_all):
+        changed = True
+        if l_kept:
+            d_hooks[event] = l_kept
+        else:
+            d_hooks.pop(event)
+if changed:
     if not d_hooks:
         d_settings.pop("hooks")
     with open(path, "w") as f:
         json.dump(d_settings, f, indent=2)
         f.write("\n")
-    print(f"  removed the SessionStart hook from {path}")
+    print(f"  removed the SessionStart / SessionEnd hooks from {path}")
 PY
+fi
+
+# -- The Codex plugin -------------------------------------------------------------------
+$SANDBOX && export CODEX_HOME="$HOME/.codex"   # never the real ~/.codex/config.toml from a sandbox
+if command -v codex &>/dev/null && [ -d "$SERVICE_DIR/codex-plugin" ]; then
+    codex plugin remove agent-resume@agent-resume-local >/dev/null 2>&1 || true
+    codex plugin marketplace remove agent-resume-local >/dev/null 2>&1 || true
+    echo "  removed the Codex plugin agent-resume@agent-resume-local"
 fi
 
 # -- ~/opt/agent-resume/, except data/ ------------------------------------------------

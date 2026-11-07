@@ -1,0 +1,18 @@
+{
+  "name": "agent-resume",
+  "version": "2.0.0",
+  "description": "agent-resume's SessionStart and SessionEnd hooks for Codex: resume warnings, re-index and push of the ended session.",
+  "author": {
+    "name": "Jean Lescut-Muller"
+  },
+  "interface": {
+    "displayName": "agent-resume",
+    "shortDescription": "Resume warnings and index refresh for ares",
+    "longDescription": "SessionStart: warns when the session is already running in another process, was last run on another machine, or in another folder (read from agent-tracker's lifecycle). SessionEnd: re-indexes the ended session for `ares resume` and pushes its index entry to the hub.",
+    "developerName": "Jean Lescut-Muller",
+    "category": "Productivity",
+    "capabilities": [
+      "Hooks"
+    ]
+  }
+}

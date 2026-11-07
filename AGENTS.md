@@ -8,10 +8,10 @@ Find and resume past Claude Code and Codex sessions from any folder and any mach
 - **session_state** (`pending`/`exited`) comes from the lifecycle: pending = a start line with no later end line of the same pid (`open_start` in `src/ares`).
 - **The index is refreshed at search time**: `ares resume` re-indexes only the transcripts (or lifecycles) newer than their index entry (`refresh_index`), then searches. The 30-min job and the VM sync stay (open point: agent-tracker `DESIGN.md` "Open points").
 - **`ares tmux` follows agent-tracker's `IMPLEMENTATION.md` §5 exactly** (previous boot, one per pane, stale rule, `select-layout`, never touch an existing tmux session). → `DEV_DOC.md` R4.
-- **The only hook is `src/duplicate_warning.py`** (SessionStart): it prints only the duplicate warning, nothing else, and always exits 0. asm's SessionStart/SessionEnd lifecycle hook and `data/lifecycles/` are gone (agent-tracker's now).
+- **Two hooks, for Claude Code and Codex** (Codex: the plugin `src/codex-plugin/`, `agent-resume@agent-resume-local`): `src/session_start.py` (SessionStart) prints only the resume warnings (duplicate, cross-machine, changed folder) read from agent-tracker's lifecycle; `src/session_end.sh` (SessionEnd) re-indexes that one session and pushes it to the hub (`ares-sync --push`). Both always exit 0 and write no lifecycle: asm's lifecycle hook and `data/lifecycles/` are gone (agent-tracker's now).
 - **No close here**: `ares close` prints a one-line pointer to agent-auto-close. No `status` script (removed by the user, 2026-11-07).
 - Python stdlib only; `src/ares` is one file (Backend registry: `BACKENDS`).
-- `install.sh` is idempotent and self-migrating (it takes apart `~/opt/agent-session-manager`, doc/deploy_migration.md). In a sandbox `HOME` it calls no `launchctl` / `systemctl` / `codex`.
+- `install.sh` is idempotent and self-migrating (it takes apart `~/opt/agent-session-manager`, doc/deploy_migration.md). In a sandbox `HOME` it calls no `launchctl` / `systemctl`, and runs `codex` only with `CODEX_HOME=$HOME/.codex`.
 
 ## Never
 
