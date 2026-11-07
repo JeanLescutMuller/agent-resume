@@ -1,12 +1,8 @@
-# ASM: Developer Documentation
+# agent-resume: Developer Documentation
 
-Requirements and design rationale for Agent Session Manager. For installation and
-day-to-day usage, see `README.md`. For the short pointer Claude Code itself reads,
-see `CLAUDE.md`.
+Requirements and design rationale for agent-resume (command `ares`; was agent-session-manager, `asm`, renamed 2026-11-07). For installation and day-to-day usage, see `README.md`; the rules agents follow, `AGENTS.md`.
 
-This document is split into two parts: **Requirements** (what ASM does) and
-**Design Notes** (why it's built this way, including alternatives that were
-considered and rejected).
+This document is split into two parts: **Requirements** (what it does) and **Design Notes** (why it's built this way, including alternatives that were considered and rejected). The Codex spike notes and Part 2 are history: they keep asm's names (`asm`, `lifecycle_generation.sh`, the Codex plugin `asm@asm-local`, `asm close`), all gone since 2026-11-07.
 
 ## Codex integration notes (Phase 0 spike, 2026-08-30)
 
@@ -79,8 +75,8 @@ contingency.
 ## Multi-agent backend architecture (as built, Phases 1-6, 2026-08-30)
 
 The refactor added a `Backend` interface (`NamedTuple`: `name`, `scan`,
-`parse`, `resolve_working_dir`, `resume_cmd`, `uuid_of`, `supports_close`) in
-`src/asm`, with instances registered in `BACKENDS: Dict[str, Backend]`
+`parse`, `resolve_working_dir`, `resume_cmd`, `uuid_of`; `supports_close` until close moved out, 2026-11-07) in
+`src/ares` (then `src/asm`), with instances registered in `BACKENDS: Dict[str, Backend]`
 (`"claude"` always present; `"codex"` added conditionally, based on
 `CODEX_ENABLED`). Everything upstream of that interface - `find_sessions`,
 `passes_filters`, `format_session_for_fzf`, `host_block`, ranking - is
@@ -133,15 +129,14 @@ and every codex-specific code path is simply never reached.
 
 # Part 1: Requirements
 
-A unified tool for tracking, indexing, and resuming Claude Code and Codex CLI
-sessions through one picker, with optional index-only visibility across
-machines.
+A unified tool for indexing, searching and resuming Claude Code and Codex CLI sessions through one picker, with optional index-only visibility across machines, and a crash restore of the whole tmux setup.
 
 ## Use Cases
 
 1. **Find and resume a past session by topic**: "I had a session about profiling hallucination rates, what was the slug?" Search by keywords across prompts and get the session instantly.
 2. **Cross-machine visibility**: "I was working on this on my VM earlier - is it visible from my laptop?" Search once, from anywhere, and pull a past session's content into a new conversation via `/inject-session` - not a true resume (see D2/D3 for why that's out of scope), but enough to pick the work back up without SSH-ing over just to remember what you were doing.
-3. **Spot what's still open**: `asm resume --state pending` across all your machines to see sessions that started but never got a clean `SessionEnd` - not full crash recovery (see R4/R5's implementation status), but the closest thing available today.
+3. **Spot what's still open**: `ares resume --state pending` lists the sessions with a start and no end in agent-tracker's lifecycle.
+4. **After a crash, get everything back**: `ares tmux` (R4).
 
 ---
 
@@ -151,49 +146,40 @@ Extracts and stores cleaned session content into a searchable JSON index.
 
 **Format:** One JSON file per session (`<uuid>.json`), stored in a single flat folder.
 
-**Index folder:** `~/opt/agent-session-manager/data/indexes/` - a real local directory on each machine, never a mount or symlink to shared storage. Indexing (`asm reindex`) and search (`asm resume`) are entirely local-first and never touch the network by themselves. Multi-machine visibility, if wanted, is provided separately and optionally by `asm-sync` (R6.4), which reconciles two machines' local indexes over SSH - index-only, see R6.4.
+**Index folder:** `~/opt/agent-resume/data/indexes/` (`$AGENT_RESUME_HOME/data/indexes/`) - a real local directory on each machine, never a mount or symlink to shared storage. Indexing (`ares reindex`) and search (`ares resume`) are entirely local-first. Multi-machine visibility, if wanted, is provided separately and optionally by `ares-sync` (R6.4), index-only.
 
-**Inputs per session** (R1-R7 below describe the Claude Code path in detail; the equivalent Codex CLI path - `~/.codex/sessions/**/*.jsonl` plus `~/.codex/session_index.jsonl` for titles - is structurally different but produces the same index-doc shape via its own `Backend`, see "Multi-agent backend architecture" above for the field-by-field mapping):
+**Inputs per session** (the Codex CLI path - `~/.codex/sessions/**/*.jsonl` plus `~/.codex/session_index.jsonl` for titles - produces the same index-doc shape via its own `Backend`, see "Multi-agent backend architecture" above):
 - `~/.claude/projects/<slug>/<uuid>.jsonl` - conversation history written by Claude Code
-- `~/opt/agent-session-manager/data/lifecycles/<uuid>.jsonl` - lifecycle events written by `lifecycle_generation.sh` (R2) - flat, keyed by UUID, not co-located with the file above
+- `$AGENT_TRACKER_HOME/data/sessions/<uuid>/lifecycle.jsonl` - agent-tracker's start and end lines (R2), read only
 
 **Each index file contains:**
 - `agent_type`: `"claude"` or `"codex"` - which backend produced this doc
 - `session_id`: full UUID
 - `custom_title`: set by `--name` or `/rename`; if absent, falls back to Claude Code's own native `ai-title` transcript entry; if neither is present, `"[Empty session]"` or `"Untitled session [prompt]"`
-- `working_dir`: original working directory path, stored as an explicit string (never decoded from the slug - see D4)
-- `hostname`: machine where the session was created
-- `created_at`: timestamp of the first message
-- `last_active`: timestamp of the last message
-- `tmux_session`, `tmux_pane`, `tmux_window`: populated from lifecycle events
-- `session_state`: `pending` (has a `start`/`resume` lifecycle event with no matching `end`) or `exited`
-- `interactive`: `false` for a session no human typed in - Claude `entrypoint` `sdk-cli` (`claude -p`) or `sdk-py`/`sdk-ts` (Agent SDK), Codex `session_meta.source` `exec` or a sub-agent (`{"subagent": ...}`). Still indexed, so `--uuid` finds it, but never shown by the picker. Kept in the doc rather than deleting the file, because `asm-sync` never deletes: a deleted file would come back from the other machine
+- `initial_working_dir`, `latest_working_dir`: from the transcript's own `cwd`, else agent-tracker's start lines (never decoded from the slug - see D4)
+- `initial_hostname`, `latest_hostname`: the `machine` of the first and the latest start line; `index_hostname`: the machine that indexed it
+- `created_at`, `last_active`: timestamps of the first and last message
+- `tmux_session`, `tmux_window`, `tmux_pane`: from the first start line's `pane` (`<tmux session>:<window>.<pane>`)
+- `session_state`: `pending` (a start line with no later end line of the same pid) or `exited`
+- `interactive`: `false` for a session no human typed in - Claude `entrypoint` `sdk-cli` (`claude -p`) or `sdk-py`/`sdk-ts` (Agent SDK), Codex `session_meta.source` `exec` or a sub-agent (`{"subagent": ...}`). Still indexed, so `--uuid` finds it, but never shown by the picker. Kept in the doc rather than deleting the file, because `ares-sync` never deletes: a deleted file would come back from the other machine
 - `conversation`: list of `{role, timestamp, text}` entries - user and assistant turns only; system reminders, XML tags, and tool invocations stripped; tool output text retained
 
-**Incremental updates:** For each `<uuid>.jsonl`, check whether a corresponding `<uuid>.json` exists in the index and has a newer mtime. If yes, skip. If no, re-index. This avoids redundant work on every machine independently; if a remote is configured, `asm-sync` (R6.4) separately reconciles already-built index files between machines rather than re-indexing them.
+**Incremental updates:** a session is re-indexed when its `.jsonl` or its `lifecycle.jsonl` is newer than its `<uuid>.json`. This runs at search time (R6.5) and every 30 min (R6.2).
 
 **Searchability:** Indexed as JSON, queryable with `jq`; keyword search matches against the extracted title/paths/conversation text.
 
 ---
 
-## R2: Lifecycle Tracking
+## R2: Lifecycle (agent-tracker's, read only)
 
-Captures session metadata that is absent from `.jsonl` files, via hooks - Claude Code's native hook mechanism, and (if Codex is installed) an equivalent Codex plugin, both calling the same script.
+The facts absent from transcripts (host, tmux pane, pid, start and end) are recorded by agent-tracker, the only writer of `$AGENT_TRACKER_HOME/data/sessions/<uuid>/` (default `~/opt/agent-tracker`; format: agent-tracker `IMPLEMENTATION.md` §4). Until 2026-11-07 asm had its own SessionStart/SessionEnd hook (`lifecycle_generation.sh`) and sidecars (`data/lifecycles/<uuid>.jsonl`); both are gone (agent-tracker `DESIGN.md` §7).
 
-**Script:** `lifecycle_generation.sh` - registered as a `SessionStart`/`SessionEnd` hook for both agents; the payload contract (stdin JSON with `session_id`/`transcript_path`/`cwd`) is byte-for-byte identical between them, confirmed live (see Phase 0 spike notes above), so the script itself needed no per-agent branching. (`SessionResume` does not exist as a hook type in either agent - resume is inferred from sidecar existence at `SessionStart` time.)
+| File | Read by | Used for |
+|---|---|---|
+| `lifecycle.jsonl`: `{"ts","event":"start","source","agent","machine","boot_ts","pid","pid_start","pane_id","pane","cwd"}` and `{"ts","event":"end","reason","pid"}` | `read_lifecycle` in `src/ares`, `src/duplicate_warning.py` | `session_state`, hosts, tmux place, folders (R1); the duplicate warning (R6.3); the candidates of `ares tmux` (R4) |
+| `last_seen.json`: where the Claude session runs (tmux session, window index and name, `pane_id`, `window_layout`, `cwd`, `transcript`), `ts`, `boot_ts` | `tmux_plan` in `src/ares` | `ares tmux` (R4) |
 
-**Output:** one sidecar file per session: `~/opt/agent-session-manager/data/lifecycles/<uuid>.jsonl`. Flat, keyed by UUID - not nested under a project slug and not co-located with the corresponding `.jsonl` in `~/.claude/projects/`. This colocation-vs-flat question only matters for lookup convenience (the UUID is always known before the lifecycle path is needed) since `asm-sync` never touches lifecycle files at all (R6.4 is index-only); flat also matches how the index itself is keyed. Append-only, one JSON line per event.
-
-**Each event line contains:**
-- `event`: `start`, `resume`, or `end`
-- `timestamp`: ISO 8601
-- `session_id`: full UUID
-- `hostname`: current machine
-- `working_dir`: current working directory
-- `tmux_session`, `tmux_pane`, `tmux_window`: current tmux context
-- `pid`: process ID of the Claude process (Start event only)
-
-The indexer (`asm reindex`) is the sole writer of JSON index files. `lifecycle_generation.sh` writes only to `~/opt/agent-session-manager/data/lifecycles/*.jsonl` sidecars. This separation avoids race conditions.
+Reading rules: a `lifecycle.jsonl` line without its final newline is still being appended and is ignored; a start is **open** while no later end line has its pid (`open_start`), so a resume that starts while the old process ends stays pending; an end line without a pid closes every start before it.
 
 ---
 
@@ -201,68 +187,60 @@ The indexer (`asm reindex`) is the sole writer of JSON index files. `lifecycle_g
 
 **Speed is the primary constraint.**
 
-**Keyword search:** grep case-insensitively across all index files, requiring ALL keywords to match (any order, any position in the file).
+**Keyword search:** case-insensitive across all index files, requiring ALL keywords to match (any order, any position in the file).
 
 **Default scope:** sessions from the last 90 days.
 
 **Fuzzy fallback:** if exact keyword search returns zero results, automatically retry with fuzzy matching. No flag required.
 
-**Filters actually implemented in `asm resume`:**
+**Filters implemented in `ares resume`:**
 - `--host <hostname>`: filter by machine
 - `--agent <claude|codex>`: filter by backend
-- `--state <pending|exited>`: session state
-- `--tmux <name>`: filter by tmux session name (substring match against `tmux_session`, captured at `SessionStart` - empty for sessions started outside tmux or before the lifecycle hook recorded it)
+- `--state <pending|exited|deleted>`: session state
+- `--tmux <name>`: filter by tmux session name (substring match against `tmux_session`, from the first start line - empty for sessions started outside tmux)
 - `-f/--from-days-ago`, `-u/--until-days-ago`: date range
 - `--max-scan`: cap on recent sessions scanned when no keywords are given
 - `--print-cmd`: print the resolved resume/fork command instead of executing it
 
-> Earlier design also called for `--dir <path>` and `--all` flags; those were never implemented. Run `asm --help` for the current, authoritative flag list.
-
-**Result format per match:**
-- Title (custom title via `/rename`, then Claude Code's native `ai-title`, then a generic untitled placeholder)
-- Working directory and hostname
-- Last active timestamp
-- Matching snippet with its timestamp
+**Result format per match:** title, working directory and hostname, last active timestamp, matching snippet with its timestamp.
 
 **Ranking:** results sorted by recency of last activity, with title matches ranked first (stable sort preserves recency within that group). Multiple keyword hits within one session otherwise break ties by term-frequency density.
 
 ---
 
-## R4: Crash Recovery
+## R4: Crash Recovery: `ares tmux`
 
-> **Status: not implemented.** This section describes original design intent. `asm` does not currently ship a crash-recovery command or tmux-layout restore script. The closest available tool today is `asm resume --state pending`, which surfaces sessions with a `start`/`resume` lifecycle event and no matching `end` - useful for spotting what didn't get cleanly closed, but it does not restore a tmux layout automatically.
+> **Status: implemented 2026-11-07** by `ares tmux` (agent-tracker `IMPLEMENTATION.md` §5, `DESIGN.md` §7). It replaces my-setup's `tools/terminal_snapshot.py` (a snapshot taken by hand) and resurrect + continuum.
 
-Depends on R5 (live state tracking).
+```text
+ares tmux [--dry-run] [--all] [--no-iterm]
+  prev boot   = the newest boot_ts in data/sessions/*/ (last_seen.json and lifecycle lines) that is not this boot
+                (this boot: $AGENT_TRACKER_BOOT_TS, else sysctl kern.boottime, else /proc/stat btime; boot_ts within 60 s = same boot)
+  candidates  = Claude sessions (agent "claude") whose open start (R2) is of prev boot
+  per pane_id   keep the newest (last_seen.ts, else the start's ts): the pane was reused
+  stale       = no last_seen.json of prev boot, or last_seen.ts < prev boot's newest last_seen.ts - 120 s
+                (killed before the crash: it had stopped ticking); restored only with --all
+  no pane_id  = not in tmux: printed with its `cd … && claude --resume …` to run by hand
+```
 
-Provides a script to identify sessions that were running before a crash and restore them.
+**Restore, per tmux session** (newest first; a tmux session that already exists is never touched: printed as skipped, with its commands to run by hand):
 
-**Output:** list of orphaned sessions with hostname, tmux session name, custom title, working directory, and last active timestamp.
+| Step | tmux command |
+|---|---|
+| first window | `new-session -d -s <name> -n <window name> -x W -y H -c ~` (W×H from the saved `window_layout`), then `move-window` to its saved index if base-index differs |
+| other windows | `new-window -d -t <session>:<index> -n <name> -c ~` |
+| pane sizes | `resize-window -x W -y H`, one `split-window -d -c ~` per extra cell of the layout, `select-layout <window_layout>`, then `set-option -w -u window-size` so the window follows the terminal again once attached |
+| Claude panes | `send-keys "cd <folder> && claude --resume <uuid>" Enter`, in the pane at the cell of its `pane_id`; `<folder>` = the decoded slug of its transcript (as `ares resume`), else the start's `cwd`, else `~` |
+| plain panes | stay shells in `~` (their folder is not recorded) |
+| iTerm2 | one new window, one tab per restored tmux session, each typing `tmux attach -t =<name>` (AppleScript via `osascript`; `--no-iterm` skips, `--dry-run` prints the script) |
 
-**Recovery:** based on user selection, generate and optionally exec a recovery script that:
-- Restores the tmux layout (session, window, pane)
-- Runs `cd <working-dir> && claude --dangerously-skip-permissions --resume <uuid>` per session
-
-**Partial recovery:** if a `.jsonl` file is corrupted or missing, skip that session with a warning.
+The window's name and layout come from its newest Claude session's `last_seen.json`. A Claude pane whose `pane_id` is not in that layout (the layout predates the pane) gets an extra pane and `select-layout tiled`. Only windows that held a Claude session are known: agent-tracker records Claude sessions, not plain shells. Codex sessions are not restored.
 
 ---
 
 ## R5: Live State Tracking
 
-> **Status: partially implemented.** `session_state` (`pending`/`exited`, R1) is computed and usable via `asm resume --state pending`. The PID-liveness confirmation step and a dedicated orphan-detection heuristic/state file described below were never built.
-
-Prerequisite for R4.
-
-Tracks which Claude sessions are currently running, on which machine, in which tmux pane.
-
-**Data sources:** lifecycle events from `~/opt/agent-session-manager/data/lifecycles/*.jsonl` sidecar files. No heartbeat, no scrollback scanning.
-
-**Orphan detection heuristic (as originally designed):** a session is considered orphaned when:
-- A `start` event exists with no corresponding `end` event, AND
-- `last_active` in the index is older than 2 hours
-
-Optionally: confirm by checking whether the PID recorded in the `start` event is still alive on the recorded hostname (local machine only; cross-machine PID check requires SSH and is out of scope).
-
-**State file** records hostname per entry to support multiple servers.
+> **Status: implemented by agent-tracker** (2026-11-07). Which Claude sessions run where, now: `agent-tracker now` (pid alive with the same `pid_start`, pane by `pane_id`). agent-resume keeps only `session_state` (R1, R2) for `--state` and the picker's colors.
 
 ---
 
@@ -272,77 +250,64 @@ Optionally: confirm by checking whether the PID recorded in the `start` event is
 
 | Component | Type | When invoked |
 |---|---|---|
-| `asm reindex` | Python script | scheduled, as part of `asm-reindex-and-rsync.sh` below |
-| `lifecycle_generation.sh` | shell script | Claude Code hooks (SessionStart / SessionEnd), and the Codex plugin below - same script, same trigger events |
-| `codex-plugin/` | Codex plugin | registered via `codex plugin`; wires Codex's SessionStart/SessionEnd to `lifecycle_generation.sh` |
-| `asm-sync` | shell script | trigger 1: backgrounded on `SessionEnd`; trigger 2: opportunistically at the start of `asm resume`; trigger 3: scheduled, as part of `asm-reindex-and-rsync.sh`; always a no-op if no remote configured |
-| `asm-reindex-and-rsync.sh` | shell script | scheduled through job-runner (`entrypoint.sh`) - runs `asm reindex` then unconditionally `asm-sync`, reindex failure never skips the sync step |
-| `asm` | shell script | terminal, before opening the agent (`asm resume`, `asm reindex`, …) |
-| `~/.claude/skills/inject-session`, `~/.agents/skills/inject-session` (links to the read-only copy `~/opt/agent-session-manager/skills/inject-session/`) | skill | inside an active Claude Code or Codex session |
+| `ares` (`resume`, `tmux`, `reindex`; alias `asm`) | Python script | terminal; `reindex` also scheduled, by `ares-reindex-and-rsync.sh` |
+| `duplicate_warning.py` | Python script | Claude Code SessionStart hook (R6.3) |
+| `ares-sync` (alias `asm-sync`) | shell script | trigger 1: opportunistically at the start of `ares resume`; trigger 2: scheduled, by `ares-reindex-and-rsync.sh`; always a no-op if no remote configured |
+| `ares-reindex-and-rsync.sh` | shell script | scheduled through job-runner (`entrypoint.sh`, every 30 min) - runs `ares reindex` then unconditionally `ares-sync` |
+| `~/.claude/skills/inject-session`, `~/.agents/skills/inject-session` (links to the read-only copy `~/opt/agent-resume/skills/inject-session/`) | skill | inside an active Claude Code or Codex session |
 
-### R6.2: `asm reindex`
+### R6.2: `ares reindex`
 
 Scans all local session files and writes the local JSON index. Purely local - never touches the network.
 
-- For each backend in `BACKENDS` (`claude`, and `codex` if enabled), scan its session files (`~/.claude/projects/**/<uuid>.jsonl` or `~/.codex/sessions/**/*.jsonl`), first checking `ignore_path_substrings` (`~/opt/agent-session-manager/data/settings.json`) - if the path matches, skip it entirely, before any mtime comparison
-- Otherwise, check if `~/opt/agent-session-manager/data/indexes/<uuid>.json` exists and has a newer mtime than the `.jsonl`
-- If yes: skip
-- If no: read the `.jsonl` (via that backend's `parse`) and the corresponding lifecycle sidecar at `~/opt/agent-session-manager/data/lifecycles/<uuid>.jsonl` (if present), extract fields, write `<uuid>.json` to the index folder with `agent_type` set accordingly
-- Writes are atomic (write to temp file, then rename) to avoid partial reads by `asm resume`
+- For each backend in `BACKENDS` (`claude`, and `codex` if enabled), scan its session files, skipping paths that match `ignore_path_substrings` (settings)
+- A session is re-indexed when its `.jsonl` or agent-tracker's `lifecycle.jsonl` is newer than its `<uuid>.json` (`needs_reindex`); `--force` re-indexes everything
+- Writes are atomic (temp file, then rename) to avoid partial reads by `ares resume`
+- The same two steps (`plan_reindex`, `run_reindex`) serve the search-time refresh (R6.5)
 
-### R6.3: `lifecycle_generation.sh`
+### R6.3: `duplicate_warning.py` (SessionStart)
 
-Registered as a `SessionStart`/`SessionEnd` hook - natively in `~/.claude/settings.json` for Claude Code, and via a `codex plugin` (`asm@asm-local`) for Codex, both invoking this same script unmodified. Start vs resume is inferred from sidecar existence; no `SessionResume` hook exists in either agent.
+The only hook of agent-resume. It reads agent-tracker's `lifecycle.jsonl` of the starting Claude session and warns when an earlier start line of this machine and this boot has a pid that is still alive with the same start time (`ps lstart` vs `pid_start`, 2 s slack) and is not this session's own process (an ancestor of the hook). Then, and only then, it prints an orange banner on `/dev/tty` (3 s to press Ctrl+C) and the same text as `hookSpecificOutput.additionalContext` on stdout. Otherwise it prints nothing. It never writes and always exits 0. asm's former cross-machine and changed-folder warnings were dropped with its lifecycle hook.
 
-- Appends one JSON line to `~/opt/agent-session-manager/data/lifecycles/<uuid>.jsonl`
-- Creates the file (and `~/opt/agent-session-manager/data/lifecycles/` itself) if it does not exist
-- Must complete quickly (hooks block the Claude session start)
-- On `SessionEnd`, also triggers `asm reindex --uuid <session_id>` and a backgrounded `asm-sync --push <session_id>` (trigger 1, below)
+### R6.4: `ares-sync` (optional, cross-machine, index-only)
 
-### R6.4: `asm-sync` (optional, cross-machine, index-only)
+Reconciles **only** `~/opt/agent-resume/data/indexes/*.json` between the local machine and one remote host over SSH - no shared filesystem, mount, or cloud-storage folder required, and no raw `.jsonl` or agent-tracker files are ever transferred. The index already embeds the full conversation, so nothing needed for search or `/inject-session` is lost - and since index files are always fully regenerated by `ares reindex`, newest-`mtime`-wins is the only reconciliation rule needed.
 
-Reconciles **only** `~/opt/agent-session-manager/data/indexes/*.json` between the local machine and one remote host over SSH - no shared filesystem, mount, or cloud-storage folder required, and no raw `.jsonl`/lifecycle files are ever transferred. The index already embeds the full conversation (every message, role, timestamp), so nothing needed for search or `/inject-session` is lost by not syncing the raw files - and since index files are always fully regenerated by `asm reindex` rather than hand-appended, newest-`mtime`-wins is the only reconciliation rule ever needed (no byte-level conflict resolution, unlike raw session logs would require).
+**Topology - hub and spoke, not mesh.** SSH connections are always initiated by whichever machine has `remote_ssh_host` configured (the "spoke"); the hub never dials out. In this project's deployment, the always-reachable VM is the hub (its own `remote_ssh_host` stays empty), and the laptop is a spoke that both pushes and pulls.
 
-**Topology - hub and spoke, not mesh.** SSH connections here are always initiated by whichever machine has `remote_ssh_host` configured (the "spoke"); the target ("hub") never dials out. In this project's actual deployment, the always-reachable VM is the hub (its own `remote_ssh_host` stays empty - nothing to push to, and it likely isn't reachable from outside anyway), and the laptop is a spoke that both pushes and pulls, so it gets full visibility too, not just the hub.
+- Configured in `~/opt/agent-resume/data/settings.json`: `remote_ssh_host`, `remote_ssh_user`, `remote_ssh_port`, `remote_index_dir` (path on the remote). If `remote_ssh_host` is empty, `ares-sync` exits silently.
+- Transport is `ssh`/`rsync`. One SSH round trip builds a manifest (path, size, mtime) of the remote's index files; new-on-one-side files are pushed/pulled in a single batched `rsync`; files present on both sides use newest-mtime-wins.
+- `ares-sync [uuid]` syncs one session's index entry (bidirectional); `ares-sync` with no argument syncs the whole index dir; `--push`/`--pull` restrict direction; `--check` is a dry run.
 
-- Configured in `~/opt/agent-session-manager/data/settings.json`: `remote_ssh_host`, `remote_ssh_user`, `remote_ssh_port`, `remote_index_dir` (path on the remote). If `remote_ssh_host` is empty, `asm-sync` exits silently - sync is entirely optional, and this is how a hub machine opts out of ever pushing/pulling.
-- Transport is `ssh`/`rsync`. One SSH round trip builds a manifest (path, size, mtime) of the remote's index files; new-on-one-side files are pushed/pulled in a single batched `rsync`; files present on both sides use newest-mtime-wins, no fetch-and-compare needed.
-- `asm-sync [uuid]` syncs one session's index entry (bidirectional); `asm-sync` with no argument syncs the whole index dir; `--push`/`--pull` restrict direction; `--check` is a dry run.
-- Does **not** attempt to alias project-folder slugs between machines the way a shared-mount setup would - see D2/D3 for why that doesn't apply without a shared filesystem, and why a synced session always falls back to `/inject-session` rather than true resume (which was never in scope for index-only sync anyway).
+**Offline resilience.** Every real (non-`--check`) run that reaches the SSH reachability check appends one line to `~/opt/agent-resume/data/sync-log.jsonl`: `{"timestamp": ..., "outcome": "success", "synced": N, "errors": N}` or `{"timestamp": ..., "outcome": "unreachable"}`. `ares-sync` always exits cleanly either way. `ares resume` (R6.5) reads this log to warn when the local index hasn't synced in a while.
 
-**Offline resilience.** Every real (non-`--check`) run that gets far enough to attempt the SSH reachability check appends one line to `~/opt/agent-session-manager/data/sync-log.jsonl`: `{"timestamp": ..., "outcome": "success", "synced": N, "errors": N}` or `{"timestamp": ..., "outcome": "unreachable"}`. A spoke machine (laptop, working intermittently offline) is expected to fail this regularly and harmlessly - `asm-sync` always exits cleanly either way, never treats "can't reach the remote right now" as a fatal error. `asm resume` (R6.5) reads this log to warn when the local index hasn't successfully synced in a while, rather than silently searching stale data with no indication.
+**Two triggers** (the third, asm's SessionEnd push, went with its lifecycle hook on 2026-11-07: a just-ended session reaches the hub within 30 min):
+1. Start of `ares resume` - rate-limited (skipped if attempted <60s ago) opportunistic pull, hard-capped at 5 s, never fatal.
+2. `ares-reindex-and-rsync.sh`, scheduled by its job-runner entrypoint (every 30 min) - `ares reindex` then unconditionally `ares-sync` (both directions). Whether the VM sync still needs this job now that `ares resume` refreshes the index itself is an open point (agent-tracker `DESIGN.md` "Open points").
 
-**Three triggers, kept independent on purpose** (separate failure modes, easy to tell apart in logs):
-1. `SessionEnd` hook - reindex the session that just ended, push its one index entry. Backgrounded, non-blocking.
-2. Start of `asm resume` - rate-limited (skipped if attempted <60s ago) opportunistic pull, hard-capped at a few seconds via a subprocess timeout, wrapped so it can never crash or hang the interactive command.
-3. `asm-reindex-and-rsync.sh`, scheduled by its job-runner entrypoint (every ~30 min) - `asm reindex` then unconditionally `asm-sync` (both directions). Reindex failing must never skip the sync step, so this wrapper explicitly ignores reindex's exit status rather than chaining under `set -e`.
+### R6.5: `ares resume`
 
-### R6.5: `asm resume`
-
-Main entry point for finding and resuming a past session from the terminal.
-
-**Usage:** `asm resume "keyword1 keyword2"`
+**Usage:** `ares resume keyword1 keyword2`
 
 **Flow:**
-1. If a remote is configured (R6.4): opportunistic rate-limited pull (trigger 2), then check `~/opt/agent-session-manager/data/sync-log.jsonl` for the last successful sync - if missing or older than `sync_stale_warning_hours` (default 24, `~/opt/agent-session-manager/data/settings.json`), print a one-line `⚠` warning before results. Both steps are skipped entirely, silently, if no remote is configured.
-2. Runs the search (R3) against the index
-3. Opens `fzf` with matching sessions - showing title, hostname, last active timestamp, matching snippet
-4. User picks a session
-5. Reads the original working directory from the index file (see R1), and dispatches to the doc's `agent_type` backend for step 6
-6. If the working directory exists on this machine:
-    - exec `cd <original-dir> && claude --dangerously-skip-permissions --resume <uuid>` (Claude) or `cd <original-dir> && codex resume <uuid>` (Codex) - **true resume**, appends to the original `.jsonl`
-7. If the working directory does not exist on this machine (e.g. a session synced from another machine, whose absolute path doesn't exist here - the expected case for any cross-machine session, since true resume was never a goal of index-only sync):
-    - Print yellow WARNING: session cannot be truly resumed from this machine
-    - Print: `Open Claude Code or Codex and invoke the /inject-session skill with <uuid>`
+1. If a remote is configured (R6.4): opportunistic rate-limited pull (trigger 1), then a one-line `⚠` warning if the last successful sync is missing or older than `sync_stale_warning_hours` (default 24).
+2. **Refresh** (`refresh_index`): the dates of all transcripts, index entries and lifecycles first (~50 ms for 3,111 transcripts, measured 2026-11-07 on the Mac), then re-index only the changed ones (2 changed: 15 ms). Silent; a failure leaves the index as it was. `--uuid` refreshes the same way before looking up the UUID.
+3. Search (R3), then `fzf` with the matches; the user picks one.
+4. If the working directory exists on this machine: exec `cd <dir> && claude [--dangerously-skip-permissions] --resume <uuid>` (Claude) or `cd <dir> && codex resume <uuid>` (Codex) - **true resume**.
+5. If not (e.g. a session synced from another machine): print that true resume is not possible and to run `/inject-session <uuid>` inside Claude Code or Codex.
 
 ### R6.6: `/inject-session`
 
 Skill for context injection when true resume is not possible, identical content installed for both agents.
 
-- Invoked inside an active session via `~/.claude/skills/inject-session` (Claude Code) or `~/.agents/skills/inject-session` (Codex), both links to the read-only copy `~/opt/agent-session-manager/skills/inject-session/` - Codex triggers skills by name/description match rather than Claude's `/inject-session <arg>` slash-command syntax, so the skill's own instructions describe both invocation styles
-- **Usage:** `/inject-session <uuid>` (Claude Code) or a plain-text mention of the skill plus the uuid/keywords (Codex), or `/inject-session "<custom title>"` (fuzzy match against index if title provided)
-- Loads the session content from the index and injects it into the current conversation - works the same regardless of whether the target session's `agent_type` is claude or codex, since the index already normalized both into the same conversation shape
+- Invoked inside an active session via `~/.claude/skills/inject-session` (Claude Code) or `~/.agents/skills/inject-session` (Codex), both links to the read-only copy `~/opt/agent-resume/skills/inject-session/`
+- **Usage:** `/inject-session <uuid>` (Claude Code) or a plain-text mention of the skill plus the uuid/keywords (Codex)
+- Loads the session content from the index and injects it into the current conversation, for either agent
 - **Not a true resume:** creates a new `.jsonl` for the current session; the original session history is not extended
+
+### R6.7: close (moved)
+
+`asm close` moved to agent-auto-close (`agent-auto-close close <uuid|%pane>`, the user, 2026-11-07): it shared no data with resume (agent-tracker `DESIGN.md` §10). `ares close` prints that one-line pointer and exits 1.
 
 ---
 
@@ -352,61 +317,47 @@ Skill for context injection when true resume is not possible, identical content 
 
 | File | Purpose |
 |---|---|
-| `asm` (`reindex`/`resume`) | R1/R6.2/R6.5: reads Claude Code `.jsonl` and Codex `.jsonl` via the `BACKENDS` registry + `~/opt/agent-session-manager/data/lifecycles/*.jsonl`, writes JSON index; search + fzf + exec resume/fork command |
-| `lifecycle_generation.sh` | R2: hook body, shared verbatim by both Claude Code's native hook and the Codex plugin below; writes `~/opt/agent-session-manager/data/lifecycles/<uuid>.jsonl` sidecar files |
-| `asm-sync` | R6.4: optional SSH-based sync of `~/opt/agent-session-manager/data/indexes/` only, between two machines (agent-agnostic - syncs both backends' index entries identically) |
-| `asm-reindex-and-rsync.sh` | R6.4: scheduled wrapper - `asm reindex` then unconditionally `asm-sync` |
-| `codex-plugin/` (`.codex-plugin/plugin.json` + `hooks/hooks.json`) | R2: Codex plugin manifest, registered as `asm@asm-local` - wires the same `lifecycle_generation.sh` into Codex's `SessionStart`/`SessionEnd` |
-| `~/.claude/skills/inject-session`, `~/.agents/skills/inject-session` (links to the read-only copy `~/opt/agent-session-manager/skills/inject-session/`) | R6.6: skill for context injection, one file for both agents |
+| `src/ares` | R1/R3/R4/R6.2/R6.5: index (both backends + agent-tracker's lifecycle), refresh, search, fzf, resume; `ares tmux` |
+| `src/duplicate_warning.py` | R6.3: the SessionStart hook |
+| `src/ares-sync` | R6.4: optional SSH sync of the index only |
+| `src/ares-reindex-and-rsync.sh`, `src/entrypoint.sh`, `src/entrypoint.conf` | R6.4: the scheduled job (job-runner), its dashboard settings |
+| `skills/inject-session/` | R6.6 |
+| `test/sandbox_test.sh`, `test/make_fixtures.py`, `test/smoke_test.sh` | tests: `TESTING.md` |
 
 ### Scheduler config
 
 | Device | Files | Purpose |
 |---|---|---|
-| macOS | `~/Library/LaunchAgents/com.jeanlescut.agent-session-manager.plist` (symlink to `~/opt/agent-session-manager/`) | starts `~/opt/agent-session-manager/entrypoint.sh` every 30 min (the whole schedule); it runs `asm-reindex-and-rsync.sh` through job-runner with a 20-min timeout and records it for the dashboard |
-| Linux | `~/.config/systemd/user/com.jeanlescut.agent-session-manager.{service,timer}` (symlinks to `~/opt/agent-session-manager/`) | the same, every 30 min |
+| macOS | `~/Library/LaunchAgents/com.jeanlescut.agent-resume.plist` (symlink to `~/opt/agent-resume/`) | starts `~/opt/agent-resume/entrypoint.sh` every 30 min; it runs `ares-reindex-and-rsync.sh` through job-runner with a 20-min timeout |
+| Linux | `~/.config/systemd/user/com.jeanlescut.agent-resume.{service,timer}` (symlinks to `~/opt/agent-resume/`) | the same, every 30 min; `install.sh` also best-effort runs `loginctl enable-linger` |
 
-The Linux unit files use systemd's native `%h` home-directory specifier, so unlike the macOS `.plist` they need no `sed` templating at install time. `install.sh` also best-effort runs `loginctl enable-linger` on Linux - without it, the user's systemd instance (and thus the timer) may only run while a session/SSH login is active, which matters for a VM you don't keep permanently logged into.
-
-Claude Code hook registration in `~/.claude/settings.json`:
+Claude Code hook registration in `~/.claude/settings.json` (install.sh replaces only this group):
 ```json
-"hooks": {
-  "SessionStart": [{"type": "command", "command": "HOOK_EVENT=start /path/to/lifecycle_generation.sh"}],
-  "SessionEnd":   [{"type": "command", "command": "HOOK_EVENT=end   /path/to/lifecycle_generation.sh"}]
-}
+"SessionStart": [{"matcher": "", "hooks": [{"type": "command", "timeout": 10,
+                  "command": "python3 \"$HOME/opt/agent-resume/duplicate_warning.py\""}]}]
 ```
-
-Codex hook registration (if detected) goes through `codex plugin marketplace add`/`codex plugin add asm@asm-local` instead of a hand-written config block - see the Phase 0 spike notes above for why. The `hooks/hooks.json` payload wires the identical `SessionStart`/`SessionEnd` events to the same `lifecycle_generation.sh`, unmodified. Codex requires a one-time interactive hook-trust approval on first use; `install.sh` cannot bypass this (see finding #3 above) and prints a reminder instead.
 
 ### Data files
 
-| File | Written by | Synced by asm-sync? |
+| File | Written by | Synced by ares-sync? |
 |---|---|---|
-| `~/opt/agent-session-manager/data/indexes/<uuid>.json` | `asm reindex` | yes, if a remote is configured |
-| `~/opt/agent-session-manager/data/lifecycles/<uuid>.jsonl` | `lifecycle_generation.sh` | no - never synced (see R6.4) |
-| `~/opt/agent-session-manager/data/settings.json` | user-edited / created by `install.sh` | no |
-| `~/opt/agent-session-manager/data/sync-log.jsonl` | `asm-sync` | no - local-only record of sync attempts |
+| `~/opt/agent-resume/data/indexes/<uuid>.json` | `ares reindex`, `ares resume` (refresh) | yes, if a remote is configured |
+| `~/opt/agent-resume/data/settings.json` | user-edited / created by `install.sh` | no |
+| `~/opt/agent-resume/data/sync-log.jsonl` | `ares-sync` | no |
+| `~/opt/agent-tracker/data/sessions/<uuid>/{lifecycle.jsonl,last_seen.json}` | agent-tracker (read only here) | no |
 
-### Filesystem structure (one-time setup per machine)
-
-Every machine is fully local and self-contained - no mounts, no symlinks to shared storage. What ASM owns lives under `~/opt/agent-session-manager/` (code and data together, per this machine's `~/opt/<project>/` convention); what Claude Code and Codex each own stays under their own dotfile dir (`~/.claude/`, `~/.codex/`) - ASM never relocates those, it only reads their session files and adds its own skill/hook registration alongside them:
+### Filesystem structure
 
 | Path | What it is |
 |---|---|
-| `~/.claude/projects/` | real local directory (written directly by Claude Code) |
-| `~/.codex/sessions/` | real local directory (written directly by Codex CLI, if installed) |
-| `~/opt/agent-session-manager/data/indexes/` | real local directory (written by `asm reindex`, both backends' entries mixed together) |
-| `~/opt/agent-session-manager/data/lifecycles/` | real local directory (written by `lifecycle_generation.sh`, shared by both agents' hooks) |
-| `~/opt/agent-session-manager/data/settings.json` | ASM's own settings |
-| `~/opt/agent-session-manager/data/sync-log.jsonl` | append-only sync-attempt log |
-| `~/opt/agent-session-manager/` | canonical deployment location - `bin/{asm,asm-sync,status}`, `lifecycle_generation.sh`, `asm-reindex-and-rsync.sh`, `codex-plugin/`, `install.sh`/`uninstall.sh` copies, and `data/` (above) |
-| `~/.local/bin/{asm,asm-sync,status}` | symlinks into `~/opt/agent-session-manager/bin/` - the only thing on `$PATH`, never real files |
+| `~/.claude/projects/`, `~/.codex/sessions/` | written by Claude Code and Codex CLI; only read |
+| `~/opt/agent-resume/` | deployment: `bin/{ares,ares-sync}`, `duplicate_warning.py`, the job files, `install.sh`/`uninstall.sh`, `skills/`, and `data/` (above) |
+| `~/.local/bin/{ares,ares-sync,asm,asm-sync}` | symlinks into `~/opt/agent-resume/bin/` (`asm*` = aliases) |
 
-`uninstall.sh` removes everything under `~/opt/agent-session-manager/` **except** `data/`, since code and data now share one parent directory - see its own header comment.
-
-`asm-sync` (optional) reconciles `~/opt/agent-session-manager/data/indexes/` with the equivalent directory on one remote host over SSH - see R6.4. There is no per-platform slug-aliasing setup step; that only made sense when multiple machines shared one mounted folder.
+`uninstall.sh` removes everything under `~/opt/agent-resume/` **except** `data/`. Moving from `~/opt/agent-session-manager/`: `doc/deploy_migration.md`.
 
 ---
+
 
 # Part 2: Design Notes
 

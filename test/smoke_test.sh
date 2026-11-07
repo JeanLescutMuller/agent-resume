@@ -1,35 +1,26 @@
 #!/usr/bin/env bash
-# smoke_test.sh - Non-destructive health check for an ASM install.
+# smoke_test.sh - Non-destructive health check for an agent-resume (ares) install.
 #
-# Run this on each machine (laptop, VM) to confirm indexing, lifecycle
-# hooks, and cross-machine sync are actually working, not just installed.
-# Read-only / additive wherever possible:
-#   - never deletes or overwrites real index/lifecycle files
-#   - the one write it performs (a lifecycle sidecar for a fake test UUID)
-#     is cleaned up at the end, even on failure (trap)
-#   - `asm reindex` and `asm-sync` are real commands, but both are designed
-#     to be safely re-run any time (mtime-skip / mtime-wins) - this is the
-#     same reindex+sync pair the scheduled job already runs every 30 min.
+# Run this on each machine (laptop, VM) to confirm indexing, the SessionStart hook and
+# cross-machine sync are actually working, not just installed. Read-only / additive:
+#   - never deletes or overwrites real index files, and never writes agent-tracker's files
+#     (the duplicate-warning check uses a temporary $AGENT_TRACKER_HOME of its own)
+#   - `ares reindex` and `ares-sync` are real commands, but both are designed to be safely
+#     re-run any time (mtime-skip / mtime-wins) - the same pair the scheduled job runs every 30 min.
+#   - when $HOME is not the user's real home (test/sandbox_test.sh runs it so), the scheduler
+#     checks are skipped: they would call launchctl / systemctl.
 #
 # Usage:
-#   bash test/smoke_test.sh            # full run, including live asm-sync
+#   bash test/smoke_test.sh            # full run, including live ares-sync
 #   bash test/smoke_test.sh --offline  # skip anything that touches the network
-#   bash test/smoke_test.sh --live     # also exercise `codex plugin` install/
-#                                       # uninstall in an isolated scratch
-#                                       # CODEX_HOME (no API calls, no cost -
-#                                       # just real `codex` CLI config commands)
 #
 # Exit status: 0 if every check passed, 1 if any failed.
 
 set -uo pipefail
 
 OFFLINE=false
-LIVE=false
 for arg in "$@"; do
-    case "$arg" in
-        --offline) OFFLINE=true ;;
-        --live) LIVE=true ;;
-    esac
+    [[ "$arg" == --offline ]] && OFFLINE=true
 done
 
 PASS=0
@@ -41,16 +32,18 @@ fail() { echo -e "  \033[31mFAIL\033[0m  $1"; FAIL=$((FAIL+1)); }
 warn() { echo -e "  \033[33mWARN\033[0m  $1"; WARN=$((WARN+1)); }
 section() { echo ""; echo "== $1 =="; }
 
-ASM_HOME="$HOME/opt/agent-session-manager/data"
-DEPLOY_DIR="$HOME/opt/agent-session-manager"
+DEPLOY_DIR="$HOME/opt/agent-resume"
+ASM_HOME="$DEPLOY_DIR/data"
 BIN_DIR="$DEPLOY_DIR/bin"
 LOCAL_BIN="$HOME/.local/bin"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC_ASM="$REPO_ROOT/src/asm"
+SRC_ASM="$REPO_ROOT/src/ares"
+REAL_HOME=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
+SANDBOX=$( [[ "$HOME" != "$REAL_HOME" ]] && echo true || echo false )
 
 # A non-interactive shell (e.g. `ssh host command`) doesn't source ~/.bashrc,
 # so ~/.local/bin may not be on PATH even though it is in real interactive
-# use. Make sure it's there so asm/asm-sync/status resolve either way.
+# use. Make sure it's there so ares/ares-sync resolve either way.
 case ":$PATH:" in
     *":$LOCAL_BIN:"*) ;;
     *) export PATH="$LOCAL_BIN:$PATH" ;;
@@ -63,7 +56,9 @@ section "Preflight"
 
 command -v python3 &>/dev/null && pass "python3 available" || fail "python3 not found"
 command -v fzf &>/dev/null && pass "fzf available" || fail "fzf not found"
-command -v jq &>/dev/null && pass "jq available (asm-sync/lifecycle hook fast path)" || warn "jq not found (falls back to python3, slower but OK)"
+[[ -d "${AGENT_TRACKER_HOME:-$HOME/opt/agent-tracker}/data/sessions" ]] \
+    && pass "agent-tracker's session files present (session state, duplicate warning, ares tmux read them)" \
+    || warn "no ${AGENT_TRACKER_HOME:-~/opt/agent-tracker}/data/sessions: install agent-tracker (states stay unknown)"
 [[ -f "$SETTINGS_JSON" ]] && python3 -c "import json; json.load(open('$SETTINGS_JSON'))" 2>/dev/null \
     && pass "settings.json exists and is valid JSON" \
     || fail "settings.json missing or invalid: $SETTINGS_JSON"
@@ -80,20 +75,23 @@ fi
 # ---------------------------------------------------------------------------
 section "Deployment layout"
 
-for f in asm asm-sync status; do
+for pair in ares:ares ares-sync:ares-sync asm:ares asm-sync:ares-sync; do
+    f=${pair%%:*}; target_want="$BIN_DIR/${pair#*:}"
     if [[ -L "$LOCAL_BIN/$f" ]]; then
         target=$(readlink "$LOCAL_BIN/$f")
-        [[ "$target" == "$BIN_DIR/$f" ]] \
-            && pass "$LOCAL_BIN/$f -> $BIN_DIR/$f" \
+        [[ "$target" == "$target_want" ]] \
+            && pass "$LOCAL_BIN/$f -> $target_want" \
             || fail "$LOCAL_BIN/$f symlink points to unexpected target: $target"
     else
         fail "$LOCAL_BIN/$f is missing or not a symlink"
     fi
 done
 
-for f in lifecycle_generation.sh asm-reindex-and-rsync.sh entrypoint.sh install.sh uninstall.sh; do
+for f in duplicate_warning.py ares-reindex-and-rsync.sh entrypoint.sh install.sh uninstall.sh; do
     [[ -f "$DEPLOY_DIR/$f" ]] && pass "$DEPLOY_DIR/$f present" || fail "$DEPLOY_DIR/$f missing"
 done
+[[ ! -e "$HOME/opt/agent-session-manager/bin" ]] \
+    || fail "the former deploy root ~/opt/agent-session-manager still has its code (re-run install.sh)"
 
 [[ "$(readlink "$HOME/.claude/skills/inject-session")" == "$DEPLOY_DIR/skills/inject-session" && ! -w "$HOME/.claude/skills/inject-session/SKILL.md" ]] \
     && pass "/inject-session skill linked" \
@@ -104,12 +102,12 @@ done
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -d "$REPO_DIR/src" ]]; then
     drift=0
-    for f in asm asm-sync status; do
+    for f in ares ares-sync; do
         if [[ -f "$REPO_DIR/src/$f" && -f "$BIN_DIR/$f" ]]; then
             diff -q "$REPO_DIR/src/$f" "$BIN_DIR/$f" &>/dev/null || drift=1
         fi
     done
-    for f in lifecycle_generation.sh asm-reindex-and-rsync.sh entrypoint.sh install.sh uninstall.sh; do
+    for f in duplicate_warning.py ares-reindex-and-rsync.sh entrypoint.sh install.sh uninstall.sh; do
         if [[ -f "$REPO_DIR/src/$f" && -f "$DEPLOY_DIR/$f" ]]; then
             diff -q "$REPO_DIR/src/$f" "$DEPLOY_DIR/$f" &>/dev/null || drift=1
         elif [[ -f "$REPO_DIR/$f" && -f "$DEPLOY_DIR/$f" ]]; then
@@ -123,46 +121,45 @@ else
     warn "not running from a repo checkout - skipping src/ drift check"
 fi
 
-# Claude Code hooks registered
+# Claude Code hooks: agent-resume's SessionStart group, and none of asm's old lifecycle hook
 if [[ -f "$CLAUDE_SETTINGS" ]]; then
     hook_ok=$(python3 -c "
 import json
-d = json.load(open('$CLAUDE_SETTINGS'))
-hooks = d.get('hooks', {})
-def has_lifecycle(evt):
-    for entry in hooks.get(evt, []):
-        for h in entry.get('hooks', []):
-            if 'lifecycle_generation.sh' in h.get('command', ''):
-                return True
-    return False
-print('1' if has_lifecycle('SessionStart') and has_lifecycle('SessionEnd') else '0')
+hooks = json.load(open('$CLAUDE_SETTINGS')).get('hooks', {})
+cmds = lambda evt: [h.get('command', '') for e in hooks.get(evt, []) for h in e.get('hooks', [])]
+ours = sum('agent-resume/duplicate_warning.py' in c for c in cmds('SessionStart'))
+old = any('lifecycle_generation.sh' in c for c in cmds('SessionStart') + cmds('SessionEnd'))
+print('1' if ours == 1 and not old else '0')
 " 2>/dev/null)
     [[ "$hook_ok" == "1" ]] \
-        && pass "SessionStart/SessionEnd hooks registered in ~/.claude/settings.json" \
-        || fail "lifecycle_generation.sh not wired into SessionStart+SessionEnd hooks"
+        && pass "SessionStart hook duplicate_warning.py registered once; no old lifecycle hook" \
+        || fail "SessionStart hook duplicate_warning.py missing or doubled, or asm's lifecycle_generation.sh still registered"
 else
     fail "~/.claude/settings.json not found"
 fi
 
 # Scheduler: this machine's trigger runs entrypoint.sh (for job-runner, separate project) every 30 min
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    launchctl list com.jeanlescut.agent-session-manager >/dev/null 2>&1 \
-        && pass "LaunchAgent com.jeanlescut.agent-session-manager loaded" || fail "LaunchAgent com.jeanlescut.agent-session-manager not loaded (re-run install.sh)"
+if $SANDBOX; then
+    warn "sandbox HOME: scheduler not checked (no launchctl / systemctl call)"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    launchctl list com.jeanlescut.agent-resume >/dev/null 2>&1 \
+        && pass "LaunchAgent com.jeanlescut.agent-resume loaded" || fail "LaunchAgent com.jeanlescut.agent-resume not loaded (re-run install.sh)"
 else
-    systemctl --user is-active --quiet com.jeanlescut.agent-session-manager.timer \
-        && pass "systemd timer com.jeanlescut.agent-session-manager active" || fail "systemd timer com.jeanlescut.agent-session-manager not active (re-run install.sh)"
+    systemctl --user is-active --quiet com.jeanlescut.agent-resume.timer \
+        && pass "systemd timer com.jeanlescut.agent-resume active" || fail "systemd timer com.jeanlescut.agent-resume not active (re-run install.sh)"
 fi
-[[ -f "$HOME/opt/job-runner/lib.sh" ]] \
-    && pass "job-runner installed" || fail "job-runner missing: ~/opt/job-runner/lib.sh"
+if [[ -f "$HOME/opt/job-runner/lib.sh" ]]; then pass "job-runner installed"
+elif $SANDBOX; then warn "sandbox HOME: no job-runner"
+else fail "job-runner missing: ~/opt/job-runner/lib.sh"; fi
 [[ ! -e "$DEPLOY_DIR/mho_var.sh" ]] || fail "the former multi-host-orchestrator job file mho_var.sh is still there (re-run install.sh)"
 [[ ! -e "$HOME/opt/multi-host-orchestrator/jobs/asm-reindex-and-rsync.conf" ]] \
     || fail "the former job link jobs/asm-reindex-and-rsync.conf is still there (re-run install.sh)"
-for name in com.asm.reindex-sync com.csm.reindex-sync com.asm.reindex-and-rsync asm-reindex-and-rsync; do
+for name in com.jeanlescut.agent-session-manager com.asm.reindex-sync com.csm.reindex-sync com.asm.reindex-and-rsync asm-reindex-and-rsync; do
     if [[ -e "$HOME/Library/LaunchAgents/$name.plist" || -e "$HOME/.config/systemd/user/$name.timer" ]]; then
         fail "former scheduling $name still present: the job would run twice (re-run install.sh)"
     fi
 done
-if [[ "$(uname -s)" != "Darwin" ]]; then
+if [[ "$(uname -s)" != "Darwin" ]] && ! $SANDBOX; then
     if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
         pass "loginctl linger enabled (timer survives logout)"
     else
@@ -173,55 +170,30 @@ fi
 # ---------------------------------------------------------------------------
 section "CLI basics"
 
-if out=$(asm --version 2>&1); then
-    pass "asm --version -> $out"
+if out=$(ares --version 2>&1); then
+    pass "ares --version -> $out"
 else
-    fail "asm --version exited non-zero: $out"
+    fail "ares --version exited non-zero: $out"
 fi
-
-if asm --help &>/dev/null; then
-    pass "asm --help exits 0"
-else
-    fail "asm --help exited non-zero"
-fi
+ares --help &>/dev/null && pass "ares --help exits 0" || fail "ares --help exited non-zero"
+[[ "$(asm --version 2>&1)" == "$(ares --version 2>&1)" ]] && pass "asm is an alias of ares" || fail "asm --version differs from ares --version"
+out=$(ares close 2>&1); rc=$?
+[[ $rc -ne 0 && "$out" == *agent-auto-close* ]] && pass "ares close points to agent-auto-close" || fail "ares close did not print the pointer (rc=$rc): $out"
+ares tmux --help &>/dev/null && pass "ares tmux --help exits 0" || fail "ares tmux --help exited non-zero"
 
 # ---------------------------------------------------------------------------
-section "status script"
+section "Reindex (ares reindex)"
 
-unset CLAUDE_CODE_SESSION_ID
-out=$(status 2>&1)
-if [[ "$out" == *"CLAUDE_CODE_SESSION_ID not set"* ]]; then
-    pass "status correctly reports 'not running' when env var unset"
-else
-    fail "status did not print expected message when env var unset: $out"
-fi
-
-# Pick a real, recently-indexed local session to test the populated path.
-sample_uuid=$(ls -t "$ASM_HOME/indexes"/*.json 2>/dev/null | head -1 | xargs -I{} basename {} .json)
-if [[ -n "${sample_uuid:-}" ]]; then
-    out=$(CLAUDE_CODE_SESSION_ID="$sample_uuid" status 2>&1)
-    if echo "$out" | grep -q "^Title:" && echo "$out" | grep -q "^UUID: *$sample_uuid$"; then
-        pass "status prints populated report for a real session ($sample_uuid)"
-    else
-        fail "status output missing expected fields for $sample_uuid"
-    fi
-else
-    warn "no local index files found - skipping populated status check"
-fi
-
-# ---------------------------------------------------------------------------
-section "Reindex (asm reindex)"
-
-if out=$(asm reindex 2>&1); then
-    pass "asm reindex exits 0"
+if out=$(ares reindex 2>&1); then
+    pass "ares reindex exits 0"
     echo "$out" | sed 's/^/    /'
 else
-    fail "asm reindex exited non-zero"
+    fail "ares reindex exited non-zero"
     echo "$out" | sed 's/^/    /'
 fi
 
 # Second run right after should skip everything (nothing new to index).
-out2=$(asm reindex 2>&1)
+out2=$(ares reindex 2>&1)
 if echo "$out2" | grep -qE "0 to reindex"; then
     pass "second reindex run is a no-op (mtime-skip working)"
 else
@@ -257,7 +229,7 @@ fi
 # ---------------------------------------------------------------------------
 section "Multi-agent backends (source checkout, install-independent)"
 
-# Runs src/asm directly rather than the deployed copy, so this section is
+# Runs src/ares directly rather than the deployed copy, so this section is
 # meaningful even before install.sh has been run - it tests the BACKENDS
 # abstraction itself (claude + codex), not the deployment. codex checks are
 # skipped, not failed, on a machine with no ~/.codex/sessions.
@@ -420,48 +392,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "Close parity (documented gap for codex, source checkout)"
-
-# Codex has no live-session surface yet (see DEV_DOC.md "Codex integration
-# notes" #4), so `asm close` must fail loudly and clearly on a codex-tagged
-# --uuid rather than a misleading generic error or a crash.
-
-close_check=$(python3 - "$SRC_ASM" <<'PYEOF' 2>&1
-import sys, json, glob, os
-from importlib.machinery import SourceFileLoader
-
-asm_mod = SourceFileLoader("asm_mod", sys.argv[1]).load_module()
-for f in glob.glob(os.path.join(asm_mod.LOCAL_INDEX_DIR, "*.json")):
-    try:
-        d = json.load(open(f))
-    except (OSError, ValueError):
-        continue
-    if d.get("agent_type") == "codex":
-        print(d["session_id"])
-        break
-PYEOF
-)
-codex_uuid=$(echo "$close_check" | tail -1)
-
-if [[ -n "$codex_uuid" ]]; then
-    close_out=$(python3 "$SRC_ASM" close --uuid "$codex_uuid" 2>&1)
-    close_rc=$?
-    if [[ $close_rc -ne 0 ]] && echo "$close_out" | grep -qi "not supported for codex"; then
-        pass "'asm close --uuid <codex session>' fails with a clear, documented message"
-    else
-        fail "'asm close --uuid <codex session>' did not fail with the expected message (rc=$close_rc): $close_out"
-    fi
-else
-    warn "no codex session available to check close-parity messaging on"
-fi
-
-# ---------------------------------------------------------------------------
 section "Search (find_sessions, headless - no fzf)"
 
 search_result=$(python3 - <<'PYEOF' 2>&1
 import sys, importlib.util, os, glob, json
 from importlib.machinery import SourceFileLoader
-loader = SourceFileLoader("asm_mod", os.path.expanduser("~/.local/bin/asm"))
+loader = SourceFileLoader("asm_mod", os.path.expanduser("~/.local/bin/ares"))
 spec = importlib.util.spec_from_loader("asm_mod", loader)
 asm_mod = importlib.util.module_from_spec(spec)
 loader.exec_module(asm_mod)
@@ -478,7 +414,7 @@ def usable_keyword(path):
     title = (idx.get("custom_title") or "").replace("(auto-generated)", "").strip()
     return next((w for w in title.split() if len(w) > 3 and w.isalnum()), None)
 
-indexes = sorted(glob.glob(os.path.expanduser("~/opt/agent-session-manager/data/indexes/*.json")),
+indexes = sorted(glob.glob(os.path.expanduser("~/opt/agent-resume/data/indexes/*.json")),
                  key=os.path.getmtime, reverse=True)
 uuid = keyword = None
 for path in indexes:
@@ -507,7 +443,7 @@ esac
 host_check=$(python3 - <<'PYEOF' 2>&1
 import importlib.util, os
 from importlib.machinery import SourceFileLoader
-loader = SourceFileLoader("asm_mod", os.path.expanduser("~/.local/bin/asm"))
+loader = SourceFileLoader("asm_mod", os.path.expanduser("~/.local/bin/ares"))
 spec = importlib.util.spec_from_loader("asm_mod", loader)
 asm_mod = importlib.util.module_from_spec(spec)
 loader.exec_module(asm_mod)
@@ -525,17 +461,13 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Sync runs BEFORE the lifecycle-hook simulation below on purpose: that
-# simulation triggers a real backgrounded `asm-sync --push` (R6.3), which
-# would otherwise race the sync-log assertions here and produce a spurious
-# extra line / timing flake.
-section "Sync (asm-sync)"
+section "Sync (ares-sync)"
 
 if [[ -z "$REMOTE_HOST" ]]; then
-    pass "hub role: remote_ssh_host empty, asm-sync should no-op"
-    out=$(asm-sync 2>&1)
+    pass "hub role: remote_ssh_host empty, ares-sync should no-op"
+    out=$(ares-sync 2>&1)
     rc=$?
-    [[ $rc -eq 0 ]] && pass "asm-sync exits 0 with no remote configured" || fail "asm-sync exited $rc with no remote configured"
+    [[ $rc -eq 0 ]] && pass "ares-sync exits 0 with no remote configured" || fail "ares-sync exited $rc with no remote configured"
 elif $OFFLINE; then
     warn "skipping live sync checks (--offline)"
 else
@@ -543,10 +475,10 @@ else
         pass "SSH reachable: $REMOTE_USER@$REMOTE_HOST:$REMOTE_PORT"
 
         before_lines=$(wc -l < "$ASM_HOME/sync-log.jsonl" 2>/dev/null || echo 0)
-        if out=$(asm-sync --check 2>&1); then
-            pass "asm-sync --check (dry run) exits 0"
+        if out=$(ares-sync --check 2>&1); then
+            pass "ares-sync --check (dry run) exits 0"
         else
-            fail "asm-sync --check exited non-zero: $out"
+            fail "ares-sync --check exited non-zero: $out"
         fi
         after_lines=$(wc -l < "$ASM_HOME/sync-log.jsonl" 2>/dev/null || echo 0)
         [[ "$before_lines" == "$after_lines" ]] \
@@ -556,10 +488,10 @@ else
         # Real sync: safe by design (mtime-wins, index-only), same as the
         # scheduled job. Confirms end-to-end reachability + rsync auth.
         before_lines=$(wc -l < "$ASM_HOME/sync-log.jsonl" 2>/dev/null || echo 0)
-        if out=$(asm-sync 2>&1); then
-            pass "asm-sync (live) exits 0"
+        if out=$(ares-sync 2>&1); then
+            pass "ares-sync (live) exits 0"
         else
-            fail "asm-sync (live) exited non-zero: $out"
+            fail "ares-sync (live) exited non-zero: $out"
         fi
         after_lines=$(wc -l < "$ASM_HOME/sync-log.jsonl" 2>/dev/null || echo 0)
         if [[ "$after_lines" -gt "$before_lines" ]]; then
@@ -570,13 +502,13 @@ else
                 fail "sync-log.jsonl recorded a non-success outcome: $last_line"
             fi
         else
-            fail "asm-sync (live) did not append to sync-log.jsonl"
+            fail "ares-sync (live) did not append to sync-log.jsonl"
         fi
     else
         warn "SSH unreachable: $REMOTE_USER@$REMOTE_HOST:$REMOTE_PORT (offline spoke - expected sometimes)"
-        out=$(asm-sync 2>&1)
+        out=$(ares-sync 2>&1)
         rc=$?
-        [[ $rc -eq 0 ]] && pass "asm-sync still exits 0 cleanly when remote is unreachable" || fail "asm-sync exited $rc when remote unreachable (should always exit 0)"
+        [[ $rc -eq 0 ]] && pass "ares-sync still exits 0 cleanly when remote is unreachable" || fail "ares-sync exited $rc when remote unreachable (should always exit 0)"
         if tail -1 "$ASM_HOME/sync-log.jsonl" 2>/dev/null | grep -q '"outcome": *"unreachable"'; then
             pass "sync-log.jsonl correctly recorded 'unreachable'"
         else
@@ -599,128 +531,23 @@ print(round((datetime.now(timezone.utc) - t).total_seconds() / 3600, 1))
 fi
 
 # ---------------------------------------------------------------------------
-section "Lifecycle hook (simulated, isolated test UUID)"
+section "Duplicate warning hook (temporary AGENT_TRACKER_HOME, never the real one)"
 
-# This exercises lifecycle_generation.sh with a raw {session_id,
-# transcript_path, cwd} stdin JSON payload - confirmed live (Phase 0 spike,
-# DEV_DOC.md "Codex integration notes") to be byte-for-byte the same shape
-# Codex delivers on SessionStart/SessionEnd, so this section validates both
-# agents' hook contract at once without needing a real `codex exec` call
-# here too. See --live below for the part that's actually Codex-specific:
-# whether `codex plugin`-based install/uninstall itself works.
-
-TEST_UUID="00000000-test-smoke-0000-$(date +%s)"
-TEST_SIDECAR="$ASM_HOME/lifecycles/${TEST_UUID}.jsonl"
-cleanup_lifecycle() { rm -f "$TEST_SIDECAR"; }
-trap cleanup_lifecycle EXIT
-
-start_payload=$(python3 -c "import json; print(json.dumps({'session_id': '$TEST_UUID', 'transcript_path': '/tmp/does-not-exist.jsonl', 'cwd': '$PWD'}))")
-if echo "$start_payload" | HOOK_EVENT=start bash "$DEPLOY_DIR/lifecycle_generation.sh" &>/dev/null; then
-    if [[ -f "$TEST_SIDECAR" ]] && grep -q '"event": *"start"' "$TEST_SIDECAR"; then
-        pass "SessionStart hook writes a start event to the sidecar"
-    else
-        fail "SessionStart hook ran but sidecar missing/malformed: $TEST_SIDECAR"
-    fi
-else
-    fail "lifecycle_generation.sh (start) exited non-zero"
-fi
-
-# Note: on SessionEnd this also fires a backgrounded `asm-sync --push
-# $TEST_UUID` (R6.3) - harmless (no matching index file for this fake UUID,
-# so asm-sync will find nothing to push) but intentionally last in the
-# script so it can't race the sync assertions above.
-end_payload=$(python3 -c "import json; print(json.dumps({'session_id': '$TEST_UUID', 'transcript_path': '/tmp/does-not-exist.jsonl', 'cwd': '$PWD'}))")
-if echo "$end_payload" | HOOK_EVENT=end bash "$DEPLOY_DIR/lifecycle_generation.sh" &>/dev/null; then
-    if grep -q '"event": *"end"' "$TEST_SIDECAR"; then
-        pass "SessionEnd hook appends an end event to the sidecar"
-    else
-        fail "SessionEnd hook ran but no end event found in sidecar"
-    fi
-else
-    fail "lifecycle_generation.sh (end) exited non-zero"
-fi
-
-cleanup_lifecycle
+DUP_HOME=$(mktemp -d)
+DUP_UUID="00000000-test-smoke-0000-$(date +%s)"
+sleep 60 & DUP_PID=$!
+cleanup_dup() { kill "$DUP_PID" 2>/dev/null; rm -rf "$DUP_HOME"; }
+trap cleanup_dup EXIT
+mkdir -p "$DUP_HOME/data/sessions/$DUP_UUID"
+printf '{"ts":1,"event":"start","agent":"claude","pid":%s}\n' "$DUP_PID" > "$DUP_HOME/data/sessions/$DUP_UUID/lifecycle.jsonl"
+out=$(echo "{\"session_id\": \"$DUP_UUID\"}" | AGENT_TRACKER_HOME="$DUP_HOME" ARES_NO_TTY=1 python3 "$DEPLOY_DIR/duplicate_warning.py")
+[[ "$out" == *"DUPLICATE SESSION"*"PID $DUP_PID"* ]] \
+    && pass "SessionStart hook warns about a session already running in another live pid" \
+    || fail "duplicate_warning.py did not warn: $out"
+out=$(echo '{"session_id": "no-such-session"}' | AGENT_TRACKER_HOME="$DUP_HOME" ARES_NO_TTY=1 python3 "$DEPLOY_DIR/duplicate_warning.py")
+[[ -z "$out" ]] && pass "SessionStart hook prints nothing when there is nothing to warn about" || fail "duplicate_warning.py printed: $out"
+cleanup_dup
 trap - EXIT
-
-# ---------------------------------------------------------------------------
-if $LIVE; then
-section "Codex plugin install/uninstall round-trip (--live, isolated CODEX_HOME)"
-
-# Runs the *exact* Codex-plugin block from install.sh/uninstall.sh (extracted
-# by line range, not retyped, so this can't silently drift from the real
-# script) against a scratch $CODEX_HOME - never the real
-# ~/.codex/config.toml. No API calls happen here (codex plugin
-# marketplace/add/remove are local config commands only), so this is cheap
-# and safe to run anytime `codex` is installed.
-
-if ! command -v codex &>/dev/null; then
-    warn "codex not installed - skipping --live Codex plugin round-trip"
-else
-    LIVE_SCRATCH=$(mktemp -d)
-    cleanup_live() { rm -rf "$LIVE_SCRATCH"; }
-    trap cleanup_live EXIT
-
-    mkdir -p "$LIVE_SCRATCH/.codex" "$LIVE_SCRATCH/opt/agent-session-manager/bin"
-    cp "$HOME/.codex/auth.json" "$LIVE_SCRATCH/.codex/auth.json" 2>/dev/null || true
-    echo 'model = "gpt-5"' > "$LIVE_SCRATCH/.codex/config.toml"
-    cp "$SRC_ASM" "$LIVE_SCRATCH/opt/agent-session-manager/bin/asm"
-
-    install_block=$(sed -n '/^# -- Codex plugin: same lifecycle hooks/,/^fi$/p' "$REPO_ROOT/install.sh")
-    uninstall_block=$(sed -n '/^# -- Remove Codex plugin/,/^fi$/p' "$REPO_ROOT/uninstall.sh")
-
-    # install.sh computes $CODEX_PRESENT once, upstream of the extracted
-    # block, from asm's own CODEX_ENABLED plus `command -v codex`; supply it
-    # directly here the same way SERVICE_DIR/SRC_DIR/OPT_BIN_DIR are supplied
-    # below, rather than re-deriving it (this scratch home has no
-    # ~/.codex/sessions of its own for auto-detect to find anyway).
-    run_in_scratch() {
-        HOME="$LIVE_SCRATCH" CODEX_HOME="$LIVE_SCRATCH/.codex" \
-        SERVICE_DIR="$LIVE_SCRATCH/opt/agent-session-manager" \
-        SRC_DIR="$REPO_ROOT/src" \
-        OPT_BIN_DIR="$LIVE_SCRATCH/opt/agent-session-manager/bin" \
-        CODEX_PRESENT=true \
-        bash -c "set -euo pipefail; $1"
-    }
-
-    run_in_scratch "$install_block" >/dev/null 2>&1
-    run_in_scratch "$install_block" >/dev/null 2>&1   # 2nd run: idempotency
-    cfg="$LIVE_SCRATCH/.codex/config.toml"
-
-    n_marketplace=$(grep -c '^\[marketplaces\.asm-local\]' "$cfg" 2>/dev/null || echo 0)
-    n_plugin=$(grep -c '^\[plugins\."asm@asm-local"\]' "$cfg" 2>/dev/null || echo 0)
-    if [[ "$n_marketplace" == "1" && "$n_plugin" == "1" ]]; then
-        pass "two consecutive installs leave exactly one marketplace + plugin entry"
-    else
-        fail "install is not idempotent: marketplace=$n_marketplace plugin=$n_plugin entries (expected 1 each)"
-        cat "$cfg" | sed 's/^/    /'
-    fi
-
-    run_in_scratch "$uninstall_block" >/dev/null 2>&1
-    if grep -q "asm-local\|asm@asm-local" "$cfg" 2>/dev/null; then
-        fail "uninstall did not remove the asm-local marketplace/plugin entries"
-        cat "$cfg" | sed 's/^/    /'
-    else
-        pass "uninstall removes the marketplace + plugin entries cleanly"
-    fi
-
-    # Skills: install.sh copies each skills/<name>/ read-only to ~/opt and links
-    # it from ~/.claude/skills/ and ~/.agents/skills/ (Codex).
-    skills_block=$(sed -n '/^# -- Skills: each skills/,/^# -- Clean up the old Codex copy/p' "$REPO_ROOT/install.sh")
-    run_in_scratch "SCRIPT_DIR='$REPO_ROOT'; $skills_block" >/dev/null 2>&1
-    want="$LIVE_SCRATCH/opt/agent-session-manager/skills/inject-session"
-    if [[ "$(readlink "$LIVE_SCRATCH/.claude/skills/inject-session")" == "$want" ]] && \
-       [[ "$(readlink "$LIVE_SCRATCH/.agents/skills/inject-session")" == "$want" ]] && \
-       [[ ! -w "$want/SKILL.md" ]]; then
-        pass "inject skill: read-only copy in ~/opt, linked from ~/.claude/skills/ and ~/.agents/skills/"
-    else
-        fail "inject skill link missing from ~/.claude/skills/ and/or ~/.agents/skills/"
-    fi
-
-    cleanup_live
-    trap - EXIT
-fi
-fi
 
 # ---------------------------------------------------------------------------
 section "Summary"

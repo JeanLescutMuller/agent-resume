@@ -1,89 +1,49 @@
-# Agent Session Manager (ASM)
+# agent-resume (`ares`; was agent-session-manager, `asm`)
 
-CLI tool for indexing, searching, and resuming Claude Code **and Codex CLI** sessions through one unified picker, with optional index-only visibility across machines.
+Find and resume past Claude Code and Codex sessions from any folder and any machine (`ares resume`), and after a crash put back the whole tmux setup with a `claude --resume` in each Claude pane (`ares tmux`). One of the projects around agent-tracker (its `DESIGN.md` §10): agent-tracker records, agent-resume finds and resumes, agent-auto-close closes.
 
-- Requirements and design rationale: `DEV_DOC.md`
-- Installation and day-to-day usage: `README.md`
+## Rules
 
-## Folder Structure
+- **agent-tracker's files are read, never written**: `$AGENT_TRACKER_HOME/data/sessions/<uuid>/{lifecycle.jsonl,last_seen.json}` (default `~/opt/agent-tracker`); their format is agent-tracker's `IMPLEMENTATION.md` §4. A `lifecycle.jsonl` line without its final newline is ignored. → `DEV_DOC.md` R2.
+- **session_state** (`pending`/`exited`) comes from the lifecycle: pending = a start line with no later end line of the same pid (`open_start` in `src/ares`).
+- **The index is refreshed at search time**: `ares resume` re-indexes only the transcripts (or lifecycles) newer than their index entry (`refresh_index`), then searches. The 30-min job and the VM sync stay (open point: agent-tracker `DESIGN.md` "Open points").
+- **`ares tmux` follows agent-tracker's `IMPLEMENTATION.md` §5 exactly** (previous boot, one per pane, stale rule, `select-layout`, never touch an existing tmux session). → `DEV_DOC.md` R4.
+- **The only hook is `src/duplicate_warning.py`** (SessionStart): it prints only the duplicate warning, nothing else, and always exits 0. asm's SessionStart/SessionEnd lifecycle hook and `data/lifecycles/` are gone (agent-tracker's now).
+- **No close here**: `ares close` prints a one-line pointer to agent-auto-close. No `status` script (removed by the user, 2026-11-07).
+- Python stdlib only; `src/ares` is one file (Backend registry: `BACKENDS`).
+- `install.sh` is idempotent and self-migrating (it takes apart `~/opt/agent-session-manager`, doc/deploy_migration.md). In a sandbox `HOME` it calls no `launchctl` / `systemctl` / `codex`.
 
-```
-agent-session-manager/
-├-- CLAUDE.md              # this file
-├-- DEV_DOC.md             # requirements + design notes
-├-- README.md              # user-facing documentation
-├-- install.sh             # installs all artifacts to system locations
-├-- uninstall.sh           # reverses install.sh
-│
-├-- src/                    # source files deployed by install.sh
-│   ├-- asm                 # the CLI executable (Python, stdlib only, local-only)
-│   ├-- asm-sync             # optional sync script (Bash, SSH/rsync to a remote host, index-only)
-│   ├-- asm-reindex-and-rsync.sh  # scheduled-job wrapper: asm reindex, then unconditionally asm-sync; fails if either failed
-│   ├-- entrypoint.sh         # the job for job-runner (separate project): what it runs, its timeout, its summary
-│   ├-- settings.json        # settings template (deploys to ~/opt/agent-session-manager/data/settings.json)
-│   ├-- status               # standalone session info script
-│   ├-- lifecycle_generation.sh  # session lifecycle hook (cross-platform, both agents)
-│   ├-- codex-plugin/        # Codex plugin: registers the same lifecycle hooks
-│   │   ├-- .codex-plugin/plugin.json
-│   │   └-- hooks/hooks.json
-```
+## Never
 
-## Key Concepts
+- Run `install.sh`, `uninstall.sh` or `ares tmux` against the real `$HOME` or the default tmux server from a test: the tests use a sandbox (`test/sandbox_test.sh`, `TMUX_TMPDIR`, `unset TMUX`).
+- Write a session's `.jsonl` transcript or sync it between machines: `ares-sync` moves index files only.
 
-- **Pluggable backend, one picker**: everything agent-specific (session discovery, transcript parsing, working-dir resolution, resume/fork command construction) sits behind a small `Backend` interface in `src/asm`, registered in a `BACKENDS = {"claude": ..., "codex": ...}` dict. Search, ranking, fzf rendering, and host-color logic operate purely on the index-doc dict and don't know or care which backend produced it. Each indexed session carries an additive `agent_type` field (`"claude"`/`"codex"`), filterable via `--agent`. Codex support auto-detects (`~/.codex/sessions` exists) unless overridden by `codex_enabled` in settings.
-- **Local-first**: `asm` works entirely on local disk. No shared filesystem or mount is assumed. Claude Code's own writes (`.jsonl`) go to `~/.claude/projects/`; everything ASM itself owns (index, lifecycle sidecars, settings, sync log) lives under `~/opt/agent-session-manager/data/`.
-- **Optional sync, index-only**: `asm-sync` only ever moves `~/opt/agent-session-manager/data/indexes/*.json` between machines over SSH/rsync - never raw `.jsonl` transcripts or lifecycle sidecars. Newest-`mtime`-wins (index files are always fully regenerated, never hand-appended, so no byte-level conflict resolution is needed). Exits silently if `remote_ssh_host` isn't configured.
-- **Hub and spoke, not mesh**: SSH connections are always initiated by the spoke (a machine with `remote_ssh_host` set); the hub never dials out and leaves that setting empty. Three independent triggers push/pull: the `SessionEnd` hook (single session, background), an opportunistic rate-limited pull at the start of `asm resume`, and a scheduled combined reindex + rsync job (run by multi-host-orchestrator every ~30 min).
-- **Offline-resilient**: every sync attempt (success or "unreachable") is logged to `~/opt/agent-session-manager/data/sync-log.jsonl`; `asm resume` warns if the last success is stale rather than either crashing offline or searching silently-stale data.
-- **`~/opt/agent-session-manager/` is the canonical deployment location**; `~/.local/bin/{asm,asm-sync,status}` are symlinks into `~/opt/agent-session-manager/bin/`, never real files.
-- **One host, one name, one color**: hostnames are the machine's name, skill `machine-name` (the Mac's `HostName`, the VM's `/etc/hostname`, no DNS domain). In the picker a host is blue when it's this machine and dark red otherwise - the only bit that matters there is "resumable vs injectable". Sessions with no lifecycle sidecar fall back to `index_hostname` (the machine that indexed them - authoritative, since `.jsonl` files never leave their machine). There is no rewrite tool for a renamed machine - a rename permanently splits that machine's history under two names in the picker.
-- **Title pipeline**: custom title (from `/rename`) > Claude Code's native `ai-title` transcript entry (auto-generated by Claude Code itself, no plugin involved) > "Untitled session [prompt]" / "[Empty session]".
-- **Pure Python, stdlib only**: no pip dependencies. Uses `json`, `pathlib`, `subprocess`, `argparse`.
-- **Mtime-based skip**: only reindexes sessions whose `.jsonl` mtime is newer than the index `.json` mtime.
-
-## Feature support by agent
-
-| Feature | Claude Code | Codex CLI |
-|---------|:-----------:|:---------:|
-| Reindex (`asm reindex`) | ✅ | ✅ |
-| Search / unified picker (`asm resume`) | ✅ | ✅ |
-| True resume (`asm resume`, picker or `--uuid`) | ✅ `claude --resume` | ✅ `codex resume` |
-| Fork (`/rename` on resume) | ✅ | ✅ `codex fork` |
-| `--agent`/`--host`/`--tmux`/`--print-cmd` filters | ✅ | ✅ |
-| Cross-machine sync (index-only) | ✅ | ✅ (same index, backend-agnostic) |
-| Lifecycle hooks (`SessionStart`/`SessionEnd`) | ✅ native hook | ✅ plugin (`codex plugin`), needs a one-time hook-trust approval |
-| `/inject-session` skill | ✅ | ✅ |
-| `asm close` (terminate a live session) | ✅ | ❌ - no stable public live-session surface in Codex CLI today; `asm close --uuid <codex-uuid>` fails with an explicit message rather than a misleading generic one. Not reachable from the interactive picker at all, since `live_only` filtering keys off Claude's `~/.claude/sessions/*.json` exclusively. |
-
-## Install / Update / Uninstall
+## Test, deploy
 
 ```bash
-# Install (first time)
-bash install.sh
-
-# Re-install after editing (from deployed copy)
-~/opt/agent-session-manager/install.sh
-
-# Uninstall
-bash uninstall.sh
+bash test/sandbox_test.sh          # everything, in a sandbox HOME + sandbox tmux server; log path printed at the end
+bash test/smoke_test.sh --offline  # health check of a real install (read-only)
+bash install.sh                    # deploy to ~/opt/agent-resume (from the Mac's checkout; VM: a temporary clone)
 ```
 
-`install.sh` is idempotent - safe to re-run after editing the source checkout, or to
-pick up a settings.json that already exists.
+## Vocabulary
 
-## Installed Locations
+| Word | Means | Never say |
+|---|---|---|
+| Claude session | one conversation of Claude Code (or Codex), named by its UUID | "session" alone, when a tmux session could be meant |
+| tmux session · window · pane | tmux's own words; a pane is named by its `%id` and shown as `<tmux session>:<window>.<pane>` | |
+| index · index entry | `~/opt/agent-resume/data/indexes/`, one `<uuid>.json` per Claude session (title, folders, hosts, state, the whole conversation) | cache, catalog |
+| lifecycle | agent-tracker's `lifecycle.jsonl` of a Claude session: one line per start and end | sidecar (asm's former files) |
+| last seen | the `ts` of agent-tracker's `last_seen.json`: last time the statusline ran for that Claude session | heartbeat |
+| boot · previous boot | one run of the Mac, named by its start time `boot_ts` · the newest `boot_ts` in agent-tracker's files that is not this boot | |
+| stale | a Claude session of the previous boot whose last seen is more than 2 min older than that boot's newest last seen (or has none): `ares tmux` restores it only with `--all` | |
+| agent-tracker · agent-resume · agent-auto-close | records + visibility · search and resume, command `ares` (alias `asm`) · closing Claude sessions | asm, agent-session-manager (except when describing the past) |
 
-| Artifact | Destination | Platform |
-|----------|-------------|----------|
-| `asm`, `asm-sync`, `status` | `~/opt/agent-session-manager/bin/`, symlinked from `~/.local/bin/` | All |
-| `settings.json` | `~/opt/agent-session-manager/data/settings.json` | All |
-| Index | `~/opt/agent-session-manager/data/indexes/` | All |
-| Lifecycle sidecars | `~/opt/agent-session-manager/data/lifecycles/` | All |
-| Sync log | `~/opt/agent-session-manager/data/sync-log.jsonl` | All |
-| `skills/inject-session/` (repo root, not `src/`) | read-only copy `~/opt/agent-session-manager/skills/inject-session/`, linked from `~/.claude/skills/` and `~/.agents/skills/` | All |
-| `lifecycle_generation.sh`, `asm-reindex-and-rsync.sh`, `entrypoint.sh`, `install.sh`, `uninstall.sh` | `~/opt/agent-session-manager/` | All |
-| Lifecycle hooks (Claude) | `~/.claude/settings.json` (auto-registered) | All |
-| Lifecycle hooks (Codex, if detected) | `codex-plugin/` deployed to `~/opt/agent-session-manager/codex-plugin/`, registered as `asm@asm-local` in `~/.codex/config.toml` via `codex plugin marketplace add` / `codex plugin add` | All |
-| Scheduled reindex + rsync | `entrypoint.sh` (the job for job-runner) started every 30 min by `com.jeanlescut.agent-session-manager` (LaunchAgent, macOS, and systemd user timer, Linux: the same name, `com.jeanlescut.<repo>`): real files in `~/opt/agent-session-manager/`, symlinks where the OS looks; mho adds a 20-min timeout and the dashboard. Former schedulings (the `.conf` linked into multi-host-orchestrator, `com.{asm,csm}.reindex-sync`, `com.asm.reindex-and-rsync`, `asm-reindex-and-rsync`) are removed by `install.sh` | All |
+## Where to look
 
-Codex support is entirely additive and auto-detected (`~/.codex/sessions` present, or `codex_enabled: true` in settings): if Codex isn't installed, `install.sh` skips the plugin/skill steps for it and every codex-specific `BACKENDS` entry is simply absent.
+| Need | File |
+|---|---|
+| what it does, for the user; commands and settings | `README.md` |
+| requirements R1–R6, design notes D0–D5 | `DEV_DOC.md` |
+| moving a machine from `~/opt/agent-session-manager` | `doc/deploy_migration.md` |
+| how to run the tests | `TESTING.md` |

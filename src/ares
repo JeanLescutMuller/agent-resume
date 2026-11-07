@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-asm - Agent Session Manager (Pure Python, local index)
+ares - agent-resume (was asm, Agent Session Manager): find and resume past agent sessions
 
 Index architecture:
-  reindex → builds JSON index from local .jsonl files (~/opt/agent-session-manager/data/indexes/)
-  resume  → reads from local index for fast disk I/O
-  close   → terminates a running session, leaving it resumable
+  reindex → builds JSON index from local .jsonl files ($AGENT_RESUME_HOME/data/indexes/)
+  resume  → refreshes the index entries whose transcript changed, then searches it
+  tmux    → after a crash, puts back the tmux sessions and Claude sessions of the previous boot,
+            read from agent-tracker's files ($AGENT_TRACKER_HOME/data/sessions/<uuid>/)
 
 Commands:
-  asm resume [OPTIONS] [KEYWORD...]   Find and resume a past Claude Code session
-  asm close  [OPTIONS] [KEYWORD...]   Find and close a running session
-  asm reindex                         Re-index all sessions now
+  ares resume [OPTIONS] [KEYWORD...]   Find and resume a past Claude Code or Codex session
+  ares tmux [--dry-run] [--all] [--no-iterm]   Restore the previous boot's tmux sessions
+  ares reindex                         Re-index all sessions now
 
-  asm --version                       Show version
-  asm --help                          Show this help
+  ares --version                       Show version
+  ares --help                          Show this help
+
+`asm` is an alias of `ares` (a symlink), kept for a while after the rename (2026-11-07).
 """
 
 import sys
@@ -24,30 +27,30 @@ import glob
 import argparse
 import subprocess
 import shlex
-import signal
 import tempfile
-import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
-VERSION = "v4.7"
+VERSION = "v5.0"
 HOME = os.path.expanduser("~")
-ASM_DATA_DIR = os.path.join(HOME, "opt", "agent-session-manager", "data")
+# Deploy root (IMPLEMENTATION.md §3 of agent-tracker): tests point it at a sandbox.
+AGENT_RESUME_HOME = os.environ.get("AGENT_RESUME_HOME") or os.path.join(HOME, "opt", "agent-resume")
+ARES_DATA_DIR = os.path.join(AGENT_RESUME_HOME, "data")
+# agent-tracker is the only writer of data/sessions/<uuid>/{lifecycle.jsonl,last_seen.json}; ares only reads them.
+AGENT_TRACKER_HOME = os.environ.get("AGENT_TRACKER_HOME") or os.path.join(HOME, "opt", "agent-tracker")
+TRACKER_SESSIONS_DIR = os.path.join(AGENT_TRACKER_HOME, "data", "sessions")
 
 # -- Settings --------------------------------------------------------------
 
-SETTINGS_PATH = os.path.join(ASM_DATA_DIR, "settings.json")
+SETTINGS_PATH = os.path.join(ARES_DATA_DIR, "settings.json")
 
 def _load_settings() -> Dict[str, Any]:
-    """Load ASM settings from ~/opt/agent-session-manager/data/settings.json
-    with defaults."""
+    """Load the settings from $AGENT_RESUME_HOME/data/settings.json, with defaults."""
     defaults: Dict[str, Any] = {
         "local_projects_dir": "~/.claude/projects",
-        "local_index_dir": "~/opt/agent-session-manager/data/indexes",
-        "lifecycle_dir": "~/opt/agent-session-manager/data/lifecycles",
+        "local_index_dir": os.path.join(ARES_DATA_DIR, "indexes"),
         "ignore_path_substrings": [],
         "sync_stale_warning_hours": 24,
         "remote_ssh_host": "",
@@ -77,13 +80,9 @@ _SETTINGS = _load_settings()
 
 PROJECTS_DIR = os.path.expanduser(_SETTINGS["local_projects_dir"])
 LOCAL_INDEX_DIR = os.path.expanduser(_SETTINGS["local_index_dir"])
-LIFECYCLE_DIR = os.path.expanduser(_SETTINGS["lifecycle_dir"])
 IGNORE_PATH_SUBSTRINGS: List[str] = _SETTINGS.get("ignore_path_substrings", [])
 SYNC_STALE_WARNING_HOURS: float = _SETTINGS.get("sync_stale_warning_hours", 24)
-SYNC_LOG_PATH = os.path.join(ASM_DATA_DIR, "sync-log.jsonl")
-LIVE_SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
-CLOSE_TOMBSTONE_DIR = os.path.join(ASM_DATA_DIR, "close-tombstones")
-CLOSE_LOG_PATH = os.path.join(ASM_DATA_DIR, "close-log.jsonl")
+SYNC_LOG_PATH = os.path.join(ARES_DATA_DIR, "sync-log.jsonl")
 
 CODEX_SESSIONS_DIR = os.path.expanduser(_SETTINGS["codex_sessions_dir"])
 CODEX_SESSION_INDEX_FILE = os.path.expanduser(_SETTINGS["codex_session_index_file"])
@@ -126,8 +125,8 @@ FRESHNESS_RAMP = ((15, C_FRESH), (60, C_RECENT), (240, C_HOURS), (720, C_HALFDAY
 def short_host(host: Optional[str]) -> Optional[str]:
     """Strip the DNS domain: 'mac.home' -> 'mac'. None/empty stays falsy.
 
-    Hostnames reach the index from several places (lifecycle sidecars written
-    by lifecycle_generation.sh, this process, indexes synced from another
+    Hostnames reach the index from several places (agent-tracker's lifecycle
+    lines, this process, indexes synced from another
     machine); comparing them only ever makes sense on the short form.
     """
     return host.split(".")[0] if host else None
@@ -151,7 +150,7 @@ except (OSError, RuntimeError):   # no name: no session counts as this machine's
 # -- Title source -------------------------------------------------------------
 # custom = set via /rename, ai = Claude Code's native ai-title, empty/untitled
 # = no title available. Shared between the reindex progress log and the
-# asm resume picker so both use the same vocabulary.
+# ares resume picker so both use the same vocabulary.
 
 TITLE_SOURCE_MARKERS = {"custom": "👤", "ai": "🤖", "empty": "∅", "untitled": "⚠️"}
 TITLE_SOURCE_LABELS = {
@@ -174,7 +173,7 @@ def log_verbose(msg: str, verbose: bool = False) -> None:
 def parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
     """Parse an ISO 8601 '...Z' timestamp, or None if absent/unparseable.
 
-    Every timestamp in the index and the sidecars is written in this one
+    Every timestamp in the index is written in this one
     format, and half a dozen call sites used to each re-implement the
     .replace("Z", "+00:00") dance inside their own try/except.
     """
@@ -191,7 +190,7 @@ def _make_portable_jsonl_path(abs_path: str) -> str:
 
     $HOME differs across machines (e.g. /Users/alice on a laptop vs
     /home/bob on a VM), and index files can be copied between machines
-    by asm-sync. Normalizing to ~/.claude/projects/<slug>/<file> makes the
+    by ares-sync. Normalizing to ~/.claude/projects/<slug>/<file> makes the
     path resolve correctly under whichever machine's $HOME reads it.
     """
     marker = "/.claude/projects/"
@@ -256,7 +255,7 @@ NOISE_RE = re.compile(r"<(" + "|".join(NOISE_TAGS) + r")\b[^>]*>.*?</\1>", re.DO
 def iter_entries(jsonl_path: Any, warn: bool = False) -> Iterator[Dict[str, Any]]:
     """Yield one dict per line of a .jsonl file, skipping blank/malformed ones.
 
-    Every reader in asm - transcripts and lifecycle sidecars alike - used to
+    Every transcript reader in ares used to
     carry its own copy of this loop (open, strip, json.loads, swallow the
     decode error). A truncated final line is normal: Claude Code appends to
     these files live, so a session being written right now can be mid-line.
@@ -298,7 +297,7 @@ def is_tool_result(entry: Dict[str, Any]) -> bool:
 
 
 class Transcript(NamedTuple):
-    """Everything asm reads out of one .jsonl session transcript.
+    """Everything ares reads out of one .jsonl session transcript.
 
     Built by a single pass in read_transcript(). Indexing needs the messages,
     resume needs only the title and permission mode, but both used to walk
@@ -478,23 +477,71 @@ def resolve_title(t: Transcript) -> Tuple[str, str]:
     return "Untitled session [prompt]", "untitled"
 
 
-def determine_state(lifecycle_events: List[Dict[str, Any]]) -> str:
-    """'pending' if the session is running, 'exited' otherwise.
+# -- agent-tracker's files (read only) ---------------------------------------
+# $AGENT_TRACKER_HOME/data/sessions/<uuid>/lifecycle.jsonl: one line per start / end, appended by
+# `agent-tracker hook start|end`; last_seen.json: where the session runs, rewritten by
+# `agent-tracker tick` (the formats: agent-tracker's IMPLEMENTATION.md §4). They replace asm's own
+# lifecycle hook and its data/lifecycles/ sidecars (2026-11-07).
 
-    Compare the LATEST start/resume against the LATEST end, not just whether
-    an end ever happened - a session that ended and was later resumed has an
-    end event in its history forever, but is running right now. ISO 8601
-    "...Z" timestamps sort correctly as strings.
+def lifecycle_path(uuid: str) -> str:
+    return os.path.join(TRACKER_SESSIONS_DIR, uuid, "lifecycle.jsonl")
+
+
+def read_lifecycle(uuid: str) -> List[Dict[str, Any]]:
+    """The lifecycle lines of one session, oldest first ([] if agent-tracker has none).
+
+    A line without its final newline is still being appended: it is ignored
+    (agent-tracker's contract), as is any line that is not a JSON object.
     """
-    start_times = [e.get("timestamp", "") for e in lifecycle_events
-                   if e.get("event") in ("start", "resume")]
-    if not start_times:
-        return "exited"
-    end_times = [e.get("timestamp", "") for e in lifecycle_events
-                 if e.get("event") == "end"]
-    if end_times and max(end_times) > max(start_times):
-        return "exited"
-    return "pending"
+    try:
+        with open(lifecycle_path(uuid), encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except OSError:
+        return []
+    l_events = []
+    for raw in data.split("\n")[:-1]:   # the piece after the last newline is incomplete (or empty)
+        try:
+            d_ev = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(d_ev, dict):
+            l_events.append(d_ev)
+    return l_events
+
+
+def open_start(lifecycle_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The newest start line not followed by an end of the same pid, or None.
+
+    The pid makes it right when a resume starts while the old process is still
+    ending (two hooks of one session, end line written after the new start):
+    that end closes the old start, not the new one. An end line without a pid
+    closes every start before it.
+    """
+    d_open: Dict[Any, Dict[str, Any]] = {}   # pid -> its start line, in file order
+    for ev in lifecycle_events:
+        if ev.get("event") == "start":
+            d_open.pop(ev.get("pid"), None)
+            d_open[ev.get("pid")] = ev
+        elif ev.get("event") == "end":
+            if ev.get("pid") is None:
+                d_open.clear()
+            else:
+                d_open.pop(ev["pid"], None)
+    return list(d_open.values())[-1] if d_open else None
+
+
+def determine_state(lifecycle_events: List[Dict[str, Any]]) -> str:
+    """'pending' if the session has a start with no end yet (running, or killed by a crash), 'exited' otherwise."""
+    return "pending" if open_start(lifecycle_events) else "exited"
+
+
+def split_pane(pane: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """'work:2.1' -> ('work', '2', '1'); None or a malformed value -> (None, None, None)."""
+    if not pane or ":" not in pane:
+        return None, None, None
+    session, rest = pane.rsplit(":", 1)
+    window, _, pane_index = rest.partition(".")
+    return session or None, window or None, pane_index or None
 
 
 def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str, Any]],
@@ -502,24 +549,16 @@ def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str
     """Build the index document for one session."""
     title, title_source = resolve_title(transcript)
 
-    # The transcript's own cwd is authoritative; sidecars only fill the gap
-    # for sessions that never recorded one.
-    initial_working_dir = transcript.cwd
-    if not initial_working_dir:
-        initial_working_dir = next(
-            (ev["working_dir"] for ev in lifecycle_events if ev.get("working_dir")), None)
+    # The transcript's own cwd is authoritative; agent-tracker's start lines
+    # only fill the gap for sessions that never recorded one.
+    l_starts = [ev for ev in lifecycle_events if ev.get("event") == "start"]
+    initial_working_dir = transcript.cwd or next((ev["cwd"] for ev in l_starts if ev.get("cwd")), None)
 
-    initial_hostname = latest_hostname = latest_working_dir = None
-    tmux_session = tmux_window = tmux_pane = None
-    for ev in lifecycle_events:
-        if ev.get("event") == "start" and initial_hostname is None:
-            initial_hostname = ev.get("hostname") or None
-            tmux_session = ev.get("tmux_session") or None
-            tmux_window = ev.get("tmux_window") or None
-            tmux_pane = ev.get("tmux_pane") or None
-        if ev.get("event") in ("start", "resume"):
-            latest_hostname = ev.get("hostname") or latest_hostname
-            latest_working_dir = ev.get("working_dir") or latest_working_dir
+    # First start: where the session was born (host, tmux place); latest start: where it last ran.
+    initial_hostname = l_starts[0].get("machine") or None if l_starts else None
+    tmux_session, tmux_window, tmux_pane = split_pane(l_starts[0].get("pane") if l_starts else None)
+    latest_hostname = next((ev["machine"] for ev in reversed(l_starts) if ev.get("machine")), None)
+    latest_working_dir = next((ev["cwd"] for ev in reversed(l_starts) if ev.get("cwd")), None)
 
     return {
         "asm_version": VERSION,
@@ -536,7 +575,7 @@ def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str
         # Ground truth for "which machine was this session on": .jsonl files
         # are never synced between machines, so whoever indexes one is by
         # definition its host. Fills the gap for sessions with no lifecycle
-        # sidecar (pre-hook ones), where the two fields above are null.
+        # lifecycle line (older ones), where the two fields above are null.
         "index_hostname": LOCAL_HOSTNAME or None,
         "created_at": transcript.created_at,
         "last_active": transcript.last_active,
@@ -555,11 +594,10 @@ def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str
 # -- Search options ---------------------------------------------------------
 
 class SearchOpts(NamedTuple):
-    """The filter/search flags shared by 'resume' and 'close'.
+    """The filter/search flags of 'resume'.
 
     These travel together through find_sessions and pick_session, so they move
-    as one value rather than as seven positional arguments that the two
-    commands had to keep in matching order by hand.
+    as one value rather than as ten positional arguments.
     """
     keywords: List[str]
     from_days: int = 90
@@ -806,7 +844,7 @@ def status_block(doc: Dict[str, Any]) -> str:
     """The '[ Pending  5 min ago ]' prefix, colored by state and freshness."""
     state = clean_field(doc.get("session_state")) or "?"
     last_active = doc.get("last_active") or ""
-    # A session with no lifecycle sidecar has no start/end events at all, so
+    # A session with no lifecycle line has no start/end events at all, so
     # its state was never observed - say "Unknown" rather than assert "Exited".
     has_lifecycle = bool(clean_field(doc.get("initial_hostname")))
 
@@ -842,7 +880,7 @@ def host_block(doc: Dict[str, Any]) -> str:
     latest = short_host(clean_field(doc.get("latest_hostname")))
     initial = short_host(clean_field(doc.get("initial_hostname")))
 
-    # Sessions predating the lifecycle hook have no sidecar and, until they get
+    # Sessions predating the lifecycle hook have no lifecycle and, until they get
     # reindexed, no index_hostname either - but if their .jsonl is still on this
     # disk they are ours, since .jsonl files are never synced between machines.
     host = latest or initial or short_host(clean_field(doc.get("index_hostname")))
@@ -1176,7 +1214,7 @@ def is_ignored_session(jsonl_path: str) -> bool:
 
     Lets users exclude sessions from specific tools/directories (e.g. an
     automated agent's own working space) without a code change - configure
-    `ignore_path_substrings` in ~/opt/agent-session-manager/data/settings.json."""
+    `ignore_path_substrings` in $AGENT_RESUME_HOME/data/settings.json."""
     return any(s in jsonl_path for s in IGNORE_PATH_SUBSTRINGS)
 
 
@@ -1193,7 +1231,6 @@ class Backend(NamedTuple):
     resolve_working_dir: Callable[[Dict[str, Any], bool], Optional[str]]  # (doc, verbose) -> path
     resume_cmd: Callable[[Dict[str, Any], Optional["Transcript"], str, str, bool], str]
     uuid_of: Callable[[str], str]                                        # jsonl_path -> uuid
-    supports_close: bool
 
 
 def index_one(backend: Backend, jsonl_path: str, idx_path: str) -> Tuple[str, str]:
@@ -1202,7 +1239,7 @@ def index_one(backend: Backend, jsonl_path: str, idx_path: str) -> Tuple[str, st
     "empty" (no messages), or "untitled" (has messages but no title)."""
     uuid = backend.uuid_of(jsonl_path)
     transcript = backend.parse(jsonl_path)
-    lifecycle_events = list(iter_entries(Path(LIFECYCLE_DIR) / f"{uuid}.jsonl"))
+    lifecycle_events = read_lifecycle(uuid)
 
     doc = build_doc(uuid, transcript, lifecycle_events, jsonl_path, backend.name)
     write_json_atomic(doc, idx_path)
@@ -1211,16 +1248,18 @@ def index_one(backend: Backend, jsonl_path: str, idx_path: str) -> Tuple[str, st
 
 
 def needs_reindex(uuid: str, jsonl_mtime: float, idx_mtime: Optional[float]) -> bool:
-    """True unless both the transcript and its sidecar predate the index file.
+    """True unless both the transcript and agent-tracker's lifecycle.jsonl predate the index file.
 
-    The sidecar has to be checked separately: a session that only started or
-    ended since the last run has a fresh lifecycle event but an untouched
+    The lifecycle has to be checked separately: a session that only started or
+    ended since the last run has a fresh lifecycle line but an untouched
     .jsonl, and its state in the index would otherwise never update.
     """
     if idx_mtime is None or jsonl_mtime > idx_mtime:
         return True
-    lifecycle_path = Path(LIFECYCLE_DIR) / f"{uuid}.jsonl"
-    return lifecycle_path.exists() and lifecycle_path.stat().st_mtime > idx_mtime
+    try:
+        return os.stat(lifecycle_path(uuid)).st_mtime > idx_mtime
+    except OSError:
+        return False
 
 
 BACKENDS: Dict[str, Backend] = {
@@ -1231,7 +1270,6 @@ BACKENDS: Dict[str, Backend] = {
         resolve_working_dir=_claude_resolve_working_dir,
         resume_cmd=_claude_resume_cmd,
         uuid_of=_claude_uuid_of,
-        supports_close=True,
     ),
 }
 
@@ -1243,86 +1281,55 @@ if CODEX_ENABLED:
         resolve_working_dir=_codex_resolve_working_dir,
         resume_cmd=_codex_resume_cmd,
         uuid_of=_codex_uuid_of,
-        supports_close=False,  # no stable live-session surface yet, see DEV_DOC.md
     )
 
 
 # -- Commands ---------------------------------------------------------------
 
-def cmd_reindex(max_sessions: int = 0, force: bool = False, single_uuid: str = "") -> Dict[str, int]:
-    """Build/refresh index JSON files from local JSONL files.
+def plan_reindex(force: bool = False, single_uuid: str = "",
+                 max_sessions: int = 0) -> Tuple[List[Tuple[str, str, "Backend"]], Dict[str, int]]:
+    """Which transcripts to (re)index: [(jsonl_path, idx_path, backend)], plus counts.
 
-    Step 1: Scan local .jsonl history files → d_history
-    Step 2: Scan local .json index files → d_index
-    Step 3: Decide what to reindex + reindex
+    Only dates are read here (one stat per transcript, index file and lifecycle):
+    ~4 ms for 3,014 transcripts (agent-tracker DESIGN §3, verified 2026-11-07).
     """
-    mode = "force-reindex" if force else "reindex"
-    if single_uuid:
-        mode = f"reindex --uuid {single_uuid[:8]}"
-    print(f"asm {VERSION} - {mode}" + (f" (max {max_sessions})" if max_sessions else ""), flush=True)
-
-    Path(LOCAL_INDEX_DIR).mkdir(parents=True, exist_ok=True)
-
-    # -- Step 1: Scan local .jsonl history files, across all backends -
     d_history: Dict[str, Tuple[float, Backend]] = {}
     for backend in BACKENDS.values():
         for p, m in backend.scan().items():
             d_history[p] = (m, backend)
     if single_uuid:
         d_history = {p: v for p, v in d_history.items() if v[1].uuid_of(p) == single_uuid}
-    print(f"  Step 1: {len(d_history)} .jsonl history files found", flush=True)
-
-    # -- Step 2: Scan local .json index files -------------------------
     d_index = scan_index_dir(LOCAL_INDEX_DIR)
-    print(f"  Step 2: {len(d_index)} .json index files in local cache", flush=True)
-
     idx_mtime_by_uuid = {Path(p).stem: mtime for p, mtime in d_index.items()}
 
-    # -- Step 3a: Decide what needs reindexing ------------------------
-    to_reindex: List[Tuple[str, str, Backend]] = []  # [(jsonl_path, idx_path, backend), ...]
-    skipped = ignored = duplicates = 0
-    seen_uuids: set = set()
-
+    l_todo: List[Tuple[str, str, Backend]] = []
+    d_counts = {"history": len(d_history), "index": len(d_index), "skipped": 0, "ignored": 0, "duplicates": 0}
+    s_seen: set = set()
     for jsonl_path, (jsonl_mtime, backend) in d_history.items():
-        if max_sessions and len(seen_uuids) >= max_sessions:
+        if max_sessions and len(s_seen) >= max_sessions:
             break
         uuid = backend.uuid_of(jsonl_path)
-        if uuid in seen_uuids:
-            duplicates += 1
+        if uuid in s_seen:
+            d_counts["duplicates"] += 1
             continue
-        seen_uuids.add(uuid)
-
+        s_seen.add(uuid)
         if is_ignored_session(jsonl_path):
-            ignored += 1
-            continue
-
-        if not force and not needs_reindex(uuid, jsonl_mtime, idx_mtime_by_uuid.get(uuid)):
-            skipped += 1
-            continue
-
-        to_reindex.append((jsonl_path, os.path.join(LOCAL_INDEX_DIR, f"{uuid}.json"), backend))
-
-    total_scanned = len(seen_uuids)
-    n_to_reindex = len(to_reindex)
-    print(f"  Step 3a: {total_scanned} sessions scanned, {n_to_reindex} to reindex, "
-          f"{skipped} up to date, {ignored} ignored, {duplicates} duplicates", flush=True)
-
-    # -- Step 3b: Reindex in parallel with [i/N] progress ------------
-    indexed = errors = 0
-    counter_lock = threading.Lock()
-    done = 0
-
-    def report(uuid: str, exc: Optional[Exception], title: str, source: str) -> None:
-        """Print one [i/N] progress line. Called from the main thread only."""
-        nonlocal indexed, errors, done
-        done += 1
-        if exc is None:
-            indexed += 1
-            marker = TITLE_SOURCE_MARKERS.get(source, "⚠️")
-            print(f"    [{done}/{n_to_reindex}] {uuid[:8]}  indexed {marker} {title[:60]}", flush=True)
+            d_counts["ignored"] += 1
+        elif not force and not needs_reindex(uuid, jsonl_mtime, idx_mtime_by_uuid.get(uuid)):
+            d_counts["skipped"] += 1
         else:
-            errors += 1
-            print(f"    [{done}/{n_to_reindex}] {uuid[:8]}  ERROR: {exc}", file=sys.stderr, flush=True)
+            l_todo.append((jsonl_path, os.path.join(LOCAL_INDEX_DIR, f"{uuid}.json"), backend))
+    d_counts["scanned"] = len(s_seen)
+    return l_todo, d_counts
+
+
+def run_reindex(l_todo: List[Tuple[str, str, "Backend"]],
+                report: Optional[Callable[[str, Optional[Exception], str, str], None]] = None) -> Tuple[int, int]:
+    """Index the given transcripts, 10 at a time. Returns (indexed, errors).
+
+    report(uuid, exc, title, source) is called once per transcript, from the main thread.
+    """
+    indexed = errors = 0
 
     def worker(jsonl_path: str, idx_path: str, backend: Backend) -> Tuple[str, Optional[Exception], str, str]:
         uuid = backend.uuid_of(jsonl_path)
@@ -1332,23 +1339,72 @@ def cmd_reindex(max_sessions: int = 0, force: bool = False, single_uuid: str = "
         except Exception as e:
             return (uuid, e, "", "")
 
-    max_workers = min(10, n_to_reindex) if n_to_reindex > 0 else 1
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(worker, jp, ip, b) for jp, ip, b in to_reindex]
-        for future in as_completed(futures):
-            with counter_lock:
-                report(*future.result())
+    if not l_todo:
+        return 0, 0
+    Path(LOCAL_INDEX_DIR).mkdir(parents=True, exist_ok=True)
+    with ThreadPoolExecutor(max_workers=min(10, len(l_todo))) as executor:
+        for future in as_completed([executor.submit(worker, *t) for t in l_todo]):
+            uuid, exc, title, source = future.result()
+            indexed, errors = indexed + (exc is None), errors + (exc is not None)
+            if report:
+                report(uuid, exc, title, source)
+    return indexed, errors
 
+
+def refresh_index(verbose: bool = False) -> None:
+    """Before a search: re-index only the transcripts newer than their index entry (agent-tracker DESIGN §3).
+
+    Silent, and never fatal: a failure just means the search reads the index as it was.
+    """
+    try:
+        l_todo, d_counts = plan_reindex()
+        indexed, errors = run_reindex(l_todo)
+        log_verbose(f"refresh: {d_counts['scanned']} transcripts dated, {indexed} re-indexed, {errors} errors", verbose)
+    except Exception as e:   # the index stays as it was; the search still runs
+        log_verbose(f"refresh skipped: {e}", verbose)
+
+
+def cmd_reindex(max_sessions: int = 0, force: bool = False, single_uuid: str = "") -> Dict[str, int]:
+    """Build/refresh index JSON files from local JSONL files, with a progress log.
+
+    Step 1: scan local .jsonl history files; Step 2: scan the .json index files;
+    Step 3: decide what to reindex (3a), then reindex in parallel (3b).
+    """
+    mode = "force-reindex" if force else "reindex"
+    if single_uuid:
+        mode = f"reindex --uuid {single_uuid[:8]}"
+    print(f"ares {VERSION} - {mode}" + (f" (max {max_sessions})" if max_sessions else ""), flush=True)
+    Path(LOCAL_INDEX_DIR).mkdir(parents=True, exist_ok=True)
+
+    l_todo, d_counts = plan_reindex(force, single_uuid, max_sessions)
+    print(f"  Step 1: {d_counts['history']} .jsonl history files found", flush=True)
+    print(f"  Step 2: {d_counts['index']} .json index files in local cache", flush=True)
+    print(f"  Step 3a: {d_counts['scanned']} sessions scanned, {len(l_todo)} to reindex, "
+          f"{d_counts['skipped']} up to date, {d_counts['ignored']} ignored, "
+          f"{d_counts['duplicates']} duplicates", flush=True)
+
+    done = 0
+
+    def report(uuid: str, exc: Optional[Exception], title: str, source: str) -> None:
+        """One [i/N] progress line per transcript."""
+        nonlocal done
+        done += 1
+        if exc is None:
+            marker = TITLE_SOURCE_MARKERS.get(source, "⚠️")
+            print(f"    [{done}/{len(l_todo)}] {uuid[:8]}  indexed {marker} {title[:60]}", flush=True)
+        else:
+            print(f"    [{done}/{len(l_todo)}] {uuid[:8]}  ERROR: {exc}", file=sys.stderr, flush=True)
+
+    indexed, errors = run_reindex(l_todo, report)
     print(f"  Step 3b: indexed={indexed}, errors={errors}")
-
-    return {"sessions_scanned": total_scanned, "sessions_indexed": indexed,
-            "sessions_skipped": skipped, "errors": errors}
+    return {"sessions_scanned": d_counts["scanned"], "sessions_indexed": indexed,
+            "sessions_skipped": d_counts["skipped"], "errors": errors}
 
 
 # -- Sync awareness ---------------------------------------------------------
 
 def _read_sync_log_tail(max_lines: int = 200) -> List[Dict[str, Any]]:
-    """Read up to the last max_lines entries from ~/opt/agent-session-manager/data/sync-log.jsonl.
+    """Read up to the last max_lines entries from $AGENT_RESUME_HOME/data/sync-log.jsonl.
 
     Slices the raw lines before parsing: the log gains an entry per sync
     attempt forever, and only the tail is ever of interest.
@@ -1371,7 +1427,7 @@ def _maybe_pull_before_resume(verbose: bool = False) -> None:
     """Opportunistic, rate-limited pull of the remote index before searching.
 
     Never blocks more than a few seconds and never raises - a failed or timed
-    out pull just means asm resume searches whatever's already local."""
+    out pull just means ares resume searches whatever's already local."""
     entries = _read_sync_log_tail()
     if entries:
         last_attempt = parse_ts(entries[-1].get("timestamp"))
@@ -1380,7 +1436,8 @@ def _maybe_pull_before_resume(verbose: bool = False) -> None:
             return
     try:
         subprocess.run(
-            ["asm-sync", "--pull"], timeout=5, capture_output=True,
+            [os.path.join(os.path.dirname(os.path.realpath(__file__)), "ares-sync"), "--pull"],
+            timeout=5, capture_output=True,
             stdin=subprocess.DEVNULL,
         )
     except Exception as e:
@@ -1402,42 +1459,28 @@ def _sync_staleness_warning() -> Optional[str]:
     return f"last synced with remote {age_hours:.0f}h ago"
 
 
-# -- Picking a session (shared by resume and close) --------------------------
+# -- Picking a session -------------------------------------------------------
 
-def pick_session(opts: SearchOpts, action_verb: str,
-                 live_only: bool = False) -> Tuple[str, Dict[str, Any]]:
-    """Search the index and let the user pick one session in fzf.
+def pick_session(opts: SearchOpts, action_verb: str) -> Tuple[str, Dict[str, Any]]:
+    """Refresh the index, search it and let the user pick one session in fzf.
 
-    This is the entire front half of both `asm resume` and `asm close` - they
-    are deliberately the same UX and the same flags, and diverge only in what
-    they then do with the session that comes back. Exits the process on an
-    empty result or a cancelled picker; never returns None.
+    Exits the process on an empty result or a cancelled picker; never returns None.
     """
-    if not os.path.isdir(LOCAL_INDEX_DIR):
-        print(f"ERROR: local index cache not found at {LOCAL_INDEX_DIR}", file=sys.stderr)
-        print("  Run 'asm reindex' first to build the local cache.", file=sys.stderr)
-        sys.exit(1)
-
     if _SETTINGS.get("remote_ssh_host", ""):
         _maybe_pull_before_resume(opts.verbose)
         warning = _sync_staleness_warning()
         if warning:
             print(f"\033[38;5;208m⚠ {warning}\033[0m", file=sys.stderr)
 
+    refresh_index(opts.verbose)   # after the pull: a local transcript wins over a pulled copy of its entry
+    if not os.path.isdir(LOCAL_INDEX_DIR):
+        print(f"ERROR: local index cache not found at {LOCAL_INDEX_DIR}", file=sys.stderr)
+        print("  Run 'ares reindex' first to build the local cache.", file=sys.stderr)
+        sys.exit(1)
+
     sessions, fuzzy = find_sessions(opts)
     if fuzzy:
         print("  (no exact matches - showing fuzzy results)", file=sys.stderr)
-
-    if live_only:
-        # find_sessions draws from the full index - years of exited history,
-        # plus entries synced from another machine - none of which close can
-        # do anything with. Scope it down to what is actually running here.
-        live_ids = _live_session_ids()
-        sessions = [(doc, path) for doc, path in sessions if doc.get("session_id") in live_ids]
-        if not sessions:
-            scope = f" matching '{' '.join(opts.keywords)}'" if opts.keywords else ""
-            print(f"No running sessions{scope} to close.", file=sys.stderr)
-            sys.exit(0)
 
     uuid, doc = run_fzf(sessions, opts.keywords, opts.verbose, action_verb)
     if not uuid or not doc:
@@ -1456,6 +1499,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
     either agent's TUI.
     """
     if opts.uuid:
+        refresh_index(opts.verbose)
         doc = find_by_uuid(opts.uuid)
         if not doc:
             print(f"ERROR: no indexed session matches uuid '{opts.uuid}'.", file=sys.stderr)
@@ -1470,7 +1514,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
                   file=sys.stderr)
             sys.exit(1)
         # The .jsonl itself is gone - either deleted locally, or this doc came
-        # from a machine that has never synced .jsonl files (asm-sync only ever
+        # from a machine that has never synced .jsonl files (ares-sync only ever
         # moves the index, never the transcript), so a real resume is not
         # possible either way. /inject-session reads the indexed conversation straight
         # into a new session instead.
@@ -1533,220 +1577,270 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
     os.execv("/bin/bash", ["/bin/bash", "-c", cmd])
 
 
-# -- Close (reclaim RAM from a running session) ------------------------------
+# -- Crash restore: ares tmux (agent-tracker IMPLEMENTATION.md §5) -----------
 #
-# Search/pick is identical to resume (both call pick_session) - the two
-# commands only differ from here on: instead of building a `claude --resume`
-# command, this captures the tmux pane, SIGTERMs the process (never SIGKILL,
-# so it flushes its transcript), and writes a tombstone + pre-typed resume
-# command into the pane so it survives the alt-screen teardown on exit.
-# Ported from the bash prototype src/asm-close after it was validated live.
+# After a crash, put back what ran at the end of the previous boot, read from
+# agent-tracker's files only (no snapshot of our own):
 #
-# Unlike resume/reindex, there's no dry-run/--yes gate here: reaching this
-# code via --uuid or an fzf pick already *is* the deliberate act. The safety
-# checks below are correctness guards (never close yourself, a busy session,
-# a non-tmux session, a stale pid/pane), not "are you sure" friction.
+#   prev boot   = the newest boot_ts in data/sessions/*/ that is not this boot
+#   candidates  = Claude sessions whose open start line (open_start) is of that boot
+#   one per pane_id: the newest last_seen.ts wins (the pane was reused)
+#   stale       = no last_seen.json of that boot, or last_seen.ts more than 2 min older than the
+#                 boot's newest last_seen.ts (it had stopped ticking: killed before the crash);
+#                 restored only with --all
+#   per tmux session (never one that already exists): its windows (index, name, size),
+#   as many panes as the saved window_layout has, select-layout, then in each Claude pane
+#   `cd <dir> && claude --resume <uuid>`; plain panes are shells in ~ (their folder is not recorded);
+#   then one iTerm2 tab per restored tmux session (AppleScript), unless --no-iterm.
+#
+# Only windows that held a Claude session are known (only Claude sessions write last_seen.json).
 
-def _rss_mb(pid: int) -> Optional[int]:
-    """Current RSS in MB, or None if the process is gone."""
+STALE_AFTER_S = 120    # agent-tracker IMPLEMENTATION.md §5: "more than 2 min older"
+SAME_BOOT_S = 60       # macOS shifts kern.boottime by a few seconds when the clock is stepped
+LAYOUT_CELL_RE = re.compile(r"(\d+)x(\d+),\d+,\d+(?:,(\d+))?")   # WxH,X,Y[,pane number]
+
+
+def current_boot_ts() -> int:
+    """This boot's start (epoch s): $AGENT_TRACKER_BOOT_TS (tests), sysctl kern.boottime, or /proc/stat btime."""
+    if os.environ.get("AGENT_TRACKER_BOOT_TS"):
+        return int(os.environ["AGENT_TRACKER_BOOT_TS"])
+    if sys.platform == "darwin":
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
+        m = re.search(r"sec = (\d+)", out)
+        return int(m.group(1)) if m else 0
+    for line in Path("/proc/stat").read_text().splitlines():
+        if line.startswith("btime "):
+            return int(line.split()[1])
+    return 0
+
+
+def layout_cells(layout: Optional[str]) -> Tuple[Optional[Tuple[int, int]], List[int]]:
+    """'b25f,208x52,0,0{104x52,0,0,1,103x52,105,0,2}' -> ((208, 52), [1, 2]): window size, pane numbers in pane order."""
+    if not layout or "," not in layout:
+        return None, []
+    l_cells = LAYOUT_CELL_RE.findall(layout.split(",", 1)[1])
+    if not l_cells:
+        return None, []
+    size = (int(l_cells[0][0]), int(l_cells[0][1]))
+    return size, [int(n) for _, _, n in l_cells if n]
+
+
+def _fmt_ts(ts: Any) -> str:
     try:
-        out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
-                             capture_output=True, text=True).stdout.strip()
-        return int(out) // 1024 if out else None
-    except (subprocess.SubprocessError, ValueError):
-        return None
+        return datetime.fromtimestamp(int(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
 
 
-def _human_age(age_ms: int) -> str:
-    """Idle time as '7m', '3h20m' or '2d13h'."""
-    mins = max(0, age_ms) // 60000
-    if mins < 60:
-        return f"{mins}m"
-    if mins < 1440:
-        return f"{mins // 60}h{mins % 60}m"
-    return f"{mins // 1440}d{(mins % 1440) // 60}h"
+def tmux_plan(include_stale: bool) -> Dict[str, Any]:
+    """Read agent-tracker's files and decide what to restore (no tmux call).
 
-
-def _live_sessions() -> List[Dict[str, Any]]:
-    """Every currently-running local Claude Code session.
-
-    Claude Code publishes one ~/.claude/sessions/<pid>.json per live process,
-    holding its uuid, status, tmux pane and name. This is the only source that
-    knows what is running *now* - the asm index deliberately spans all of
-    history, including sessions that exited months ago or live on another host.
+    Returns {"boot_ts", "newest_ts", "sessions": {name: {window_index: window}}, "stale": [row],
+    "outside": [row]} or {"boot_ts": None} when there is no previous boot. A row is one Claude
+    session: {"uuid", "seen", "start", "ts", "cmd"}; a window: {"name", "layout", "size",
+    "panes": [row or None]} (None = a plain shell).
     """
-    sessions = []
-    for path in glob.glob(os.path.join(LIVE_SESSIONS_DIR, "*.json")):
-        doc = read_json(path)
-        if doc and doc.get("sessionId"):
-            sessions.append(doc)
-    return sessions
+    boot_now = current_boot_ts()
+    same_boot = lambda a, b: a is not None and b is not None and abs(int(a) - int(b)) <= SAME_BOOT_S
 
+    l_rows = []
+    for folder in sorted(glob.glob(os.path.join(TRACKER_SESSIONS_DIR, "*", ""))):
+        uuid = os.path.basename(folder.rstrip("/"))
+        seen = read_json(os.path.join(folder, "last_seen.json")) or {}
+        l_events = read_lifecycle(uuid)
+        l_rows.append({"uuid": uuid, "seen": seen, "start": open_start(l_events),
+                       "boots": [seen.get("boot_ts")] + [e.get("boot_ts") for e in l_events]})
 
-def _live_session_ids() -> set:
-    """UUIDs of all currently-running local sessions - i.e. what close can act on."""
-    return {s["sessionId"] for s in _live_sessions()}
+    l_boots = sorted({int(b) for r in l_rows for b in r["boots"] if isinstance(b, (int, float))
+                      and not same_boot(b, boot_now)}, reverse=True)
+    if not l_boots:
+        return {"boot_ts": None}
+    prev = l_boots[0]
 
+    # The moment of the crash, roughly: the newest tick of that boot.
+    newest_ts = max((int(r["seen"]["ts"]) for r in l_rows
+                     if same_boot(r["seen"].get("boot_ts"), prev) and r["seen"].get("ts")), default=0)
 
-def _find_live_session(uuid: str) -> Optional[Dict[str, Any]]:
-    """Return the live session matching uuid (exact, or prefix if unambiguous).
-    None if there's no live process for it - already exited, or from another
-    machine. Exits on an ambiguous prefix rather than guessing."""
-    matches = [s for s in _live_sessions()
-               if s["sessionId"] == uuid or (uuid and s["sessionId"].startswith(uuid))]
-    if len(matches) > 1:
-        print(f"ERROR: multiple live sessions match uuid '{uuid}':", file=sys.stderr)
-        for s in matches:
-            print(f"  {s.get('pid')}  {s.get('name')}  {s.get('sessionId')}", file=sys.stderr)
-        sys.exit(1)
-    return matches[0] if matches else None
+    d_by_pane: Dict[str, Dict[str, Any]] = {}
+    l_outside: List[Dict[str, Any]] = []
+    for r in l_rows:
+        start = r["start"]
+        if not start or not same_boot(start.get("boot_ts"), prev) or (start.get("agent") or "claude") != "claude":
+            continue
+        seen = r["seen"] if same_boot(r["seen"].get("boot_ts"), prev) else {}
+        r["seen"] = seen
+        r["ts"] = int(seen.get("ts") or start.get("ts") or 0)
+        r["stale"] = not seen.get("ts") or r["ts"] < newest_ts - STALE_AFTER_S
+        r["cmd"] = _tmux_resume_cmd(r["uuid"], seen, start)
+        pane_id = seen.get("pane_id") or start.get("pane_id")
+        if not pane_id:
+            l_outside.append(r)
+        elif pane_id not in d_by_pane or r["ts"] > d_by_pane[pane_id]["ts"]:
+            d_by_pane[pane_id] = r
 
-
-def _die(msg: str) -> None:
-    """Report a failed safety check and stop - nothing has been touched yet."""
-    print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(1)
-
-
-def _check_closeable(live: Dict[str, Any]) -> str:
-    """Run every safety check against a live session, returning its tmux pane.
-
-    Ordered cheapest-first, and all of them run before anything is captured or
-    signalled, so a refusal always leaves the session exactly as it was.
-    """
-    pid, session_id = live.get("pid"), live["sessionId"]
-
-    if os.environ.get("CLAUDE_CODE_SESSION_ID") == session_id:
-        _die("refusing to close the session this command is running from.")
-    if live.get("status") == "busy":
-        _die("session is busy (mid-task) - never close a busy session.")
-    if live.get("kind") != "interactive":
-        _die(f"session kind is '{live.get('kind')}', not 'interactive' - not handled in v1.")
-    if not live.get("tmux"):
-        _die("session has no tmux pane (not tmux-based) - not handled in v1.")
-
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, TypeError):
-        _die(f"pid {pid} is not running - stale ~/.claude/sessions/ file.")
-
-    # live["tmux"] is "session:@window.%pane"; only the %pane part is addressable
-    pane_id = live["tmux"].split(".")[-1]
-    live_panes = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
-                                capture_output=True, text=True).stdout.split()
-    if pane_id not in live_panes:
-        _die(f"tmux pane {pane_id} (from {live['tmux']}) no longer exists - stale reference.")
-    return pane_id
-
-
-def _terminate(pid: int, timeout_s: float = 5.0) -> None:
-    """SIGTERM the process and wait for it to actually go, or bail out.
-
-    Never SIGKILL: Claude Code flushes its transcript on SIGTERM, and losing
-    that is the one genuinely unrecoverable outcome here. If it outlives the
-    timeout we leave the pane untouched rather than half-close it.
-    """
-    os.kill(pid, signal.SIGTERM)
-    waited = 0.0
-    while waited < timeout_s:
+    d_sessions: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    l_stale = []
+    for pane_id, r in sorted(d_by_pane.items(), key=lambda kv: -kv[1]["ts"]):   # newest first
+        if r["stale"] and not include_stale:
+            l_stale.append(r)
+            continue
+        seen = r["seen"]
+        session, window, _ = split_pane(seen.get("pane") or r["start"].get("pane"))
+        session = seen.get("tmux_session") or session
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.5)
-        waited += 0.5
-    print(f"WARNING: pid {pid} did not exit within {timeout_s:.0f}s of SIGTERM - "
-          f"leaving the pane untouched.", file=sys.stderr)
-    print("WARNING: check on it manually before retrying (it may be flushing a "
-          "large transcript).", file=sys.stderr)
-    sys.exit(1)
+            widx = int(seen["window_index"] if seen.get("window_index") is not None else window)
+        except (TypeError, ValueError):
+            widx = 0
+        if not session:
+            l_outside.append(r)
+            continue
+        w = d_sessions.setdefault(session, {}).setdefault(widx, {"name": None, "layout": None, "claude": {}})
+        if w["name"] is None:   # rows come newest first: the newest one gives the window's name and layout
+            w["name"], w["layout"] = seen.get("window_name"), seen.get("window_layout")
+        w["claude"][pane_id] = r
+
+    for d_windows in d_sessions.values():
+        for w in d_windows.values():
+            # One pane per cell of the saved layout, in pane order; a cell with no Claude session is a plain shell.
+            w["size"], l_numbers = layout_cells(w["layout"])
+            d_claude = dict(w.pop("claude"))
+            w["panes"] = [d_claude.pop(f"%{n}", None) for n in l_numbers]
+            if d_claude:   # a Claude pane the saved layout does not hold (layout older than the pane): add it
+                w["panes"] += sorted(d_claude.values(), key=lambda r: int(r["seen"].get("pane_index") or 0))
+                w["layout"] = "tiled"
+            if not w["panes"]:
+                w["panes"], w["layout"] = [None], None
+
+    return {"boot_ts": prev, "newest_ts": newest_ts, "sessions": d_sessions, "stale": l_stale,
+            "outside": l_outside}
 
 
-def _write_tombstone(session_id: str, capture: str, closed_at: str, age: str, mem: int) -> str:
-    """Save the pane's final screen to a file the pane can cat back after exit."""
-    os.makedirs(CLOSE_TOMBSTONE_DIR, exist_ok=True)
-    path = os.path.join(CLOSE_TOMBSTONE_DIR, f"{session_id}.txt")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"───── 🚪  CLOSED {closed_at} · idle {age} · {mem}MB reclaimed ─────\n")
-        f.write(capture if capture.endswith("\n") else capture + "\n")
-        f.write(f"───── resume: asm resume {session_id[:8]} ─────\n")
-    return path
+def _tmux_resume_cmd(uuid: str, seen: Dict[str, Any], start: Dict[str, Any]) -> str:
+    """`cd <dir> && claude --resume <uuid>`, in the folder `claude --resume` needs.
 
-
-def _do_close(uuid: str) -> None:
-    """Resolve uuid against live sessions, run safety checks, close it."""
-    live = _find_live_session(uuid)
-    if not live:
-        _die(f"session {uuid} has no live process - nothing to close "
-             f"(already exited, or from another machine).")
-
-    pid = live["pid"]
-    session_id = live["sessionId"]
-    name = live.get("name") or session_id
-
-    print(f"Target: {name} (pid {pid}, session {session_id})", flush=True)
-    pane_id = _check_closeable(live)
-
-    age_ms = int(time.time() * 1000) - int(live.get("statusUpdatedAt") or 0)
-    age = _human_age(age_ms)
-    mem = _rss_mb(pid)
-    if mem is None:
-        _die(f"pid {pid} disappeared while checking.")
-    print(f"  status={live.get('status')}  idle={age}  mem={mem}MB  "
-          f"pane={pane_id}  cwd={live.get('cwd')}", flush=True)
-
-    # Capture BEFORE terminating: the conversation lives on the terminal's
-    # alternate screen, which is torn down the moment the process exits.
-    capture = subprocess.run(["tmux", "capture-pane", "-p", "-e", "-t", pane_id],
-                             capture_output=True, text=True).stdout
-
-    _terminate(pid)
-
-    closed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    tombstone_path = _write_tombstone(session_id, capture, closed_at, age, mem)
-
-    # cat lands the text in the pane's *normal* buffer, so it survives; then
-    # the resume command is pre-typed without Enter - the pane becomes its
-    # own resume button.
-    subprocess.run(["tmux", "send-keys", "-t", pane_id, f"cat '{tombstone_path}'", "Enter"])
-    subprocess.run(["tmux", "send-keys", "-t", pane_id, f"claude --resume {session_id}"])
-    subprocess.run(["tmux", "select-pane", "-t", pane_id, "-T", f"🚪  {name}"],
-                   stderr=subprocess.DEVNULL)
-
-    os.makedirs(os.path.dirname(CLOSE_LOG_PATH), exist_ok=True)
-    with open(CLOSE_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "timestamp": closed_at, "sessionId": session_id, "name": name, "pid": pid,
-            "pane": pane_id, "idle_minutes": age_ms // 60000,
-            "mem_mb_reclaimed": mem, "tombstone": tombstone_path,
-        }) + "\n")
-
-    print(f"\033[32mClosed.\033[0m {mem}MB reclaimed. Tombstone: {tombstone_path}")
-
-
-def cmd_close(opts: SearchOpts) -> None:
-    """Find and close a running session. Same search as resume; only the
-    action after picking one differs - see _do_close.
-
-    Close relies entirely on ~/.claude/sessions/<pid>.json (_live_sessions())
-    to know what's actually running - Codex has no equivalent surface yet
-    (see DEV_DOC.md "Codex integration notes" #4), so a codex-tagged session
-    can never appear in the live_only picker below. --uuid bypasses the
-    picker, though, so it gets an explicit, honest check instead of falling
-    through to a "no live process" message that would misleadingly imply the
-    session simply isn't running rather than "not supported for this agent".
+    That folder is the one of the transcript's project slug (the folder the session started in);
+    it is decoded like `ares resume` does, else agent-tracker's start cwd, else the last cwd, else ~.
     """
-    if opts.uuid:
-        doc = find_by_uuid(opts.uuid)
-        backend = BACKENDS.get((doc or {}).get("agent_type") or "claude", BACKENDS["claude"])
-        if doc and not backend.supports_close:
-            print(f"ERROR: close is not supported for {backend.name} sessions yet.",
-                  file=sys.stderr)
-            sys.exit(1)
-        _do_close(opts.uuid)
-        return
-    uuid, _ = pick_session(opts, action_verb="Close", live_only=True)
-    _do_close(uuid)
+    transcript = seen.get("transcript") or ""
+    slug = Path(os.path.expanduser(transcript)).parent.name if transcript else ""
+    wd = (resolve_working_dir(slug) if slug else None) or start.get("cwd") or seen.get("cwd")
+    if not (wd and os.path.isdir(wd)):
+        wd = HOME
+    return f"cd {shlex.quote(wd)} && claude --resume {shlex.quote(uuid)}"
+
+
+def _applescript_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def iterm_script(l_sessions: List[str]) -> str:
+    """AppleScript: one new iTerm2 window, one tab per tmux session, each attaching to it."""
+    l_osa = ['tell application "iTerm2"', "  set w to (create window with default profile)"]
+    for i, name in enumerate(l_sessions):
+        if i:
+            l_osa.append("  tell w to create tab with default profile")
+        cmd = f"tmux attach -t {shlex.quote('=' + name)}"
+        l_osa.append(f"  tell current session of w to write text {_applescript_str(cmd)}")
+    return "\n".join(l_osa + ["end tell"])
+
+
+def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = True) -> int:
+    """Print the plan; unless dry_run, carry it out. Returns the exit status."""
+    plan = tmux_plan(include_stale)
+    if plan["boot_ts"] is None:
+        print(f"ares tmux: no previous boot in {TRACKER_SESSIONS_DIR}: nothing to restore.")
+        return 0
+
+    def tmux(*l_args: str) -> str:
+        """Run one tmux command; its output, stripped. Raises on failure."""
+        out = subprocess.run(["tmux", *l_args], capture_output=True, text=True)
+        if out.returncode != 0:
+            raise RuntimeError(f"tmux {' '.join(shlex.quote(a) for a in l_args)}: {out.stderr.strip()}")
+        return out.stdout.strip()
+
+    def exists(name: str) -> bool:
+        return subprocess.run(["tmux", "has-session", "-t", f"={name}"],
+                              capture_output=True).returncode == 0
+
+    n_claude = sum(1 for ws in plan["sessions"].values() for w in ws.values() for p in w["panes"] if p)
+    print(f"ares tmux{' --dry-run' if dry_run else ''}: previous boot {_fmt_ts(plan['boot_ts'])}, "
+          f"its last tick {_fmt_ts(plan['newest_ts'])}; {n_claude} Claude session(s) in tmux then"
+          f"{'' if include_stale else ' (stale ones need --all)'}")
+
+    l_restored: List[str] = []
+    errors = 0
+    for name, d_windows in plan["sessions"].items():
+        l_claude = [p for w in d_windows.values() for p in w["panes"] if p]
+        if exists(name):
+            print(f"  skip     tmux session {name!r}: already exists, left as is. Its Claude session(s), by hand:")
+            for r in l_claude:
+                print(f"             {r['cmd']}")
+            continue
+        print(f"  restore  tmux session {name!r}: {len(d_windows)} window(s)")
+        for widx, w in sorted(d_windows.items()):
+            size = f"{w['size'][0]}x{w['size'][1]}" if w["size"] else "default size"
+            print(f"    window {widx} {w['name']!r}, {size}, {len(w['panes'])} pane(s), layout {w['layout']}")
+            for i, r in enumerate(w["panes"]):
+                print(f"      pane {i}  {r['cmd'] + ('   (stale)' if r['stale'] else '') if r else 'shell in ~'}")
+        if dry_run:
+            l_restored.append(name)
+            continue
+        try:
+            sid = None
+            for widx, w in sorted(d_windows.items()):
+                l_size = ["-x", str(w["size"][0]), "-y", str(w["size"][1])] if w["size"] else []
+                l_name = ["-n", w["name"]] if w["name"] else []
+                if sid is None:
+                    sid = tmux("new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, *l_name,
+                               *l_size, "-c", HOME)
+                    wid, got = tmux("display-message", "-p", "-t", f"{sid}:", "#{window_id} #{window_index}").split()
+                    if int(got) != widx:   # the first window lands on base-index: move it to its saved index
+                        tmux("move-window", "-s", wid, "-t", f"{sid}:{widx}")
+                else:
+                    wid = tmux("new-window", "-d", "-P", "-F", "#{window_id}", "-t", f"{sid}:{widx}", *l_name,
+                               "-c", HOME)
+                if l_size:   # the saved size first, or the splits below may not fit
+                    tmux("resize-window", "-t", wid, *l_size)
+                for _ in w["panes"][1:]:
+                    tmux("split-window", "-d", "-t", wid, "-c", HOME)
+                if w["layout"]:
+                    tmux("select-layout", "-t", wid, w["layout"])
+                if l_size:   # resize-window fixed the size: let it follow the terminal again once attached
+                    tmux("set-option", "-w", "-u", "-t", wid, "window-size")
+                l_pane_ids = tmux("list-panes", "-t", wid, "-F", "#{pane_id}").split()
+                for pane_id, r in zip(l_pane_ids, w["panes"]):
+                    if r:
+                        tmux("send-keys", "-t", pane_id, r["cmd"], "Enter")
+            l_restored.append(name)
+        except (RuntimeError, OSError) as e:
+            errors += 1
+            print(f"  ERROR    tmux session {name!r}: {e}", file=sys.stderr)
+
+    for r in plan["stale"]:
+        where = r["seen"].get("pane") or r["start"].get("pane") or "?"
+        seen = f"last seen {_fmt_ts(r['ts'])}" if r["seen"].get("ts") else "no last_seen.json of that boot"
+        print(f"  stale    {r['uuid']} in {where}: {seen} (not restored; --all restores it)")
+    for r in plan["outside"]:
+        print(f"  no tmux  {r['uuid']}: by hand: {r['cmd']}")
+
+    if not l_restored:
+        print("  iTerm2   nothing to open")
+    elif not iterm:
+        print(f"  iTerm2   skipped (--no-iterm); attach with: tmux attach -t ={l_restored[0]}")
+    else:
+        script = iterm_script(l_restored)
+        if dry_run:
+            print("  iTerm2   one tab per restored tmux session:\n" + "\n".join("    " + l for l in script.splitlines()))
+        elif sys.platform != "darwin":
+            print("  iTerm2   skipped (not macOS)")
+        else:
+            out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+            if out.returncode == 0:
+                print(f"  iTerm2   {len(l_restored)} tab(s) opened")
+            else:
+                errors += 1
+                print(f"  ERROR    iTerm2: {out.stderr.strip()}", file=sys.stderr)
+    return 1 if errors else 0
 
 
 # -- Main -------------------------------------------------------------------
@@ -1755,24 +1849,24 @@ def cmd_close(opts: SearchOpts) -> None:
 # subparser's --help epilog, instead of a hand-maintained HELP blob that
 # duplicates flag descriptions already given to argparse via add_argument().
 EXAMPLES: List[Tuple[str, str, Optional[str]]] = [
-    ("resume", "asm resume", None),
-    ("resume", "asm resume profiling hallucination", None),
-    ("resume", "asm resume -f 30 cai benchmarking", None),
-    ("resume", "asm resume --host myserver", None),
-    ("resume", "asm resume --state pending", None),
-    ("resume", "asm resume --agent codex", "only sessions from a given agent"),
-    ("resume", "asm resume --tmux mywork", 'only sessions started in tmux session "mywork"'),
-    ("resume", "asm resume --fork", "fork instead of resume"),
-    ("resume", "asm resume --uuid <uuid> --print-cmd", "print the resume command, don't run it"),
-    ("resume", "asm resume --max-scan 200", None),
-    ("resume", "asm resume -v", "with verbose logging"),
-    ("resume", "asm resume --uuid 31967223-656d-41a3-8ed3-56dbcc37ef38", "skip search, resume directly"),
-    ("close", "asm close", "browse running sessions, close the one you pick"),
-    ("close", "asm close my-setup", "narrow the picker to matches first"),
-    ("close", "asm close --uuid 69959166-9792-44c3-9ee6-9f87e634a3f5", "skip search, close directly"),
-    ("reindex", "asm reindex", None),
-    ("reindex", "asm reindex -n 5", "reindex at most 5 sessions"),
-    ("reindex", "asm reindex --force", "force reindex, ignoring mtime-based skip"),
+    ("resume", "ares resume", None),
+    ("resume", "ares resume profiling hallucination", None),
+    ("resume", "ares resume -f 30 cai benchmarking", None),
+    ("resume", "ares resume --host myserver", None),
+    ("resume", "ares resume --state pending", None),
+    ("resume", "ares resume --agent codex", "only sessions from a given agent"),
+    ("resume", "ares resume --tmux mywork", 'only sessions started in tmux session "mywork"'),
+    ("resume", "ares resume --fork", "fork instead of resume"),
+    ("resume", "ares resume --uuid <uuid> --print-cmd", "print the resume command, don't run it"),
+    ("resume", "ares resume --max-scan 200", None),
+    ("resume", "ares resume -v", "with verbose logging"),
+    ("resume", "ares resume --uuid 31967223-656d-41a3-8ed3-56dbcc37ef38", "skip search, resume directly"),
+    ("tmux", "ares tmux --dry-run", "after a crash: print what would be restored"),
+    ("tmux", "ares tmux", "restore it, then one iTerm2 tab per tmux session"),
+    ("tmux", "ares tmux --all --no-iterm", "also the stale Claude sessions; no iTerm2 tab"),
+    ("reindex", "ares reindex", None),
+    ("reindex", "ares reindex -n 5", "reindex at most 5 sessions"),
+    ("reindex", "ares reindex --force", "force reindex, ignoring mtime-based skip"),
 ]
 
 
@@ -1786,24 +1880,21 @@ def _epilog_for(command: str) -> str:
     return "\n".join(lines)
 
 
-TOP_DESCRIPTION = f"""asm {VERSION} - Agent Session Manager (local index)
+TOP_DESCRIPTION = f"""ares {VERSION} - agent-resume (was asm): find and resume agent sessions
 
-  reindex → builds JSON index from local .jsonl files
-  resume  → reads from local index (~/opt/agent-session-manager/data/indexes/) for fast I/O
-  close   → reclaims RAM from a running session, leaves it resumable
+  resume  → refreshes the changed index entries, then searches ($AGENT_RESUME_HOME/data/indexes/)
+  tmux    → after a crash, restores the previous boot's tmux sessions and Claude sessions
+  reindex → builds the JSON index from local .jsonl files
 
-'resume' and 'close' take identical search options - only the action on the
-picked session differs: resume runs `claude --resume`/`codex resume`, close
-terminates it. 'close' only supports Claude sessions for now - Codex has no
-live-session surface yet, so it never appears in 'close's picker."""
+`asm` is an alias of `ares`. Closing a running session moved to agent-auto-close."""
 
-TOP_EPILOG = "Run `asm <command> --help` for that command's full flag list and examples."
+TOP_EPILOG = "Run `ares <command> --help` for that command's full flag list and examples."
+
+CLOSE_POINTER = "ares close moved to agent-auto-close: run `agent-auto-close close <uuid|%pane>`."
 
 
 def _add_search_args(p: argparse.ArgumentParser) -> None:
-    """Search/filter flags shared by 'resume' and 'close' - a single
-    definition keeps their UX identical; they only diverge in what happens
-    after a session is picked (see cmd_resume/cmd_close)."""
+    """Search/filter flags of 'resume'."""
     p.add_argument("-f", "--from-days-ago", type=int, default=90, help="Only sessions active in last N days (default: 90)")
     p.add_argument("-u", "--until-days-ago", type=int, help="Only sessions active more than N days ago")
     p.add_argument("--host", default="", help="Filter by hostname")
@@ -1818,13 +1909,17 @@ def _add_search_args(p: argparse.ArgumentParser) -> None:
 
 def main() -> None:
     """Main entry point."""
+    if sys.argv[1:2] == ["close"]:   # before argparse: any flags after it are close's, not ours
+        print(CLOSE_POINTER, file=sys.stderr)
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(
-        prog="asm",
+        prog="ares",
         description=TOP_DESCRIPTION,
         epilog=TOP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"asm {VERSION}")
+    parser.add_argument("--version", action="version", version=f"ares {VERSION}")
     subparsers = parser.add_subparsers(dest="command")
 
     resume_parser = subparsers.add_parser(
@@ -1836,11 +1931,14 @@ def main() -> None:
     resume_parser.add_argument("--print-cmd", action="store_true",
                                help="Print the resume/fork command instead of running it (scripting/testing)")
 
-    close_parser = subparsers.add_parser(
-        "close", help="Find and close a running session (reclaims memory, leaves a resumable tombstone)",
-        epilog=_epilog_for("close"), formatter_class=argparse.RawDescriptionHelpFormatter,
+    tmux_parser = subparsers.add_parser(
+        "tmux", help="After a crash: restore the previous boot's tmux sessions and Claude sessions",
+        epilog=_epilog_for("tmux"), formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    _add_search_args(close_parser)
+    tmux_parser.add_argument("--dry-run", action="store_true", help="Print the plan, change nothing")
+    tmux_parser.add_argument("--all", action="store_true",
+                             help="Also restore stale Claude sessions (stopped ticking > 2 min before the crash)")
+    tmux_parser.add_argument("--no-iterm", action="store_true", help="Do not open iTerm2 tabs")
 
     reindex_parser = subparsers.add_parser(
         "reindex", help="Re-index all sessions now",
@@ -1858,8 +1956,8 @@ def main() -> None:
 
     if args.command == "resume":
         cmd_resume(SearchOpts.from_args(args), args.fork, args.print_cmd)
-    elif args.command == "close":
-        cmd_close(SearchOpts.from_args(args))
+    elif args.command == "tmux":
+        sys.exit(cmd_tmux(args.dry_run, args.all, not args.no_iterm))
     elif args.command == "reindex":
         cmd_reindex(args.max, args.force, args.uuid)
 
