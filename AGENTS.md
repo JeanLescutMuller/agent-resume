@@ -15,7 +15,7 @@ Find and resume past Claude Code and Codex sessions from any folder and any mach
 
 ## Never
 
-- Run `install.sh`, `uninstall.sh` or `ares tmux` against the real `$HOME` or the default tmux server from a test: the tests use a sandbox (`test/sandbox_test.sh`, `TMUX_TMPDIR`, `unset TMUX`).
+- Run `install.sh`, `uninstall.sh` or `ares tmux` against the real `$HOME` or the default tmux server from a test: every tmux call of a test goes to an explicit socket: run the tests under agent-tracker's `tests/tmux_guard.sh` (the user's rule after a test's `TMUX_TMPDIR=… tmux kill-server`, with `TMUX` set, killed the real tmux server on 2026-11-07 15:30); the tests use a sandbox (`test/sandbox_test.sh`, `TMUX_TMPDIR`, `unset TMUX`).
 - Write a session's `.jsonl` transcript or sync it between machines: `ares-sync` moves index files only.
 
 ## Test, deploy

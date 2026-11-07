@@ -213,7 +213,10 @@ Reading rules: a `lifecycle.jsonl` line without its final newline is still being
 > **Status: implemented 2026-11-07** by `ares tmux` (agent-tracker `IMPLEMENTATION.md` §5, `DESIGN.md` §7). It replaces my-setup's `tools/terminal_snapshot.py` (a snapshot taken by hand) and resurrect + continuum.
 
 ```text
-ares tmux [--dry-run] [--all] [--no-iterm]
+ares tmux [--dry-run] [--all] [--no-iterm] [--this-boot]
+# --this-boot (2026-11-07, after a test killed the user's tmux server): no reboot happened, so there is no
+# previous boot; candidates are this boot's Claude sessions whose last start has no end, or an end with reason
+# "other" (Claude Code's SessionEnd when its tmux server dies), and whose process is gone (killed_start, pid_alive).
   prev boot   = the newest boot_ts in data/sessions/*/ (last_seen.json and lifecycle lines) that is not this boot
                 (this boot: $AGENT_TRACKER_BOOT_TS, else sysctl kern.boottime, else /proc/stat btime; boot_ts within 60 s = same boot)
   candidates  = Claude sessions (agent "claude") whose open start (R2) is of prev boot

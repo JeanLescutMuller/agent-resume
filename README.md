@@ -199,6 +199,8 @@ ares-sync --check [uuid]   # dry run - report what would sync, without copying
 ares tmux --dry-run          # print the plan: tmux sessions, windows, panes, the claude --resume per pane, stale ones
 ares tmux                    # do it, then open one iTerm2 tab per restored tmux session
 ares tmux --all              # also the stale Claude sessions (they had stopped ticking > 2 min before the crash)
+ares tmux --this-boot        # the tmux server died WITHOUT a reboot: this boot's Claude sessions whose process is gone
+                             # without a clean exit (Claude Code logs such a death as SessionEnd reason "other")
 ares tmux --no-iterm         # no iTerm2 tab (attach yourself: tmux attach -t =<name>)
 ```
 

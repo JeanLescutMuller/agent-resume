@@ -530,6 +530,34 @@ def open_start(lifecycle_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     return list(d_open.values())[-1] if d_open else None
 
 
+def killed_start(lifecycle_events: List[Dict[str, Any]], in_boot) -> Optional[Dict[str, Any]]:
+    """--this-boot: the newest start line of the boot `in_boot` accepts whose process ended without a clean
+    exit: no end line of its pid, or an end with reason "other" (what Claude Code logs when the tmux server
+    dies under it: 2026-11-07 15:30). The process may still run: the caller checks it is dead."""
+    d_open: Dict[Any, Dict[str, Any]] = {}
+    l_killed: List[Dict[str, Any]] = []
+    for ev in lifecycle_events:
+        if ev.get("event") == "start":
+            d_open[ev.get("pid")] = ev
+        elif ev.get("event") == "end":
+            st = d_open.pop(ev.get("pid"), None)
+            if st is not None and (ev.get("reason") or "other") == "other":
+                l_killed.append(st)
+    l_cand = [st for st in list(d_open.values()) + l_killed if in_boot(st.get("boot_ts"))]
+    return max(l_cand, key=lambda st: int(st.get("ts") or 0)) if l_cand else None
+
+
+def pid_alive(pid: Any) -> bool:
+    """Whether a process with this pid runs now (signal 0)."""
+    try:
+        os.kill(int(pid), 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def determine_state(lifecycle_events: List[Dict[str, Any]]) -> str:
     """'pending' if the session has a start with no end yet (running, or killed by a crash), 'exited' otherwise."""
     return "pending" if open_start(lifecycle_events) else "exited"
@@ -1632,8 +1660,11 @@ def _fmt_ts(ts: Any) -> str:
         return "?"
 
 
-def tmux_plan(include_stale: bool) -> Dict[str, Any]:
+def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
     """Read agent-tracker's files and decide what to restore (no tmux call).
+
+    this_boot: the tmux server died without a reboot: candidates are this boot's Claude sessions
+    whose process is gone without a clean exit (killed_start), instead of the previous boot's.
 
     Returns {"boot_ts", "newest_ts", "sessions": {name: {window_index: window}}, "stale": [row],
     "outside": [row]} or {"boot_ts": None} when there is no previous boot. A row is one Claude
@@ -1648,27 +1679,36 @@ def tmux_plan(include_stale: bool) -> Dict[str, Any]:
         uuid = os.path.basename(folder.rstrip("/"))
         seen = read_json(os.path.join(folder, "last_seen.json")) or {}
         l_events = read_lifecycle(uuid)
-        l_rows.append({"uuid": uuid, "seen": seen, "start": open_start(l_events),
+        l_rows.append({"uuid": uuid, "seen": seen, "start": open_start(l_events), "events": l_events,
                        "boots": [seen.get("boot_ts")] + [e.get("boot_ts") for e in l_events]})
 
-    l_boots = sorted({int(b) for r in l_rows for b in r["boots"] if isinstance(b, (int, float))
-                      and not same_boot(b, boot_now)}, reverse=True)
-    if not l_boots:
-        return {"boot_ts": None}
-    prev = l_boots[0]
+    if this_boot:
+        prev = boot_now
+    else:
+        l_boots = sorted({int(b) for r in l_rows for b in r["boots"] if isinstance(b, (int, float))
+                          and not same_boot(b, boot_now)}, reverse=True)
+        if not l_boots:
+            return {"boot_ts": None}
+        prev = l_boots[0]
 
-    # The moment of the crash, roughly: the newest tick of that boot.
-    newest_ts = max((int(r["seen"]["ts"]) for r in l_rows
-                     if same_boot(r["seen"].get("boot_ts"), prev) and r["seen"].get("ts")), default=0)
+    l_cand = []
+    for r in l_rows:
+        start = killed_start(r["events"], lambda b: same_boot(b, prev)) if this_boot else r["start"]
+        if not start or not same_boot(start.get("boot_ts"), prev) or (start.get("agent") or "claude") != "claude":
+            continue
+        if this_boot and pid_alive(start.get("pid")):
+            continue   # still running: nothing to restore
+        r["start"] = start
+        r["seen"] = r["seen"] if same_boot(r["seen"].get("boot_ts"), prev) else {}
+        l_cand.append(r)
+
+    # The moment of the crash, roughly: the newest tick among the candidates (this boot also holds live ones).
+    newest_ts = max((int(r["seen"]["ts"]) for r in l_cand if r["seen"].get("ts")), default=0)
 
     d_by_pane: Dict[str, Dict[str, Any]] = {}
     l_outside: List[Dict[str, Any]] = []
-    for r in l_rows:
-        start = r["start"]
-        if not start or not same_boot(start.get("boot_ts"), prev) or (start.get("agent") or "claude") != "claude":
-            continue
-        seen = r["seen"] if same_boot(r["seen"].get("boot_ts"), prev) else {}
-        r["seen"] = seen
+    for r in l_cand:
+        start, seen = r["start"], r["seen"]
         r["ts"] = int(seen.get("ts") or start.get("ts") or 0)
         r["stale"] = not seen.get("ts") or r["ts"] < newest_ts - STALE_AFTER_S
         r["cmd"] = _tmux_resume_cmd(r["uuid"], seen, start)
@@ -1744,11 +1784,17 @@ def iterm_script(l_sessions: List[str]) -> str:
     return "\n".join(l_osa + ["end tell"])
 
 
-def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = True) -> int:
+def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = True, this_boot: bool = False) -> int:
     """Print the plan; unless dry_run, carry it out. Returns the exit status."""
-    plan = tmux_plan(include_stale)
+    plan = tmux_plan(include_stale, this_boot)
+    if not this_boot:   # a tmux server killed without a reboot leaves this boot's sessions to restore too
+        n_now = sum(1 for d in tmux_plan(True, True)["sessions"].values() for w in d.values() for p in w["panes"] if p)
+        if n_now:
+            print(f"ares tmux: {n_now} Claude session(s) of THIS boot ended without a clean exit (tmux server killed?):"
+                  f" ares tmux --this-boot --dry-run")
     if plan["boot_ts"] is None:
-        print(f"ares tmux: no previous boot in {TRACKER_SESSIONS_DIR}: nothing to restore.")
+        print(f"ares tmux: no previous boot in {TRACKER_SESSIONS_DIR}: nothing to restore."
+              f" If the tmux server died without a reboot: ares tmux --this-boot --dry-run")
         return 0
 
     def tmux(*l_args: str) -> str:
@@ -1763,7 +1809,8 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
                               capture_output=True).returncode == 0
 
     n_claude = sum(1 for ws in plan["sessions"].values() for w in ws.values() for p in w["panes"] if p)
-    print(f"ares tmux{' --dry-run' if dry_run else ''}: previous boot {_fmt_ts(plan['boot_ts'])}, "
+    which = "this boot (tmux died without a reboot)" if this_boot else "previous boot"
+    print(f"ares tmux{' --this-boot' if this_boot else ''}{' --dry-run' if dry_run else ''}: {which} {_fmt_ts(plan['boot_ts'])}, "
           f"its last tick {_fmt_ts(plan['newest_ts'])}; {n_claude} Claude session(s) in tmux then"
           f"{'' if include_stale else ' (stale ones need --all)'}")
 
@@ -1936,6 +1983,9 @@ def main() -> None:
         epilog=_epilog_for("tmux"), formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     tmux_parser.add_argument("--dry-run", action="store_true", help="Print the plan, change nothing")
+    tmux_parser.add_argument("--this-boot", action="store_true",
+                             help="The tmux server died without a reboot: restore this boot's Claude sessions whose "
+                                  "process is gone without a clean exit")
     tmux_parser.add_argument("--all", action="store_true",
                              help="Also restore stale Claude sessions (stopped ticking > 2 min before the crash)")
     tmux_parser.add_argument("--no-iterm", action="store_true", help="Do not open iTerm2 tabs")
@@ -1957,7 +2007,7 @@ def main() -> None:
     if args.command == "resume":
         cmd_resume(SearchOpts.from_args(args), args.fork, args.print_cmd)
     elif args.command == "tmux":
-        sys.exit(cmd_tmux(args.dry_run, args.all, not args.no_iterm))
+        sys.exit(cmd_tmux(args.dry_run, args.all, not args.no_iterm, args.this_boot))
     elif args.command == "reindex":
         cmd_reindex(args.max, args.force, args.uuid)
 
