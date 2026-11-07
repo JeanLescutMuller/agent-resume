@@ -531,20 +531,22 @@ def open_start(lifecycle_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any
 
 
 def killed_start(lifecycle_events: List[Dict[str, Any]], in_boot) -> Optional[Dict[str, Any]]:
-    """--this-boot: the newest start line of the boot `in_boot` accepts whose process ended without a clean
-    exit: no end line of its pid, or an end with reason "other" (what Claude Code logs when the tmux server
-    dies under it: 2026-11-07 15:30). The process may still run: the caller checks it is dead."""
-    d_open: Dict[Any, Dict[str, Any]] = {}
-    l_killed: List[Dict[str, Any]] = []
-    for ev in lifecycle_events:
-        if ev.get("event") == "start":
-            d_open[ev.get("pid")] = ev
-        elif ev.get("event") == "end":
-            st = d_open.pop(ev.get("pid"), None)
-            if st is not None and (ev.get("reason") or "other") == "other":
-                l_killed.append(st)
-    l_cand = [st for st in list(d_open.values()) + l_killed if in_boot(st.get("boot_ts"))]
-    return max(l_cand, key=lambda st: int(st.get("ts") or 0)) if l_cand else None
+    """The Claude session's NEWEST start line, when it is of the boot `in_boot` accepts and its process ended
+    without a clean exit: no end line of its pid after it (a power cut), or one with reason "other" (what
+    Claude Code logs when the tmux server or the terminal dies under it: 2026-11-07 15:30). None otherwise:
+    resumed again later (by hand, or in a newer boot), or ended cleanly (prompt_input_exit, clear, logout).
+    A terminal tab closed on purpose also logs "other": the stale rule (tmux_plan) keeps it out unless --all."""
+    l_idx = [i for i, ev in enumerate(lifecycle_events) if ev.get("event") == "start"]
+    if not l_idx:
+        return None
+    i = l_idx[-1]
+    st = lifecycle_events[i]
+    if not in_boot(st.get("boot_ts")):
+        return None
+    for ev in lifecycle_events[i + 1:]:
+        if ev.get("event") == "end" and (ev.get("pid") is None or ev.get("pid") == st.get("pid")):
+            return st if (ev.get("reason") or "other") == "other" else None
+    return st
 
 
 def pid_alive(pid: Any) -> bool:
@@ -1611,7 +1613,9 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
 # agent-tracker's files only (no snapshot of our own):
 #
 #   prev boot   = the newest boot_ts in data/sessions/*/ that is not this boot
-#   candidates  = Claude sessions whose open start line (open_start) is of that boot
+#   candidates  = Claude sessions whose NEWEST start line is of that boot and was not followed by a clean exit
+#                 (killed_start: no end, or an end with reason "other" = tmux or the terminal died under it);
+#                 --this-boot: the same, for this boot, process no longer running (tmux died, no reboot)
 #   one per pane_id: the newest last_seen.ts wins (the pane was reused)
 #   stale       = no last_seen.json of that boot, or last_seen.ts more than 2 min older than the
 #                 boot's newest last_seen.ts (it had stopped ticking: killed before the crash);
@@ -1693,11 +1697,11 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
 
     l_cand = []
     for r in l_rows:
-        start = killed_start(r["events"], lambda b: same_boot(b, prev)) if this_boot else r["start"]
+        start = killed_start(r["events"], lambda b: same_boot(b, prev))   # both modes: see its docstring
         if not start or not same_boot(start.get("boot_ts"), prev) or (start.get("agent") or "claude") != "claude":
             continue
         if this_boot and pid_alive(start.get("pid")):
-            continue   # still running: nothing to restore
+            continue   # still running: nothing to restore (after a reboot, a pid is a new process: not checked)
         r["start"] = start
         r["seen"] = r["seen"] if same_boot(r["seen"].get("boot_ts"), prev) else {}
         l_cand.append(r)
@@ -1835,9 +1839,9 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
         if dry_run:
             l_restored.append(name)
             continue
-        try:
-            sid = None
-            for widx, w in sorted(d_windows.items()):
+        sid = None
+        for widx, w in sorted(d_windows.items()):
+            try:   # one window failing does not drop the session's other windows (tester, 2026-11-07)
                 l_size = ["-x", str(w["size"][0]), "-y", str(w["size"][1])] if w["size"] else []
                 l_name = ["-n", w["name"]] if w["name"] else []
                 if sid is None:
@@ -1853,6 +1857,7 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
                     tmux("resize-window", "-t", wid, *l_size)
                 for _ in w["panes"][1:]:
                     tmux("split-window", "-d", "-t", wid, "-c", HOME)
+                    tmux("select-layout", "-t", wid, "tiled")   # rebalance: else the 6th split finds "no space"
                 if w["layout"]:
                     tmux("select-layout", "-t", wid, w["layout"])
                 if l_size:   # resize-window fixed the size: let it follow the terminal again once attached
@@ -1861,10 +1866,13 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
                 for pane_id, r in zip(l_pane_ids, w["panes"]):
                     if r:
                         tmux("send-keys", "-t", pane_id, r["cmd"], "Enter")
+            except (RuntimeError, OSError) as e:
+                errors += 1
+                print(f"  ERROR    tmux session {name!r}, window {widx}: {e}", file=sys.stderr)
+                if sid is None:   # the session itself could not be created: nothing more to do for it
+                    break
+        if sid is not None:
             l_restored.append(name)
-        except (RuntimeError, OSError) as e:
-            errors += 1
-            print(f"  ERROR    tmux session {name!r}: {e}", file=sys.stderr)
 
     for r in plan["stale"]:
         where = r["seen"].get("pane") or r["start"].get("pane") or "?"

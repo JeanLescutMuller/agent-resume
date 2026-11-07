@@ -270,7 +270,7 @@ check "--dry-run: plan names work and general, skips existing" \
 check "--dry-run: stale E and M listed, L as no tmux" \
     bash -c "grep -q 'stale    $(uuid E)' '$S/dry.out' && grep -q 'stale    $(uuid M)' '$S/dry.out' && grep -q 'no tmux  $(uuid L)' '$S/dry.out'"
 check "--dry-run: the iTerm2 AppleScript is printed, osascript not run" \
-    bash -c "grep -q 'tmux attach -t =work' '$S/dry.out' && ! grep -q '^osascript' '$FAKE_LOG'"
+    bash -c "grep -qF \"tmux attach -t '=work'\" '$S/dry.out' && ! grep -q '^osascript' '$FAKE_LOG'"   # quoted: zsh reads a bare =name as a command path
 check "--dry-run: nothing from other boots, ended or codex sessions" \
     bash -c "! grep -qE '$(uuid G)|$(uuid H)|$(uuid I)|$(uuid J)|$(uuid K)' '$S/dry.out'"
 

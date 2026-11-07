@@ -217,6 +217,10 @@ ares tmux [--dry-run] [--all] [--no-iterm] [--this-boot]
 # --this-boot (2026-11-07, after a test killed the user's tmux server): no reboot happened, so there is no
 # previous boot; candidates are this boot's Claude sessions whose last start has no end, or an end with reason
 # "other" (Claude Code's SessionEnd when its tmux server dies), and whose process is gone (killed_start, pid_alive).
+# Same rule after a reboot (a tmux death followed by a reboot left only "other" ends: plain ares tmux restored 0);
+# only each session's newest start counts (resumed by hand, then exited: not restored). A window rebalances
+# (select-layout tiled) after each split, or the 6th split finds no space; one failing window spares the others.
+# Tests: test/test_restore_rules.sh (10 checks; under agent-tracker's tests/tmux_guard.sh).
   prev boot   = the newest boot_ts in data/sessions/*/ (last_seen.json and lifecycle lines) that is not this boot
                 (this boot: $AGENT_TRACKER_BOOT_TS, else sysctl kern.boottime, else /proc/stat btime; boot_ts within 60 s = same boot)
   candidates  = Claude sessions (agent "claude") whose open start (R2) is of prev boot
