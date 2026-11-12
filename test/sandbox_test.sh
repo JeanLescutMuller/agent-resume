@@ -192,6 +192,41 @@ ares close --uuid x > "$S/close.out" 2>&1; rc=$?
 check "ares close prints the one-line pointer to agent-auto-close, exit 1" \
     bash -c "[ $rc -eq 1 ] && [ \$(wc -l < '$S/close.out') -eq 1 ] && grep -q agent-auto-close '$S/close.out'"
 
+section "search: hidden non-interactive entries, accent folding, sessions without a date"
+python3 - "$IDX" <<'EOF'
+import json, os, sys
+from datetime import datetime, timezone
+d = sys.argv[1]
+def put(uuid, title, text, interactive=True, last_active="now"):
+    la = datetime.now(timezone.utc).isoformat() if last_active == "now" else last_active
+    json.dump({"session_id": uuid, "custom_title": title, "title_source": "custom", "interactive": interactive, "agent_type": "claude",
+               "jsonl_path": "/nonexistent/%s.jsonl" % uuid, "last_active": la, "created_at": la, "session_state": "exited",
+               "conversation": [{"role": "user", "timestamp": la, "text": text}]}, open(os.path.join(d, uuid + ".json"), "w"))
+put("aaaaaaaa-0000-4000-8000-0000000000a1", "Visit", "tomorrow I fly to Zürich for work")
+put("aaaaaaaa-0000-4000-8000-0000000000a2", "Hidden", "quokkaword headless", interactive=False)
+put("aaaaaaaa-0000-4000-8000-0000000000a3", "Dateless", "quokkaword nodate", last_active="")
+put("aaaaaaaa-0000-4000-8000-0000000000a4", "Shown", "quokkaword typed by hand")
+EOF
+cat > "$S/search.py" <<EOF
+import sys
+from importlib.machinery import SourceFileLoader
+m = SourceFileLoader("ares_mod", "$NEW/bin/ares").load_module()
+kw, days = sys.argv[1].split(), int(sys.argv[2])
+print(" ".join(sorted(p.rsplit("/", 1)[-1][:-5][-2:] for _, p in m.find_sessions(m.SearchOpts(keywords=kw, from_days=days))[0])))
+EOF
+rm -f "$IDX/hidden/.migrated"
+ares reindex >>"$LOG" 2>&1   # the migration moves the non-interactive entry
+check "reindex moves a non-interactive entry to indexes/hidden/" bash -c "[ -f '$IDX/hidden/aaaaaaaa-0000-4000-8000-0000000000a2.json' ] && [ ! -f '$IDX/aaaaaaaa-0000-4000-8000-0000000000a2.json' ]"
+check "a search never shows the hidden entry, and (date filter on) not the dateless one" test "$(python3 "$S/search.py" quokkaword 90)" = a4
+check "-f 0 (no date filter) shows the dateless one too, still not the hidden one" test "$(python3 "$S/search.py" quokkaword 0)" = "a3 a4"
+check "accents folded: 'zurich' finds 'Zürich'" test "$(python3 "$S/search.py" zurich 90)" = a1
+check "accents folded: 'ZÜRICH' finds 'Zürich'" test "$(python3 "$S/search.py" ZÜRICH 90)" = a1
+check "--uuid still finds a hidden entry" bash -c "python3 - <<'PY'
+from importlib.machinery import SourceFileLoader
+m = SourceFileLoader('ares_mod', '$NEW/bin/ares').load_module()
+assert m.find_by_uuid('aaaaaaaa-0000-4000-8000-0000000000a2')['custom_title'] == 'Hidden'
+PY"
+
 # ---------------------------------------------------------------------------------------------------------
 section "SessionStart hook: duplicate, cross-machine and changed-folder warnings"
 HOOK="$NEW/session_start.py"
@@ -208,6 +243,10 @@ write_lc "$SLEEP_PID" "$PSTART"
 out=$(run_hook); echo "$out" >>"$LOG"
 check "an earlier start still alive -> DUPLICATE SESSION with its pid and pane" \
     bash -c "echo '$out' | grep -q 'DUPLICATE SESSION: this session is already running in PID $SLEEP_PID (tmux: work:0.1)'"
+{ cat "$AGENT_TRACKER_HOME/data/sessions/$DUP/lifecycle.jsonl"
+  printf '{"ts":2,"event":"end","pid":%s}\n' "$SLEEP_PID"; } > "$S/lc_ended"; cp "$S/lc_ended" "$AGENT_TRACKER_HOME/data/sessions/$DUP/lifecycle.jsonl"
+check "a start whose pid logged an end (still alive, as after /clear) -> nothing printed" test -z "$(run_hook)"
+write_lc "$SLEEP_PID" "$PSTART"
 write_lc "$SLEEP_PID" "$((PSTART - 3600))"
 check "same pid, other start time (pid reused) -> nothing printed" test -z "$(run_hook)"
 write_lc "$$" "0"

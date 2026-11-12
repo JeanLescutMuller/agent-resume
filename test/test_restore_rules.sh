@@ -80,5 +80,19 @@ ok "8-pane window: restore exits 0, no ERROR" "[ $rc -eq 0 ] && ! grep -q ERROR 
 ok "8-pane window: 8 panes back" "[ \$(tmux list-panes -t big:0 | wc -l | tr -d ' ') -eq 8 ]"
 ok "8-pane window: a Claude session resumed in the last pane" "tmux capture-pane -p -t big:0.7 | grep -q 'fake claude --resume'"
 
+# -- claude not found: the pane is back at its shell prompt -> ERROR line, summary, rc 1 --------------------------
+for i in 0 1 2 3 4 5 6 7; do mv "$AGENT_TRACKER_HOME/data/sessions/$(U $((10+i)))" "$S/set-aside/"; done
+tmux kill-session -t big
+printf '#!/bin/bash\necho "claude: command not found"; exit 127\n' > "$HOME/bin/claude"
+write_session "$(U 30)" "lost:0.0" "[{'event':'start','ts':$((NOW-500)),'boot_ts':$B2,'pid':$((DEAD+30))},{'event':'end','ts':$((NOW-100)),'reason':'other','pid':$((DEAD+30))}]" $((NOW-100)) $B2
+"${ARES[@]}" tmux --this-boot --no-iterm > "$S/lost.txt" 2>&1; rc=$?
+ok "claude missing: rc is 1" "[ $rc -eq 1 ]"
+ok "claude missing: an ERROR line names the pane" "grep -q 'ERROR .*no Claude session running' '$S/lost.txt'"
+ok "claude missing: the summary counts 0 of 1 running" "grep -q 'summary  0 of 1 Claude pane(s) running, 1 without claude' '$S/lost.txt'"
+printf '#!/bin/bash\necho "fake claude $*"; exec sleep 300\n' > "$HOME/bin/claude"
+tmux kill-session -t lost
+"${ARES[@]}" tmux --this-boot --no-iterm > "$S/found.txt" 2>&1; rc=$?
+ok "claude present: rc 0 and the summary says 1 of 1 running" "[ $rc -eq 0 ] && grep -q 'summary  1 of 1 Claude pane(s) running$' '$S/found.txt'"
+
 echo "== $PASS passed, $FAIL failed (sandbox $S)"
 [ "$FAIL" -eq 0 ]

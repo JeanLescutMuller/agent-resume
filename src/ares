@@ -24,10 +24,12 @@ import os
 import re
 import json
 import glob
+import unicodedata
 import argparse
 import subprocess
 import shlex
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -80,6 +82,9 @@ _SETTINGS = _load_settings()
 
 PROJECTS_DIR = os.path.expanduser(_SETTINGS["local_projects_dir"])
 LOCAL_INDEX_DIR = os.path.expanduser(_SETTINGS["local_index_dir"])
+# Entries of sessions nobody typed in (`claude -p`, SDK, Codex sub-agents; ~87% of the files) live apart, so a
+# search reads only the interactive ones. ares-sync (maxdepth 1) leaves this folder out.
+HIDDEN_INDEX_DIR = os.path.join(LOCAL_INDEX_DIR, "hidden")
 IGNORE_PATH_SUBSTRINGS: List[str] = _SETTINGS.get("ignore_path_substrings", [])
 SYNC_STALE_WARNING_HOURS: float = _SETTINGS.get("sync_stale_warning_hours", 24)
 SYNC_LOG_PATH = os.path.join(ARES_DATA_DIR, "sync-log.jsonl")
@@ -675,6 +680,11 @@ def load_index_doc(path: str) -> Optional[Dict[str, Any]]:
     return doc
 
 
+def fold(s: str) -> str:
+    """Lower-case and without accents ('Zürich' -> 'zurich'), for matching keywords."""
+    return "".join(c for c in unicodedata.normalize("NFKD", s.casefold()) if not unicodedata.combining(c))
+
+
 def searchable_text(doc: Dict[str, Any]) -> str:
     """Text keywords are matched against: title, dirs, and the conversation.
 
@@ -725,6 +735,8 @@ def passes_filters(doc: Dict[str, Any], opts: SearchOpts,
             return False
         if cutoff_until and ts > cutoff_until:
             return False
+    elif cutoff_from or cutoff_until:
+        return False   # no date: it cannot be inside a date range (only `-f 0` without --until shows these)
     return True
 
 
@@ -754,7 +766,8 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
             log_verbose(f"PHASE 2: ERROR reading {os.path.basename(idx_path)}", verbose)
             continue
         if passes_filters(doc, opts, cutoff_from, cutoff_until):
-            candidates.append((doc, idx_path, searchable_text(doc)))
+            text = searchable_text(doc)
+            candidates.append((doc, idx_path, fold(text) if opts.keywords else text))
 
     # Sort by last_active (most recent first)
     candidates.sort(key=lambda item: item[0].get("last_active", "") or "", reverse=True)
@@ -764,9 +777,10 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
     if not opts.keywords:
         candidates = candidates[:opts.max_scan]
 
+    l_kw = [fold(kw) for kw in opts.keywords]
+
     def matches(text: str, fuzzy: bool = False) -> bool:
-        lowered = text.lower()
-        return all((kw[:3] if fuzzy else kw).lower() in lowered for kw in opts.keywords)
+        return all((kw[:3] if fuzzy else kw) in text for kw in l_kw)
 
     fuzzy = False
     sessions = [(doc, path) for doc, path, text in candidates
@@ -785,12 +799,12 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
 
         def rank_key(item: Tuple[Dict[str, Any], str]) -> Tuple[int, float]:
             doc, idx_path = item
-            title = (doc.get("custom_title") or "").lower()
-            if all(kw.lower() in title for kw in opts.keywords):
+            title = fold(doc.get("custom_title") or "")
+            if all(kw in title for kw in l_kw):
                 return (0, 0.0)  # title match: stable sort keeps recency order
             text = text_by_path.get(idx_path, "")
             n_tokens = len(text.split()) or 1
-            hits = sum(text.lower().count(kw.lower()) for kw in opts.keywords)
+            hits = sum(text.count(kw) for kw in l_kw)
             return (1, -hits / n_tokens)
 
         sessions.sort(key=rank_key)
@@ -804,11 +818,12 @@ def find_by_uuid(uuid: str) -> Optional[Dict[str, Any]]:
     exists. Used by --uuid to skip search/fzf entirely. None if 0 matches;
     exits with an error message (not just None) if the prefix is ambiguous,
     since silently picking one would be the wrong failure mode here."""
-    exact = os.path.join(LOCAL_INDEX_DIR, f"{uuid}.json")
-    if os.path.isfile(exact):
-        return load_index_doc(exact)
+    for d in (LOCAL_INDEX_DIR, HIDDEN_INDEX_DIR):
+        exact = os.path.join(d, f"{uuid}.json")
+        if os.path.isfile(exact):
+            return load_index_doc(exact)
 
-    candidates = [p for p in glob.glob(os.path.join(LOCAL_INDEX_DIR, "*.json"))
+    candidates = [p for d in (LOCAL_INDEX_DIR, HIDDEN_INDEX_DIR) for p in glob.glob(os.path.join(d, "*.json"))
                   if Path(p).stem.startswith(uuid)]
     if len(candidates) > 1:
         print(f"ERROR: multiple indexed sessions match uuid prefix '{uuid}':", file=sys.stderr)
@@ -1272,7 +1287,16 @@ def index_one(backend: Backend, jsonl_path: str, idx_path: str) -> Tuple[str, st
     lifecycle_events = read_lifecycle(uuid)
 
     doc = build_doc(uuid, transcript, lifecycle_events, jsonl_path, backend.name)
-    write_json_atomic(doc, idx_path)
+    if doc.get("interactive") is False:
+        Path(HIDDEN_INDEX_DIR).mkdir(parents=True, exist_ok=True)
+        write_json_atomic(doc, os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json"))
+        if os.path.exists(idx_path):
+            os.remove(idx_path)   # an entry from before this split
+    else:
+        write_json_atomic(doc, idx_path)
+        hidden = os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json")
+        if os.path.exists(hidden):
+            os.remove(hidden)
 
     return doc["custom_title"], doc["title_source"]
 
@@ -1329,7 +1353,7 @@ def plan_reindex(force: bool = False, single_uuid: str = "",
             d_history[p] = (m, backend)
     if single_uuid:
         d_history = {p: v for p, v in d_history.items() if v[1].uuid_of(p) == single_uuid}
-    d_index = scan_index_dir(LOCAL_INDEX_DIR)
+    d_index = {**scan_index_dir(HIDDEN_INDEX_DIR), **scan_index_dir(LOCAL_INDEX_DIR)}
     idx_mtime_by_uuid = {Path(p).stem: mtime for p, mtime in d_index.items()}
 
     l_todo: List[Tuple[str, str, Backend]] = []
@@ -1381,12 +1405,33 @@ def run_reindex(l_todo: List[Tuple[str, str, "Backend"]],
     return indexed, errors
 
 
+def migrate_hidden_entries() -> int:
+    """Move the entries of non-interactive sessions from indexes/ to indexes/hidden/ (once per machine).
+
+    A marker file ends it; entries synced in later by an older ares are moved by the next `ares reindex --force`.
+    Returns how many were moved.
+    """
+    marker = os.path.join(HIDDEN_INDEX_DIR, ".migrated")
+    if os.path.exists(marker) or not os.path.isdir(LOCAL_INDEX_DIR):
+        return 0
+    Path(HIDDEN_INDEX_DIR).mkdir(parents=True, exist_ok=True)
+    n = 0
+    for path in glob.glob(os.path.join(LOCAL_INDEX_DIR, "*.json")):
+        doc = read_json(path)
+        if doc is not None and doc.get("interactive") is False:
+            os.replace(path, os.path.join(HIDDEN_INDEX_DIR, os.path.basename(path)))
+            n += 1
+    Path(marker).touch()
+    return n
+
+
 def refresh_index(verbose: bool = False) -> None:
     """Before a search: re-index only the transcripts newer than their index entry (agent-tracker DESIGN §3).
 
     Silent, and never fatal: a failure just means the search reads the index as it was.
     """
     try:
+        migrate_hidden_entries()
         l_todo, d_counts = plan_reindex()
         indexed, errors = run_reindex(l_todo)
         log_verbose(f"refresh: {d_counts['scanned']} transcripts dated, {indexed} re-indexed, {errors} errors", verbose)
@@ -1405,6 +1450,7 @@ def cmd_reindex(max_sessions: int = 0, force: bool = False, single_uuid: str = "
         mode = f"reindex --uuid {single_uuid[:8]}"
     print(f"ares {VERSION} - {mode}" + (f" (max {max_sessions})" if max_sessions else ""), flush=True)
     Path(LOCAL_INDEX_DIR).mkdir(parents=True, exist_ok=True)
+    migrate_hidden_entries()
 
     l_todo, d_counts = plan_reindex(force, single_uuid, max_sessions)
     print(f"  Step 1: {d_counts['history']} .jsonl history files found", flush=True)
@@ -1627,6 +1673,8 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
 #
 # Only windows that held a Claude session are known (only Claude sessions write last_seen.json).
 
+CLAUDE_START_WAIT_S = 2.0   # ares tmux: how long a pane gets to start claude before it is checked
+SHELLS = {"bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh"}   # a pane still on one of these is not running claude
 STALE_AFTER_S = 120    # agent-tracker IMPLEMENTATION.md §5: "more than 2 min older"
 SAME_BOOT_S = 60       # macOS shifts kern.boottime by a few seconds when the clock is stepped
 LAYOUT_CELL_RE = re.compile(r"(\d+)x(\d+),\d+,\d+(?:,(\d+))?")   # WxH,X,Y[,pane number]
@@ -1822,6 +1870,8 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
           f"{'' if include_stale else ' (stale ones need --all)'}")
 
     l_restored: List[str] = []
+    l_started: List[Tuple[str, str]] = []   # (tmux session, pane id) of every pane that was sent a claude command
+    l_failed: List[str] = []
     errors = 0
     for name, d_windows in plan["sessions"].items():
         l_claude = [p for w in d_windows.values() for p in w["panes"] if p]
@@ -1866,6 +1916,7 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
                 for pane_id, r in zip(l_pane_ids, w["panes"]):
                     if r:
                         tmux("send-keys", "-t", pane_id, r["cmd"], "Enter")
+                        l_started.append((name, pane_id))
             except (RuntimeError, OSError) as e:
                 errors += 1
                 print(f"  ERROR    tmux session {name!r}, window {widx}: {e}", file=sys.stderr)
@@ -1873,6 +1924,19 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
                     break
         if sid is not None:
             l_restored.append(name)
+
+    if not dry_run and l_started:   # a pane back at its shell prompt: claude was not found, or died at once
+        time.sleep(CLAUDE_START_WAIT_S)
+        for name, pane_id in l_started:
+            try:
+                cmd = tmux("display-message", "-p", "-t", pane_id, "#{pane_current_command}").lstrip("-")
+            except RuntimeError:
+                continue
+            if cmd in SHELLS:
+                errors += 1
+                print(f"  ERROR    tmux session {name!r}, pane {pane_id}: no Claude session running (claude not found"
+                      f" on the PATH of that pane, or it exited at once); the pane shows why", file=sys.stderr)
+                l_failed.append(name)
 
     for r in plan["stale"]:
         where = r["seen"].get("pane") or r["start"].get("pane") or "?"
@@ -1898,6 +1962,9 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
             else:
                 errors += 1
                 print(f"  ERROR    iTerm2: {out.stderr.strip()}", file=sys.stderr)
+    if not dry_run and l_started:
+        n_ok = len(l_started) - len(l_failed)
+        print(f"  summary  {n_ok} of {len(l_started)} Claude pane(s) running" + (f", {len(l_failed)} without claude" if l_failed else ""))
     return 1 if errors else 0
 
 
