@@ -10,7 +10,7 @@ Writes: nothing. Prints only the warnings, and only when there is one: a banner 
 
 The warnings (as asm's lifecycle hook gave them until 2026-11-07):
   DUPLICATE SESSION  an earlier start line of this machine and this boot whose pid is still alive with the
-                     same start time (pid_start), so a reused pid does not count, and which is not this
+                     same start time (pid_start), so a reused pid does not count, and which logged no end line of that pid, and which is not this
                      session's own process (any ancestor of this hook)
   Cross-machine      the previous start (the newest start line not of this process) ran on another machine
   Working directory  the previous start's cwd is another folder than this one (compared by realpath)
@@ -69,6 +69,14 @@ def main() -> None:
     elif not boot:
         boot = next((l.split()[1] for l in open("/proc/stat") if l.startswith("btime ")), None)
 
+    s_ended = set()   # pids that logged an end (after /clear the process lives on and logs a new start)
+    for raw in l_raw:
+        try:
+            ev = json.loads(raw)
+            if ev.get("event") == "end" and ev.get("pid"):
+                s_ended.add(int(ev["pid"]))
+        except (ValueError, TypeError, AttributeError):
+            continue
     l_warn, s_seen, prev = [], set(), None
     for raw in l_raw:
         try:
@@ -78,7 +86,7 @@ def main() -> None:
             continue
         if ev.get("event") == "start" and pid not in s_mine:
             prev = ev   # ends as the newest start of another process: the previous start
-        if ev.get("event") != "start" or not pid or pid in s_mine or pid in s_seen or pid not in d_proc:
+        if ev.get("event") != "start" or not pid or pid in s_mine or pid in s_seen or pid in s_ended or pid not in d_proc:
             continue
         if ev.get("machine") and machine and ev["machine"] != machine:
             continue
