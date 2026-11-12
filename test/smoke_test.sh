@@ -412,6 +412,8 @@ def usable_keyword(path):
         idx = json.load(open(path))
     except (OSError, ValueError):
         return None
+    if idx.get("interactive") is False or not idx.get("last_active") or idx.get("title_source") in ("empty", "untitled"):
+        return None   # a `claude -p` entry, or a placeholder title: search never shows it
     title = (idx.get("custom_title") or "").replace("(auto-generated)", "").strip()
     return next((w for w in title.split() if len(w) > 3 and w.isalnum()), None)
 
