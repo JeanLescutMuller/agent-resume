@@ -211,6 +211,18 @@ Reading rules: a `lifecycle.jsonl` line without its final newline is still being
 ## R4: Crash Recovery: `ares tmux`
 
 > **Status: implemented 2026-11-07** by `ares tmux` (agent-tracker `IMPLEMENTATION.md` §5, `DESIGN.md` §7). It replaces my-setup's `tools/terminal_snapshot.py` (a snapshot taken by hand) and resurrect + continuum.
+>
+> **Changed 2026-11-17 (the user, after the first real crash): from agent-tracker's snapshot.** The guess below dropped a Claude session still running (its status line stopped 2 min before the others while the Mac froze: "stale") and lost the iTerm2 layout (a second window, the tab order). agent-tracker now writes `data/snapshots/<boot_ts>.tsv` (its `FOR_READERS.md` §4, rule 18; `tick` starts it at most once a minute). With a snapshot of the previous boot (`read_snapshot`, `snapshot_plan` in `src/ares`):
+>
+> | Step | From the snapshot |
+> |---|---|
+> | tmux sessions, windows, panes | every `pane` row (session, window index and name, `window_layout`, pane index), also tmux sessions with no Claude session |
+> | Claude panes | a candidate (`killed_start` in that boot) with the pane's `pane_id`, when the pane's command was not a shell (Claude Code shows as its version, `2.1.326`); no stale rule, no `--all` |
+> | plain panes | a shell in the pane's saved folder (`respawn-pane -c`; `~` if the folder is gone) |
+> | candidates newer than the snapshot | printed with their command, to run by hand ("no tmux") |
+> | iTerm2 | the `iterm` rows: one window per iTerm2 window, back to front (the first ends in front), `set bounds`, one tab per tmux session in tab order (a tab's tmux session: the `client` row with its tty); a restored tmux session in no tab: a tab of the front window |
+>
+> Without a snapshot of that boot, and with `--this-boot` (the snapshot may already show the new tmux server), the guess below. Tests: `test/sandbox_test.sh`, section "ares tmux from agent-tracker's snapshot".
 
 ```text
 ares tmux [--dry-run] [--all] [--no-iterm] [--this-boot]

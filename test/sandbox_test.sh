@@ -368,6 +368,61 @@ assert len(got) == 6, got
 assert got[exp["uuids"]["E"]] == "general:1.1" and got[exp["uuids"]["M"]] == "nols:0.0", got
 EOF
 
+section "ares tmux from agent-tracker's snapshot: every pane, no stale rule, the iTerm2 windows and tab order"
+# The 2026-11-17 crash: E (last seen 10 min before the others, still running) was dropped as stale, and the iTerm2
+# layout (jobs/interviewing alone in a second window, the tab order) was lost. The snapshot says what was open.
+tmux kill-server; sleep 0.3
+tmux new-session -d -s existing -n keep -c "$HOME"
+if ! tmux_sandbox_guard; then fail "tmux server is not the sandbox one: stopping"; exit 1; fi
+: > "$FAKE_LOG"
+mkdir -p "$HOME/dev/plain dir"
+python3 - "$S/expected.json" <<'PY'
+import json, os, sys
+exp = json.load(open(sys.argv[1])); L = exp["layouts"]
+prev = int(os.environ["AGENT_TRACKER_BOOT_TS"]) - 200000
+ts, d = prev + 49990, "x"
+H = os.environ["HOME"]
+rows = [("pane", "work", 0, 0, "%1", "2.1.326", H, L["work:0"], "editor"),
+        ("pane", "work", 0, 1, "%2", "-zsh", H + "/dev/plain dir", L["work:0"], "editor"),
+        ("pane", "work", 0, 2, "%3", "2.1.326", H, L["work:0"], "editor"),
+        ("pane", "work", 2, 0, "%5", "2.1.326", H, L["work:2"], "logs"),
+        ("pane", "general", 1, 0, "%7", "2.1.326", H, L["general:1"], "main"),
+        ("pane", "general", 1, 1, "%8", "2.1.326", H, L["general:1"], "main"),
+        ("pane", "jobs/interviewing", 0, 0, "%20", "zsh", H, "", "zsh"),
+        ("pane", "nols", 0, 0, "%12", "zsh", H, "", "n"),
+        ("client", "/dev/ttys001", "work"), ("client", "/dev/ttys002", "general"),
+        ("client", "/dev/ttys003", "jobs/interviewing"), ("client", "/dev/ttys004", "nols"),
+        ("iterm", 1, 225, 1, "/dev/ttys002", "0,0,800,600"), ("iterm", 1, 225, 2, "/dev/ttys004", "0,0,800,600"),
+        ("iterm", 1, 225, 3, "/dev/ttys001", "0,0,800,600"), ("iterm", 1, 225, 4, "/dev/ttys009", "0,0,800,600"),
+        ("iterm", 2, 263, 1, "/dev/ttys003", "-100,-500,700,0")]
+folder = os.path.join(os.environ["AGENT_TRACKER_HOME"], "data", "snapshots")
+os.makedirs(folder, exist_ok=True)
+with open(os.path.join(folder, f"{prev + 3}.tsv"), "w") as f:   # a boot_ts a few seconds off: still that boot
+    f.writelines("\t".join(map(str, (ts, d) + r)) + "\n" for r in rows)
+PY
+ares tmux --dry-run > "$S/snap-dry.out" 2>&1; rc=$?; cat "$S/snap-dry.out" >>"$LOG"
+check "snapshot --dry-run exits 0, says it uses the snapshot" bash -c "[ $rc -eq 0 ] && grep -q 'its snapshot of' '$S/snap-dry.out' && ! grep -q '^  stale' '$S/snap-dry.out'"
+check "snapshot --dry-run: iTerm2 windows front first, tabs in order, bounds" bash -c "
+    grep -qF '2 window(s): general, nols, work | jobs/interviewing' '$S/snap-dry.out' &&
+    grep -A1 'create window' '$S/snap-dry.out' | head -2 | grep -qF 'set bounds of w to {-100,-500,700,0}'"
+ares tmux --no-iterm > "$S/snap-run.out" 2>&1; rc=$?; cat "$S/snap-run.out" >>"$LOG"
+check "snapshot run exits 0" test $rc -eq 0
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(n_claude)" -ge 5 ] && break; sleep 0.5; done
+check "snapshot: sessions general, jobs/interviewing (no Claude in it), nols, work, plus existing" \
+    test "$(tmux list-sessions -F '#{session_name}' | sort | tr '\n' ' ')" = "existing general jobs/interviewing nols work "
+check "snapshot: claude --resume A, B, C, D and E (E was 'stale'), not M (its pane was back at a shell)" python3 - <<EOF
+import json, subprocess
+exp = json.load(open("$S/expected.json"))
+d_pane = dict(l.split(" ", 1) for l in subprocess.run(["tmux", "list-panes", "-a", "-F",
+              "#{pane_id} #{session_name}:#{window_index}.#{pane_index}"], capture_output=True, text=True).stdout.split("\n") if l)
+got = sorted((d_pane.get(p, p), args.split()[-1]) for _, p, _, args in (l.strip().split("|") for l in open("$FAKE_LOG") if l.startswith("claude|")))
+want = sorted((place, exp["uuids"][k]) for k, place in
+              {"A": "work:0.0", "B": "work:0.2", "C": "work:2.0", "D": "general:1.0", "E": "general:1.1"}.items())
+assert got == want, (got, want)
+EOF
+for _ in 1 2 3 4 5 6; do [ "$(tmux display-message -p -t =work:0.1 '#{pane_current_path}')" = "$HOME/dev/plain dir" ] && break; sleep 0.5; done
+check "snapshot: a plain pane is a shell in its saved folder" test "$(tmux display-message -p -t =work:0.1 '#{pane_current_path}')" = "$HOME/dev/plain dir"
+
 echo ""
 echo "Passed: $PASS   Failed: $FAIL   (log: $LOG)"
 [ "$FAIL" -eq 0 ]

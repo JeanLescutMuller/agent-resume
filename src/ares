@@ -6,7 +6,8 @@ Index architecture:
   reindex → builds JSON index from local .jsonl files ($AGENT_RESUME_HOME/data/indexes/)
   resume  → refreshes the index entries whose transcript changed, then searches it
   tmux    → after a crash, puts back the tmux sessions and Claude sessions of the previous boot,
-            read from agent-tracker's files ($AGENT_TRACKER_HOME/data/sessions/<uuid>/)
+            and the iTerm2 windows, read from agent-tracker's files ($AGENT_TRACKER_HOME/data/snapshots/<boot_ts>.tsv,
+            data/sessions/<uuid>/)
 
 Commands:
   ares resume [OPTIONS] [KEYWORD...]   Find and resume a past Claude Code or Codex session
@@ -43,6 +44,7 @@ ARES_DATA_DIR = os.path.join(AGENT_RESUME_HOME, "data")
 # agent-tracker is the only writer of data/sessions/<uuid>/{lifecycle.jsonl,last_seen.json}; ares only reads them.
 AGENT_TRACKER_HOME = os.environ.get("AGENT_TRACKER_HOME") or os.path.join(HOME, "opt", "agent-tracker")
 TRACKER_SESSIONS_DIR = os.path.join(AGENT_TRACKER_HOME, "data", "sessions")
+TRACKER_SNAPSHOTS_DIR = os.path.join(AGENT_TRACKER_HOME, "data", "snapshots")   # <boot_ts>.tsv: the terminal snapshot
 
 # -- Settings --------------------------------------------------------------
 
@@ -1754,6 +1756,11 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
         r["seen"] = r["seen"] if same_boot(r["seen"].get("boot_ts"), prev) else {}
         l_cand.append(r)
 
+    if not this_boot:   # --this-boot: the snapshot may already show the tmux server started after the death
+        snap = read_snapshot(prev, same_boot)
+        if snap:
+            return snapshot_plan(prev, snap, l_cand)
+
     # The moment of the crash, roughly: the newest tick among the candidates (this boot also holds live ones).
     newest_ts = max((int(r["seen"]["ts"]) for r in l_cand if r["seen"].get("ts")), default=0)
 
@@ -1807,6 +1814,95 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
             "outside": l_outside}
 
 
+def read_snapshot(boot_ts: int, same_boot) -> Optional[Dict[str, Any]]:
+    """agent-tracker's terminal snapshot of that boot (its FOR_READERS.md §4, rule 18), or None.
+
+    The newest data/snapshots/<boot_ts>.tsv whose name is that boot (macOS may shift boot_ts by a few seconds).
+    Returns {"path", "ts" (newest pane row), "panes": [{"session", "window_index", "pane_index", "pane_id",
+    "command", "cwd", "layout", "window_name"}], "clients": {tty: tmux session}, "iterm": [{"window", "tab",
+    "tty", "bounds"}]}. A line without its final newline is ignored."""
+    l_files = [f for f in glob.glob(os.path.join(TRACKER_SNAPSHOTS_DIR, "*.tsv"))
+               if os.path.basename(f)[:-4].isdigit() and same_boot(int(os.path.basename(f)[:-4]), boot_ts)]
+    if not l_files:
+        return None
+    path = max(l_files, key=os.path.getmtime)
+    d = {"path": path, "ts": 0, "panes": [], "clients": {}, "iterm": []}
+    try:
+        l_lines = open(path, encoding="utf-8", errors="replace").readlines()
+    except OSError:
+        return None
+    for line in l_lines:
+        f = line.rstrip("\n").split("\t")
+        if not line.endswith("\n") or len(f) < 3 or not f[0].isdigit():
+            continue
+        if f[2] == "pane" and len(f) >= 11 and f[4].isdigit() and f[5].isdigit():
+            d["ts"] = max(d["ts"], int(f[0]))
+            d["panes"].append({"session": f[3], "window_index": int(f[4]), "pane_index": int(f[5]), "pane_id": f[6],
+                               "command": f[7].lstrip("-"), "cwd": f[8], "layout": f[9],
+                               "window_name": "\t".join(f[10:])})
+        elif f[2] == "client" and len(f) >= 5:
+            d["clients"][f[3]] = f[4]
+        elif f[2] == "iterm" and len(f) >= 8 and f[3].isdigit() and f[5].isdigit():
+            d["iterm"].append({"window": int(f[3]), "tab": int(f[5]), "tty": f[6], "bounds": f[7]})
+    return d if d["panes"] else None
+
+
+def snapshot_plan(prev: int, snap: Dict[str, Any], l_cand: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """tmux_plan from the previous boot's snapshot: every tmux session, window and pane it lists. A pane gets
+    `claude --resume` when a candidate (killed_start in that boot) has its pane_id and the pane's command was not
+    a shell (Claude was still running there); else a shell in its folder. No stale rule. Candidates newer than the
+    snapshot (started after it) are listed as "outside", to resume by hand. Same shape as tmux_plan, plus
+    "iterm": [{"bounds", "tabs": [tmux session]}] front window first, and "snapshot": its path."""
+    d_cand: Dict[str, Dict[str, Any]] = {}
+    l_outside: List[Dict[str, Any]] = []
+    for r in l_cand:
+        start, seen = r["start"], r["seen"]
+        r["ts"] = int(seen.get("ts") or start.get("ts") or 0)
+        r["stale"] = False
+        r["cmd"] = _tmux_resume_cmd(r["uuid"], seen, start)
+        pane_id = seen.get("pane_id") or start.get("pane_id")
+        if pane_id and (pane_id not in d_cand or r["ts"] > d_cand[pane_id]["ts"]):
+            d_cand[pane_id] = r
+        elif not pane_id and r["ts"] > snap["ts"]:
+            l_outside.append(r)
+
+    d_sessions: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    set_used = set()
+    for p in sorted(snap["panes"], key=lambda p: (p["window_index"], p["pane_index"])):
+        w = d_sessions.setdefault(p["session"], {}).setdefault(
+            p["window_index"], {"name": p["window_name"] or None, "layout": p["layout"] or None, "panes": []})
+        r = d_cand.get(p["pane_id"])
+        if r and p["command"] not in SHELLS:
+            set_used.add(r["uuid"])
+            w["panes"].append(dict(r, cwd=p["cwd"]))
+        else:
+            w["panes"].append({"cmd": None, "cwd": p["cwd"]})
+    for d_windows in d_sessions.values():
+        for w in d_windows.values():
+            w["size"], _ = layout_cells(w["layout"])
+    l_outside += [r for r in d_cand.values() if r["uuid"] not in set_used and r["ts"] > snap["ts"]]
+
+    d_iterm: Dict[int, Dict[str, Any]] = {}
+    for row in sorted(snap["iterm"], key=lambda x: (x["window"], x["tab"])):
+        w = d_iterm.setdefault(row["window"], {"bounds": row["bounds"], "tabs": []})
+        name = snap["clients"].get(row["tty"])
+        if name and name not in w["tabs"]:
+            w["tabs"].append(name)
+    return {"boot_ts": prev, "newest_ts": snap["ts"], "sessions": d_sessions, "stale": [], "outside": l_outside,
+            "iterm": [w for _, w in sorted(d_iterm.items()) if w["tabs"]], "snapshot": snap["path"]}
+
+
+def _is_claude(p: Optional[Dict[str, Any]]) -> bool:
+    """A planned pane that gets `claude --resume` (else a plain shell: None, or {"cmd": None, "cwd"})."""
+    return bool(p and p.get("cmd"))
+
+
+def _pane_dir(p: Optional[Dict[str, Any]]) -> str:
+    """The folder a planned pane's shell starts in: its saved folder when it still exists, else ~."""
+    wd = (p or {}).get("cwd")
+    return wd if wd and os.path.isdir(wd) else HOME
+
+
 def _tmux_resume_cmd(uuid: str, seen: Dict[str, Any], start: Dict[str, Any]) -> str:
     """`cd <dir> && claude --resume <uuid>`, in the folder `claude --resume` needs.
 
@@ -1825,9 +1921,38 @@ def _applescript_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def iterm_script(l_sessions: List[str]) -> str:
-    """AppleScript: one new iTerm2 window, one tab per tmux session, each attaching to it."""
-    l_osa = ['tell application "iTerm2"', "  set w to (create window with default profile)"]
+BOUNDS_RE = re.compile(r"-?\d+(,-?\d+){3}")
+
+
+def iterm_windows(plan: Dict[str, Any], l_restored: List[str]) -> List[Tuple[Optional[str], List[str]]]:
+    """[(bounds or None, [tmux session, in tab order])], front window first: the snapshot's iTerm2 windows with
+    only the restored tmux sessions; a restored one in no tab becomes a tab of the first window. No snapshot:
+    one window, one tab per restored tmux session."""
+    l_out = [(w["bounds"], [n for n in w["tabs"] if n in l_restored]) for w in plan.get("iterm") or []]
+    l_out = [(b, l_tabs) for b, l_tabs in l_out if l_tabs]
+    set_placed = {n for _, l_tabs in l_out for n in l_tabs}
+    l_rest = [n for n in l_restored if n not in set_placed]
+    if l_rest:
+        if l_out:
+            l_out[0][1].extend(l_rest)
+        else:
+            l_out = [(None, l_rest)]
+    return l_out
+
+
+def iterm_script(l_windows: List[Tuple[Optional[str], List[str]]]) -> str:
+    """AppleScript: per (bounds, tmux sessions), one new iTerm2 window (at those bounds), one tab per tmux session,
+    each attaching to it. Created back to front, so the first window ends in front."""
+    l_osa = ['tell application "iTerm2"']
+    for bounds, l_sessions in reversed(l_windows):
+        l_osa.append("  set w to (create window with default profile)")
+        if bounds and BOUNDS_RE.fullmatch(bounds):
+            l_osa.append(f"  set bounds of w to {{{bounds}}}")
+        _iterm_tabs(l_osa, l_sessions)
+    return "\n".join(l_osa + ["end tell"])
+
+
+def _iterm_tabs(l_osa: List[str], l_sessions: List[str]) -> None:
     for i, name in enumerate(l_sessions):
         if i:
             l_osa.append("  tell w to create tab with default profile")
@@ -1836,14 +1961,13 @@ def iterm_script(l_sessions: List[str]) -> str:
         target = "=" + name
         cmd = "tmux attach -t '" + target.replace("'", "'\\''") + "'"
         l_osa.append(f"  tell current session of w to write text {_applescript_str(cmd)}")
-    return "\n".join(l_osa + ["end tell"])
 
 
 def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = True, this_boot: bool = False) -> int:
     """Print the plan; unless dry_run, carry it out. Returns the exit status."""
     plan = tmux_plan(include_stale, this_boot)
     if not this_boot:   # a tmux server killed without a reboot leaves this boot's sessions to restore too
-        n_now = sum(1 for d in tmux_plan(True, True)["sessions"].values() for w in d.values() for p in w["panes"] if p)
+        n_now = sum(1 for d in tmux_plan(True, True)["sessions"].values() for w in d.values() for p in w["panes"] if _is_claude(p))
         if n_now:
             print(f"ares tmux: {n_now} Claude session(s) of THIS boot ended without a clean exit (tmux server killed?):"
                   f" ares tmux --this-boot --dry-run")
@@ -1863,18 +1987,21 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
         return subprocess.run(["tmux", "has-session", "-t", f"={name}"],
                               capture_output=True).returncode == 0
 
-    n_claude = sum(1 for ws in plan["sessions"].values() for w in ws.values() for p in w["panes"] if p)
+    n_claude = sum(1 for ws in plan["sessions"].values() for w in ws.values() for p in w["panes"] if _is_claude(p))
     which = "this boot (tmux died without a reboot)" if this_boot else "previous boot"
-    print(f"ares tmux{' --this-boot' if this_boot else ''}{' --dry-run' if dry_run else ''}: {which} {_fmt_ts(plan['boot_ts'])}, "
-          f"its last tick {_fmt_ts(plan['newest_ts'])}; {n_claude} Claude session(s) in tmux then"
-          f"{'' if include_stale else ' (stale ones need --all)'}")
+    head = f"ares tmux{' --this-boot' if this_boot else ''}{' --dry-run' if dry_run else ''}: {which} {_fmt_ts(plan['boot_ts'])}, "
+    if plan.get("snapshot"):
+        print(head + f"its snapshot of {_fmt_ts(plan['newest_ts'])} ({plan['snapshot']}); {n_claude} Claude session(s) in tmux then")
+    else:
+        print(head + f"no snapshot, guessed from its last tick {_fmt_ts(plan['newest_ts'])}; {n_claude} Claude session(s)"
+              f" in tmux then{'' if include_stale else ' (stale ones need --all)'}")
 
     l_restored: List[str] = []
     l_started: List[Tuple[str, str]] = []   # (tmux session, pane id) of every pane that was sent a claude command
     l_failed: List[str] = []
     errors = 0
     for name, d_windows in plan["sessions"].items():
-        l_claude = [p for w in d_windows.values() for p in w["panes"] if p]
+        l_claude = [p for w in d_windows.values() for p in w["panes"] if _is_claude(p)]
         if exists(name):
             print(f"  skip     tmux session {name!r}: already exists, left as is. Its Claude session(s), by hand:")
             for r in l_claude:
@@ -1885,7 +2012,7 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
             size = f"{w['size'][0]}x{w['size'][1]}" if w["size"] else "default size"
             print(f"    window {widx} {w['name']!r}, {size}, {len(w['panes'])} pane(s), layout {w['layout']}")
             for i, r in enumerate(w["panes"]):
-                print(f"      pane {i}  {r['cmd'] + ('   (stale)' if r['stale'] else '') if r else 'shell in ~'}")
+                print(f"      pane {i}  {r['cmd'] + ('   (stale)' if r['stale'] else '') if _is_claude(r) else 'shell in ' + _pane_dir(r)}")
         if dry_run:
             l_restored.append(name)
             continue
@@ -1896,13 +2023,13 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
                 l_name = ["-n", w["name"]] if w["name"] else []
                 if sid is None:
                     sid = tmux("new-session", "-d", "-P", "-F", "#{session_id}", "-s", name, *l_name,
-                               *l_size, "-c", HOME)
+                               *l_size, "-c", _pane_dir(w["panes"][0]))
                     wid, got = tmux("display-message", "-p", "-t", f"{sid}:", "#{window_id} #{window_index}").split()
                     if int(got) != widx:   # the first window lands on base-index: move it to its saved index
                         tmux("move-window", "-s", wid, "-t", f"{sid}:{widx}")
                 else:
                     wid = tmux("new-window", "-d", "-P", "-F", "#{window_id}", "-t", f"{sid}:{widx}", *l_name,
-                               "-c", HOME)
+                               "-c", _pane_dir(w["panes"][0]))
                 if l_size:   # the saved size first, or the splits below may not fit
                     tmux("resize-window", "-t", wid, *l_size)
                 for _ in w["panes"][1:]:
@@ -1913,10 +2040,12 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
                 if l_size:   # resize-window fixed the size: let it follow the terminal again once attached
                     tmux("set-option", "-w", "-u", "-t", wid, "window-size")
                 l_pane_ids = tmux("list-panes", "-t", wid, "-F", "#{pane_id}").split()
-                for pane_id, r in zip(l_pane_ids, w["panes"]):
-                    if r:
+                for i, (pane_id, r) in enumerate(zip(l_pane_ids, w["panes"])):
+                    if _is_claude(r):
                         tmux("send-keys", "-t", pane_id, r["cmd"], "Enter")
                         l_started.append((name, pane_id))
+                    elif i and _pane_dir(r) != HOME:   # splits start in ~: a fresh shell in the pane's own folder
+                        tmux("respawn-pane", "-k", "-t", pane_id, "-c", _pane_dir(r))
             except (RuntimeError, OSError) as e:
                 errors += 1
                 print(f"  ERROR    tmux session {name!r}, window {widx}: {e}", file=sys.stderr)
@@ -1950,15 +2079,16 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
     elif not iterm:
         print(f"  iTerm2   skipped (--no-iterm); attach with: tmux attach -t ={l_restored[0]}")
     else:
-        script = iterm_script(l_restored)
+        l_windows = iterm_windows(plan, l_restored)
+        script = iterm_script(l_windows)
         if dry_run:
-            print("  iTerm2   one tab per restored tmux session:\n" + "\n".join("    " + l for l in script.splitlines()))
+            print(f"  iTerm2   {len(l_windows)} window(s): " + " | ".join(", ".join(t) for _, t in l_windows) + "\n" + "\n".join("    " + l for l in script.splitlines()))
         elif sys.platform != "darwin":
             print("  iTerm2   skipped (not macOS)")
         else:
             out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
             if out.returncode == 0:
-                print(f"  iTerm2   {len(l_restored)} tab(s) opened")
+                print(f"  iTerm2   {len(l_windows)} window(s), {len(l_restored)} tab(s) opened")
             else:
                 errors += 1
                 print(f"  ERROR    iTerm2: {out.stderr.strip()}", file=sys.stderr)
@@ -1987,7 +2117,7 @@ EXAMPLES: List[Tuple[str, str, Optional[str]]] = [
     ("resume", "ares resume -v", "with verbose logging"),
     ("resume", "ares resume --uuid 31967223-656d-41a3-8ed3-56dbcc37ef38", "skip search, resume directly"),
     ("tmux", "ares tmux --dry-run", "after a crash: print what would be restored"),
-    ("tmux", "ares tmux", "restore it, then one iTerm2 tab per tmux session"),
+    ("tmux", "ares tmux", "restore it, then the iTerm2 windows and tabs as they were"),
     ("tmux", "ares tmux --all --no-iterm", "also the stale Claude sessions; no iTerm2 tab"),
     ("reindex", "ares reindex", None),
     ("reindex", "ares reindex -n 5", "reindex at most 5 sessions"),
@@ -2065,7 +2195,7 @@ def main() -> None:
                              help="The tmux server died without a reboot: restore this boot's Claude sessions whose "
                                   "process is gone without a clean exit")
     tmux_parser.add_argument("--all", action="store_true",
-                             help="Also restore stale Claude sessions (stopped ticking > 2 min before the crash)")
+                             help="No snapshot of that boot only: also restore stale Claude sessions (stopped ticking > 2 min before the others)")
     tmux_parser.add_argument("--no-iterm", action="store_true", help="Do not open iTerm2 tabs")
 
     reindex_parser = subparsers.add_parser(

@@ -57,20 +57,19 @@ Not every feature has full parity yet - see [Feature Support by Agent](#feature-
 
 ### 4. Crash Restore of the Whole tmux Setup (`ares tmux`)
 
-After a crash (or a reboot), `ares tmux` puts back what ran at the end of the previous boot: each tmux session with its windows (index, name, exact pane sizes via the saved `window_layout`), `claude --resume <uuid>` in each Claude pane, plain shells in `~` for the other panes, then one iTerm2 tab per tmux session. It reads only agent-tracker's files; it replaces my-setup's `terminal_snapshot.py`.
+After a crash (or a reboot), `ares tmux` puts back what was open at the end of the previous boot, as agent-tracker's **snapshot** recorded it (since 2026-11-17): every tmux session, window (index, name, exact pane sizes via the saved `window_layout`) and pane, `claude --resume <uuid>` in each pane where Claude was still running, a shell in its own folder in the others, then the iTerm2 windows (position and size) with their tabs in the same order. It reads only agent-tracker's files.
 
 ```text
-agent-tracker's files                            ares tmux
-data/sessions/<uuid>/lifecycle.jsonl   ──►  previous boot = newest boot_ts that is not this boot
-                     last_seen.json    ──►  Claude sessions with an open start in that boot
-                                            one per pane (newest last seen wins)
-                                            stale (last seen > 2 min before the boot's last tick): only with --all
-                                       ──►  tmux new-session / new-window / split-window, select-layout,
-                                            send-keys "cd <folder> && claude --resume <uuid>"
-                                       ──►  iTerm2: one tab per restored tmux session (AppleScript)
+agent-tracker's files                                  ares tmux
+data/snapshots/<boot_ts>.tsv  (≤ 1 min old)   ──►  every tmux pane, its folder, its command; iTerm2 windows and tabs
+data/sessions/<uuid>/lifecycle.jsonl          ──►  Claude sessions killed in that boot (no clean exit)
+                     last_seen.json           ──►  matched to their pane by pane_id
+                                              ──►  tmux new-session / new-window / split-window, select-layout,
+                                                   send-keys "cd <folder> && claude --resume <uuid>"
+                                              ──►  iTerm2: each window at its bounds, its tabs in order (AppleScript)
 ```
 
-A tmux session that already exists is never touched (printed as skipped, with its `claude --resume` commands to run by hand). Only windows that held a Claude session are known: agent-tracker records Claude sessions, not plain shells.
+A tmux session that already exists is never touched (printed as skipped, with its `claude --resume` commands to run by hand). A previous boot without a snapshot (before 2026-11-17, or no Claude session ran) falls back to the old guess from `last_seen.json`: only windows that held a Claude session, plain shells in `~`, "stale" Claude sessions (last seen > 2 min before the others) only with `--all`, one iTerm2 window.
 
 ### 5. Session Analytics
 
@@ -196,9 +195,9 @@ ares-sync --check [uuid]   # dry run - report what would sync, without copying
 ### `ares tmux` - after a crash, restore the previous boot's tmux setup
 
 ```bash
-ares tmux --dry-run          # print the plan: tmux sessions, windows, panes, the claude --resume per pane, stale ones
-ares tmux                    # do it, then open one iTerm2 tab per restored tmux session
-ares tmux --all              # also the stale Claude sessions (they had stopped ticking > 2 min before the crash)
+ares tmux --dry-run          # print the plan: tmux sessions, windows, panes, the claude --resume per pane, the iTerm2 windows
+ares tmux                    # do it, then open the iTerm2 windows and tabs as they were
+ares tmux --all              # no snapshot of that boot only: also the stale Claude sessions
 ares tmux --this-boot        # the tmux server died WITHOUT a reboot: this boot's Claude sessions whose process is gone
                              # without a clean exit (Claude Code logs such a death as SessionEnd reason "other")
 ares tmux --no-iterm         # no iTerm2 tab (attach yourself: tmux attach -t =<name>)
