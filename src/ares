@@ -1993,7 +1993,9 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
     if plan.get("snapshot"):
         print(head + f"its snapshot of {_fmt_ts(plan['newest_ts'])} ({plan['snapshot']}); {n_claude} Claude session(s) in tmux then")
     else:
-        print(head + f"no snapshot, guessed from its last tick {_fmt_ts(plan['newest_ts'])}; {n_claude} Claude session(s)"
+        # newest_ts 0: no Claude session ever ticked here (a new machine): say so, not "1970-01-01".
+        guess = f"guessed from its last tick {_fmt_ts(plan['newest_ts'])}" if plan["newest_ts"] else "no data on this machine"
+        print(head + f"no snapshot, {guess}; {n_claude} Claude session(s)"
               f" in tmux then{'' if include_stale else ' (stale ones need --all)'}")
 
     l_restored: List[str] = []
