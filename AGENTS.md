@@ -1,6 +1,6 @@
 # agent-resume (`ares`; was agent-session-manager, `asm`)
 
-Find and resume past Claude Code and Codex sessions from any folder and any machine (`ares resume`), and after a crash put back the whole tmux setup with a `claude --resume` in each Claude pane (`ares tmux`). One of the projects around agent-tracker (its `DESIGN.md` §10): agent-tracker records, agent-resume finds and resumes, agent-auto-close closes.
+Find and resume past Claude Code and Codex sessions from any folder and any machine (`ares resume`), and after a crash put back the whole tmux setup with a `claude --resume` in each Claude pane (`ares tmux`). One of the projects around agent-tracker (its `DESIGN.md` §10): agent-tracker records, agent-resume finds and resumes, claude-close-keep-screen closes.
 
 ## Rules
 
@@ -9,7 +9,7 @@ Find and resume past Claude Code and Codex sessions from any folder and any mach
 - **The index is refreshed at search time**: `ares resume` re-indexes only the transcripts (or lifecycles) newer than their index entry (`refresh_index`), then searches. The 30-min job and the VM sync stay (open point: agent-tracker `DESIGN.md` "Open points").
 - **`ares tmux` follows agent-tracker's `IMPLEMENTATION.md` §5 exactly**: since 2026-11-17 from agent-tracker's snapshot (`data/snapshots/<boot_ts>.tsv`: every pane, its folder and command, the iTerm2 windows and tabs; Claude sessions matched by `pane_id`, no stale rule); without one, the old guess (one per pane, stale rule); always `select-layout`, never touch an existing tmux session. → `DEV_DOC.md` R4.
 - **Two hooks, for Claude Code and Codex** (Codex: the plugin `src/codex-plugin/`, `agent-resume@agent-resume-local`): `src/session_start.py` (SessionStart) prints only the resume warnings (duplicate, cross-machine, changed folder) read from agent-tracker's lifecycle; `src/session_end.sh` (SessionEnd) re-indexes that one session and pushes it to the hub (`ares-sync --push`). Both always exit 0 and write no lifecycle: asm's lifecycle hook and `data/lifecycles/` are gone (agent-tracker's now).
-- **No close here**: `ares close` prints a one-line pointer to agent-auto-close. No `status` script (removed by the user, 2026-11-07).
+- **No close here**: `ares close` prints a one-line pointer to claude-close-keep-screen. No `status` script (removed by the user, 2026-11-07).
 - Python stdlib only; `src/ares` is one file (Backend registry: `BACKENDS`).
 - `install.sh` is idempotent and self-migrating (it takes apart `~/opt/agent-session-manager`, doc/deploy_migration.md). In a sandbox `HOME` it calls no `launchctl` / `systemctl`, and runs `codex` only with `CODEX_HOME=$HOME/.codex`.
 
@@ -38,7 +38,7 @@ bash install.sh                    # deploy to ~/opt/agent-resume (from the Mac'
 | boot · previous boot | one run of the Mac, named by its start time `boot_ts` · the newest `boot_ts` in agent-tracker's files that is not this boot | |
 | snapshot | agent-tracker's `data/snapshots/<boot_ts>.tsv`: the terminal layout of a boot (tmux panes, tmux clients, iTerm2 windows and tabs), at most ~1 min old | |
 | stale | without a snapshot only: a Claude session of the previous boot whose last seen is more than 2 min older than that boot's newest last seen (or has none): `ares tmux` restores it only with `--all` | |
-| agent-tracker · agent-resume · agent-auto-close | records + visibility · search and resume, command `ares` (alias `asm`) · closing Claude sessions | asm, agent-session-manager (except when describing the past) |
+| agent-tracker · agent-resume · claude-close-keep-screen | records + visibility · search and resume, command `ares` (alias `asm`) · closing Claude sessions | asm, agent-session-manager (except when describing the past) |
 
 ## Where to look
 

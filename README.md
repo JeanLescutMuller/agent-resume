@@ -209,7 +209,7 @@ ares tmux --no-iterm         # no iTerm2 tab (attach yourself: tmux attach -t =<
 ares --version   # show version
 ares --help      # show all flags
 asm ...          # the same as ares (alias, kept for a while after the rename)
-ares close       # moved: prints a pointer to agent-auto-close
+ares close       # moved: prints a pointer to claude-close-keep-screen
 ```
 
 ## Installation

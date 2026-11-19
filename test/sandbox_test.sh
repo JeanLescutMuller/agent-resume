@@ -189,8 +189,8 @@ check "a lifecycle-only change is re-indexed too (I now exited)" test "$(field "
 check "an unchanged session is not re-indexed" test "$(stat -f %m "$IDX/$UH.json")" = "$before_h"
 check "--print-cmd builds cd <project> && claude --resume" grep -q "claude --resume $UA" "$S/printcmd.out"
 ares close --uuid x > "$S/close.out" 2>&1; rc=$?
-check "ares close prints the one-line pointer to agent-auto-close, exit 1" \
-    bash -c "[ $rc -eq 1 ] && [ \$(wc -l < '$S/close.out') -eq 1 ] && grep -q agent-auto-close '$S/close.out'"
+check "ares close prints the one-line pointer to claude-close-keep-screen, exit 1" \
+    bash -c "[ $rc -eq 1 ] && [ \$(wc -l < '$S/close.out') -eq 1 ] && grep -q claude-close-keep-screen '$S/close.out'"
 
 section "search: hidden non-interactive entries, accent folding, sessions without a date"
 python3 - "$IDX" <<'EOF'

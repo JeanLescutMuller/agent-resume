@@ -179,7 +179,7 @@ fi
 ares --help &>/dev/null && pass "ares --help exits 0" || fail "ares --help exited non-zero"
 [[ "$(asm --version 2>&1)" == "$(ares --version 2>&1)" ]] && pass "asm is an alias of ares" || fail "asm --version differs from ares --version"
 out=$(ares close 2>&1); rc=$?
-[[ $rc -ne 0 && "$out" == *agent-auto-close* ]] && pass "ares close points to agent-auto-close" || fail "ares close did not print the pointer (rc=$rc): $out"
+[[ $rc -ne 0 && "$out" == *claude-close-keep-screen* ]] && pass "ares close points to claude-close-keep-screen" || fail "ares close did not print the pointer (rc=$rc): $out"
 ares tmux --help &>/dev/null && pass "ares tmux --help exits 0" || fail "ares tmux --help exited non-zero"
 
 # ---------------------------------------------------------------------------

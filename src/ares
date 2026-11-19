@@ -2143,11 +2143,11 @@ TOP_DESCRIPTION = f"""ares {VERSION} - agent-resume (was asm): find and resume a
   tmux    → after a crash, restores the previous boot's tmux sessions and Claude sessions
   reindex → builds the JSON index from local .jsonl files
 
-`asm` is an alias of `ares`. Closing a running session moved to agent-auto-close."""
+`asm` is an alias of `ares`. Closing a running session moved to claude-close-keep-screen."""
 
 TOP_EPILOG = "Run `ares <command> --help` for that command's full flag list and examples."
 
-CLOSE_POINTER = "ares close moved to agent-auto-close: run `agent-auto-close close <uuid|%pane>`."
+CLOSE_POINTER = "ares close moved to claude-close-keep-screen: run `claude-close-keep-screen close <uuid|%pane>`."
 
 
 def _add_search_args(p: argparse.ArgumentParser) -> None:
