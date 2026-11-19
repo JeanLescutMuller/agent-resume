@@ -274,3 +274,7 @@ This must be set on each machine independently. (Codex CLI's own session-retenti
 - Resume search completes in well under a second from local disk
 - Scheduling uses each platform's native mechanism (`launchd` on macOS, a `systemd --user` timer on Linux) rather than a custom daemon or cron - `install.sh` sets it up, no manual scheduler config needed
 - Every sync attempt (success or failure) is appended to `~/opt/agent-resume/data/sync-log.jsonl` as one JSON line - a lightweight audit trail, not just a staleness check
+
+## Several Claude accounts (2026-11-19)
+
+`ares resume` starts Claude through my-setup's `claude-account` when it is installed (a `claude` shell function inside its `bash -c`, since a non-interactive bash has no alias), so the account selector appears before the session opens, preselecting the session's last account. `ares tmux` types `claude --resume <uuid>` into each restored pane's shell: the `claude` alias answers, one selector per pane. Without `claude-account` (the VM), plain `claude`.

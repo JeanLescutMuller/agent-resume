@@ -1652,7 +1652,10 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
     print(f"Command:            {cmd}")
     print("")
     print(f"{'Forking' if fork else 'Resuming'} in {working_dir} ...")
-    os.execv("/bin/bash", ["/bin/bash", "-c", cmd])
+    # A non-interactive bash has no `claude` alias: define it as a function, so the resume goes through my-setup's
+    # claude-account (the account selector) when it is installed, else straight to claude (2026-11-19).
+    via_account = 'claude() { if command -v claude-account >/dev/null 2>&1; then claude-account "$@"; else command claude "$@"; fi; }; '
+    os.execv("/bin/bash", ["/bin/bash", "-c", via_account + cmd])
 
 
 # -- Crash restore: ares tmux (agent-tracker IMPLEMENTATION.md §5) -----------
