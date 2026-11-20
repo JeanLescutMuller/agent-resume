@@ -109,22 +109,32 @@ else
     warn "not running from a repo checkout - skipping src/ drift check"
 fi
 
-# Claude Code hooks: agent-resume's SessionStart group, and not its former SessionEnd one
-if [[ -f "$CLAUDE_SETTINGS" ]]; then
-    hook_ok=$(python3 -c "
-import json
-hooks = json.load(open('$CLAUDE_SETTINGS')).get('hooks', {})
-cmds = lambda evt: [h.get('command', '') for e in hooks.get(evt, []) for h in e.get('hooks', [])]
-start = sum('agent-resume/session_start.py' in c for c in cmds('SessionStart'))
-end = sum('agent-resume/session_end.sh' in c for c in cmds('SessionEnd'))
-print('1' if start == 1 and end == 0 else '0')
-" 2>/dev/null)
-    [[ "$hook_ok" == "1" ]] \
-        && pass "hook session_start.py (SessionStart) registered once; the former session_end.sh gone" \
-        || fail "hook session_start.py missing or doubled, or the former session_end.sh still registered (re-run install.sh)"
-else
-    fail "~/.claude/settings.json not found"
-fi
+# Claude Code hooks: agent-resume's SessionStart group, and not its former SessionEnd one, in every Claude account's
+# settings.json (my-setup's claude-account: account b's is a link to account a's; a real copy keeps old hooks, as on
+# 2026-11-20: account b still called the removed session_end.sh). Every agent-resume file a hook names must exist.
+[[ -f "$CLAUDE_SETTINGS" ]] || fail "~/.claude/settings.json not found"
+for settings in "$CLAUDE_SETTINGS" "$HOME"/.claude/account-*/settings.json; do
+    [[ -f "$settings" ]] || continue
+    [[ "$settings" != "$CLAUDE_SETTINGS" && "$(readlink "$settings")" == ../settings.json ]] && continue   # the same file
+    hook_err=$(python3 - "$settings" "$DEPLOY_DIR" <<'PY' 2>&1
+import json, os, re, sys
+hooks = json.load(open(sys.argv[1])).get("hooks", {})
+cmds = lambda evt: [h.get("command", "") for e in hooks.get(evt, []) for h in e.get("hooks", [])]
+l_err = []
+if sum("agent-resume/session_start.py" in c for c in cmds("SessionStart")) != 1:
+    l_err.append("session_start.py (SessionStart) missing or doubled")
+for evt in hooks:
+    for c in cmds(evt):
+        for rel in re.findall(r"opt/agent-resume/([^\s\"']+)", c):
+            if not os.path.exists(os.path.join(sys.argv[2], rel)):
+                l_err.append(f"{evt} hook calls {rel}, which does not exist")
+print("; ".join(l_err))
+PY
+)
+    [[ -z "$hook_err" ]] \
+        && pass "$settings: hook session_start.py registered once; every agent-resume file a hook names exists" \
+        || fail "$settings: $hook_err (account a: re-run install.sh; another account: claude-account --relink)"
+done
 
 # No job since 2026-11-20: the former trigger must be gone (re-run install.sh)
 if [[ -e "$HOME/Library/LaunchAgents/com.jeanlescut.agent-resume.plist" || -e "$HOME/.config/systemd/user/com.jeanlescut.agent-resume.timer" ]]; then

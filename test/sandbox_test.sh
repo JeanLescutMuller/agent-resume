@@ -126,6 +126,20 @@ python3 "$REPO/test/make_fixtures.py" > "$S/expected.json" 2>>"$LOG"; check "fix
 bash "$REPO/test/smoke_test.sh" --offline >"$S/smoke.log" 2>&1; rc=$?
 cat "$S/smoke.log" >>"$LOG"
 check "smoke_test.sh passes ($(grep -o 'Passed: [0-9]*   Failed: [0-9]*' "$S/smoke.log"))" test $rc -eq 0
+# account b's settings.json: a link to account a's passes; a real copy with the removed SessionEnd hook fails (2026-11-20)
+mkdir -p "$HOME/.claude/account-b"; ln -s ../settings.json "$HOME/.claude/account-b/settings.json"
+check "smoke_test.sh passes with account b's settings.json linked to account a's" bash "$REPO/test/smoke_test.sh" --offline
+rm "$HOME/.claude/account-b/settings.json"
+python3 - "$HOME/.claude/settings.json" "$HOME/.claude/account-b/settings.json" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["hooks"]["SessionEnd"] = [{"matcher": "", "hooks": [{"type": "command", "command": 'bash "$HOME/opt/agent-resume/session_end.sh"'}]}]
+json.dump(d, open(sys.argv[2], "w"))
+EOF
+bash "$REPO/test/smoke_test.sh" --offline >"$S/smoke-b.log" 2>&1; rc=$?; cat "$S/smoke-b.log" >>"$LOG"
+check "smoke_test.sh fails on account b's real copy calling the removed session_end.sh, and names it" \
+    bash -c "[ $rc -ne 0 ] && grep -q 'account-b/settings.json: SessionEnd hook calls session_end.sh, which does not exist' '$S/smoke-b.log'"
+rm "$HOME/.claude/account-b/settings.json"; rmdir "$HOME/.claude/account-b"
 
 section "uninstall.sh, then install.sh again"
 bash "$NEW/uninstall.sh" >>"$LOG" 2>&1; check "uninstall.sh exits 0" test $? -eq 0
@@ -233,6 +247,96 @@ from importlib.machinery import SourceFileLoader
 m = SourceFileLoader('ares_mod', '$NEW/bin/ares').load_module()
 assert m.find_by_uuid('aaaaaaaa-0000-4000-8000-0000000000a2')['custom_title'] == 'Hidden'
 PY"
+
+section "search filters, the picker, --fork, a gone transcript, reindex options"
+# c1 claude pending on alpha-mac in tmux 'work', today; c2 codex exited on beta-vm, 10 days ago; c3 claude exited on
+# alpha-mac, today, its transcript gone (state 'deleted'). A fake fzf saves the rows it was given and picks the first.
+C1=cccccccc-0000-4000-8000-0000000000c1; C2=cccccccc-0000-4000-8000-0000000000c2; C3=cccccccc-0000-4000-8000-0000000000c3
+mkdir -p "$S/tx" "$S/proj"; : > "$S/tx/$C1.jsonl"; : > "$S/tx/$C2.jsonl"
+python3 - "$IDX" "$S" <<'EOF'
+import json, os, sys
+from datetime import datetime, timedelta, timezone
+d, s = sys.argv[1:3]
+def put(n, agent, state, host_key, host, tmux, days_ago, jsonl):
+    uuid = "cccccccc-0000-4000-8000-0000000000c%d" % n
+    la = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+    json.dump({"session_id": uuid, "custom_title": "Filter %d" % n, "title_source": "custom", "interactive": True,
+               "agent_type": agent, "session_state": state, host_key: host, "tmux_session": tmux,
+               "jsonl_path": jsonl % uuid, "latest_working_dir": s + "/proj", "last_active": la, "created_at": la,
+               "conversation": [{"role": "user", "timestamp": la, "text": "filtrword number %d" % n}]},
+              open(os.path.join(d, uuid + ".json"), "w"))
+put(1, "claude", "pending", "initial_hostname", "alpha-mac", "work", 0, s + "/tx/%s.jsonl")
+put(2, "codex", "exited", "latest_hostname", "beta-vm", "", 10, s + "/tx/%s.jsonl")
+put(3, "claude", "exited", "initial_hostname", "alpha-mac", "", 0, "/nonexistent/%s.jsonl")
+EOF
+cat > "$S/filter.py" <<EOF
+import json, sys
+from importlib.machinery import SourceFileLoader
+m = SourceFileLoader("ares_mod", "$NEW/bin/ares").load_module()
+l = m.find_sessions(m.SearchOpts(**json.loads(sys.argv[1])))[0]
+print(" ".join(sorted(p.rsplit("/", 1)[-1][:-5][-2:] for _, p in l)))
+EOF
+flt() { python3 "$S/filter.py" "{\"keywords\": [\"filtrword\"], $1}"; }
+check "--state pending -> c1" test "$(flt '"state": "pending"')" = c1
+check "--state EXITED -> c2 only (c3's transcript is gone: it is 'deleted', not 'exited')" test "$(flt '"state": "EXITED"')" = c2
+check "--state deleted -> c3" test "$(flt '"state": "deleted"')" = c3
+check "--host BETA (latest_hostname, any case) -> c2" test "$(flt '"host": "BETA"')" = c2
+check "--host alpha (initial_hostname, part of the name) -> c1 c3" test "$(flt '"host": "alpha"')" = "c1 c3"
+check "--agent codex -> c2; --agent claude -> c1 c3" test "$(flt '"agent": "codex"')|$(flt '"agent": "claude"')" = "c2|c1 c3"
+check "--tmux wor -> c1" test "$(flt '"tmux": "wor"')" = c1
+check "-f 5 -> c1 c3 (c2 is 10 days old); -u 5 -> c2" test "$(flt '"from_days": 5')|$(flt '"until_days": 5')" = "c1 c3|c2"
+check "no keywords: --max-scan 2 keeps the 2 most recent of all" \
+    test "$(python3 "$S/filter.py" '{"keywords": [], "max_scan": 2, "from_days": 0}' | wc -w | tr -d ' ')" = 2
+cat > "$S/fakebin/fzf" <<'EOF'
+#!/bin/bash
+cat > "$FAKE_FZF_IN"
+[ -n "${FAKE_FZF_CANCEL:-}" ] && exit 130
+head -n 1 "$FAKE_FZF_IN"
+EOF
+chmod +x "$S/fakebin/fzf"; export FAKE_FZF_IN="$S/fzf.in"
+fzf_uuids() { awk -F'\t' '{print substr($NF, length($NF) - 1)}' "$FAKE_FZF_IN" | sort | tr '\n' ' '; }
+out=$(ares resume --host beta --agent codex -u 5 --print-cmd filtrword 2>>"$LOG")
+check "CLI: --host --agent -u reach the search (fzf gets c2 only); a codex session resumes with codex resume" \
+    bash -c "[ '$(fzf_uuids)' = 'c2 ' ] && [ '$out' = 'cd $S/proj && codex resume $C2' ]"
+out=$(ares resume --state pending --tmux work --print-cmd FILTRWORD 2>>"$LOG")
+check "CLI: --state --tmux reach the search (fzf gets c1 only); claude --resume with its title" \
+    bash -c "[ '$(fzf_uuids)' = 'c1 ' ] && grep -qF \"cd $S/proj && claude --resume $C1 '/rename Filter 1'\" <<<\"\$1\"" _ "$out"
+ares resume --print-cmd NUMBER Filtrword 2>>"$LOG" >/dev/null
+check "CLI: several keywords, any order and case, no filter -> fzf gets c1 c2 c3 (c3 shown, though not resumable)" \
+    test "$(fzf_uuids)" = "c1 c2 c3 "
+check "--fork, claude: claude --resume <uuid> --fork-session" \
+    bash -c "ares resume --uuid $C1 --fork --print-cmd 2>>'$LOG' | grep -qF 'claude --resume $C1 --fork-session'"
+check "--fork, codex: codex fork <uuid>" test "$(ares resume --uuid $C2 --fork --print-cmd 2>>"$LOG")" = "cd $S/proj && codex fork $C2"
+ares resume --uuid $C3 --print-cmd >"$S/gone.out" 2>"$S/gone.err"; rc=$?
+check "a gone transcript: exit 1, says it cannot be resumed, prints no command" \
+    bash -c "[ $rc -eq 1 ] && grep -q 'is gone from this machine' '$S/gone.err' && [ ! -s '$S/gone.out' ]"
+ares resume --uuid nosuchuuid --print-cmd >/dev/null 2>"$S/nouuid.err"; rc=$?
+check "an unknown --uuid: exit 1 and an error" bash -c "[ $rc -eq 1 ] && grep -q \"no indexed session matches uuid 'nosuchuuid'\" '$S/nouuid.err'"
+ares resume --print-cmd qqqzzzxxxwww >"$S/none.out" 2>"$S/none.err"; rc=$?
+check "no match (fuzzy too): 'No sessions found.', exit 0, no command" \
+    bash -c "[ $rc -eq 0 ] && grep -q 'No sessions found' '$S/none.err' && [ ! -s '$S/none.out' ]"
+check "fuzzy: 'filtrXXX' falls back to 3-letter prefixes and says so" \
+    bash -c "ares resume --print-cmd filtrXXX 2>&1 >/dev/null | grep -q 'no exact matches - showing fuzzy results'"
+FAKE_FZF_CANCEL=1 ares resume --print-cmd filtrword >"$S/cancel.out" 2>"$S/cancel.err"; rc=$?
+check "the picker cancelled: 'Cancelled.', exit 0, no command" \
+    bash -c "[ $rc -eq 0 ] && grep -q Cancelled '$S/cancel.err' && [ ! -s '$S/cancel.out' ]"
+check "-v: the search phases on stderr" bash -c "ares resume -v --print-cmd filtrword 2>&1 >/dev/null | grep -q 'PHASE 5'"
+check "ares with no command: help on stderr, exit 1" bash -c "ares 2>&1 >/dev/null | grep -q 'usage: ares'; ! ares 2>/dev/null"
+# reindex options (the fixtures' transcripts: Claude ones plus one Codex rollout)
+out=$(ares reindex 2>&1); echo "$out" >>"$LOG"
+check "reindex with nothing changed: 0 to reindex" grep -q ' 0 to reindex' <<<"$out"
+n_all=$(sed -n 's/.*Step 3a: \([0-9]*\) sessions scanned.*/\1/p' <<<"$out")
+out=$(ares reindex --force 2>&1); echo "$out" >>"$LOG"
+check "reindex --force: every session re-indexed ($n_all), 0 up to date, 0 errors" \
+    bash -c "grep -q 'Step 3a: $n_all sessions scanned, $n_all to reindex, 0 up to date' <<<\"\$1\" && grep -q 'errors=0' <<<\"\$1\"" _ "$out"
+check "reindex -n 1 --force: 1 session" bash -c "ares reindex -n 1 --force 2>&1 | grep -q 'Step 3a: 1 sessions scanned, 1 to reindex'"
+before_h=$(stat -f %m "$IDX/$UH.json"); sleep 1
+out=$(ares reindex --uuid "$UA" --force 2>&1); echo "$out" >>"$LOG"
+check "reindex --uuid: that session only (others untouched)" \
+    bash -c "grep -q 'Step 3a: 1 sessions scanned, 1 to reindex' <<<\"\$1\" && [ \$(stat -f %m '$IDX/$UH.json') = $before_h ]" _ "$out"
+CU=$(python3 -c "import json; print(json.load(open('$S/expected.json'))['codex_uuid'])")
+check "reindex --uuid of a Codex rollout: indexed as agent codex" \
+    bash -c "ares reindex --uuid $CU --force >>'$LOG' 2>&1 && [ \"\$(python3 -c \"import json; print(json.load(open('$IDX/$CU.json'))['agent_type'])\")\" = codex ]"
 
 # ---------------------------------------------------------------------------------------------------------
 section "SessionStart hook: the duplicate warning"
