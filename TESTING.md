@@ -14,4 +14,4 @@ How `ares tmux` is tested without touching the user's terminal:
 - a fake `claude` first on `PATH` that logs `pane|folder|args` and sleeps; fake `launchctl`, `systemctl`, `loginctl`, `ssh`, `osascript` that log and fail (the remote section swaps in an `ssh` that answers the pull), so no call reaches the machine (the test checks none of the first three was made), and a fake `codex` that logs its `CODEX_HOME` (checked: always the sandbox's);
 - checked: tmux sessions, window indexes and names, pane counts, pane sizes against the saved `window_layout`, one `claude --resume <uuid>` per Claude pane in its folder, plain panes in `~`, stale ones skipped without `--all` and restored with it, an existing tmux session untouched, a second run skipping everything.
 
-Last run: 2026-11-20, 100 passed, 0 failed (macOS, tmux under agent-tracker's tests/tmux_guard.sh, real codex round trip included).
+Last run: 2026-11-20, 100 passed, 0 failed (macOS, tmux under agent-tracker's tests/run_with_test_tmux.sh, real codex round trip included).

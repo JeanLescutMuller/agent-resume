@@ -3,13 +3,13 @@
 #   1. a window with 6+ panes stopped the restore ("no space for a new pane"), the session left half built;
 #   2. tmux killed (end lines "other"), then a reboot: plain `ares tmux` restored 0;
 #   3. --this-boot restored a Claude session the user had resumed by hand and then exited cleanly.
-# Sandbox only. Every tmux call goes through agent-tracker's tests/tmux_guard.sh (explicit -S socket):
+# Sandbox only. Every tmux call goes through agent-tracker's tests/run_with_test_tmux.sh (explicit -S socket):
 # this script re-runs itself under it.
 # Usage: bash test/test_restore_rules.sh       Reads: src/ares. Writes: a mktemp sandbox only.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-GUARD=/Users/jeanlescut/dev/agent-tracker/tests/tmux_guard.sh
-[ -n "${TMUX_GUARD_SOCKET:-}" ] || exec bash "$GUARD" bash "$0" "$@"
+GUARD=/Users/jeanlescut/dev/agent-tracker/tests/run_with_test_tmux.sh
+[ -n "${TEST_TMUX_SOCKET:-}" ] || exec bash "$GUARD" bash "$0" "$@"
 S=$(mktemp -d)
 export HOME="$S/home" CLAUDE_CONFIG_DIR="$S/home/.claude" AGENT_TRACKER_HOME="$S/home/opt/agent-tracker"
 export AGENT_RESUME_HOME="$S/home/opt/agent-resume" JR_MACHINE_NAME=test-machine

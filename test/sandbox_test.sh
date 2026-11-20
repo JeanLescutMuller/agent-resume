@@ -51,7 +51,7 @@ printf 'set -g default-command "/bin/bash --noprofile --norc"\n' > "$HOME/.tmux.
 n_claude() { local n; n=$(grep -c '^claude|' "$FAKE_LOG" 2>/dev/null); echo "${n:-0}"; }   # fake claude started so far
 tmux_sandbox_guard() {   # every tmux call below must reach the sandbox server, never the user's
     local sock; sock=$(tmux display-message -p '#{socket_path}' 2>/dev/null)
-    [[ "$sock" == "$TMUX_TMPDIR/"* ]] || { [ -n "${TMUX_GUARD_SOCKET:-}" ] && [ "$sock" = "$TMUX_GUARD_SOCKET" ]; }   # or tmux_guard.sh's
+    [[ "$sock" == "$TMUX_TMPDIR/"* ]] || { [ -n "${TEST_TMUX_SOCKET:-}" ] && [ "$sock" = "$TEST_TMUX_SOCKET" ]; }   # or run_with_test_tmux.sh's
 }
 cleanup() {
     tmux_sandbox_guard && tmux kill-server 2>/dev/null   # its panes' fake claude processes go with it
