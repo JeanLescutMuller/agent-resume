@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 # smoke_test.sh - Non-destructive health check for an agent-resume (ares) install.
 #
-# Run this on each machine (laptop, VM) to confirm indexing, the SessionStart hook and
-# cross-machine sync are actually working, not just installed. Read-only / additive:
+# Run this on each machine (Mac, VM, NAS) to confirm indexing, the SessionStart hook and the other machines
+# (remote_hosts) are actually working, not just installed. Read-only / additive:
 #   - never deletes or overwrites real index files, and never writes agent-tracker's files
 #     (the duplicate-warning check uses a temporary $AGENT_TRACKER_HOME of its own)
-#   - `ares reindex` and `ares-sync` are real commands, but both are designed to be safely
-#     re-run any time (mtime-skip / mtime-wins) - the same pair the scheduled job runs every 30 min.
-#   - when $HOME is not the user's real home (test/sandbox_test.sh runs it so), the scheduler
-#     checks are skipped: they would call launchctl / systemctl.
+#   - `ares reindex` is a real command, designed to be safely re-run any time (mtime-skip)
 #
 # Usage:
-#   bash test/smoke_test.sh            # full run, including live ares-sync
+#   bash test/smoke_test.sh            # full run, including the pull of each remote host's index
 #   bash test/smoke_test.sh --offline  # skip anything that touches the network
 #
 # Exit status: 0 if every check passed, 1 if any failed.
@@ -43,7 +40,7 @@ SANDBOX=$( [[ "$HOME" != "$REAL_HOME" ]] && echo true || echo false )
 
 # A non-interactive shell (e.g. `ssh host command`) doesn't source ~/.bashrc,
 # so ~/.local/bin may not be on PATH even though it is in real interactive
-# use. Make sure it's there so ares/ares-sync resolve either way.
+# use. Make sure it's there so ares resolves either way.
 case ":$PATH:" in
     *":$LOCAL_BIN:"*) ;;
     *) export PATH="$LOCAL_BIN:$PATH" ;;
@@ -63,20 +60,14 @@ command -v fzf &>/dev/null && pass "fzf available" || fail "fzf not found"
     && pass "settings.json exists and is valid JSON" \
     || fail "settings.json missing or invalid: $SETTINGS_JSON"
 
-REMOTE_HOST=$(python3 -c "import json,os; print(json.load(open('$SETTINGS_JSON')).get('remote_ssh_host',''))" 2>/dev/null)
-REMOTE_USER=$(python3 -c "import json,os; print(json.load(open('$SETTINGS_JSON')).get('remote_ssh_user',''))" 2>/dev/null)
-REMOTE_PORT=$(python3 -c "import json,os; print(json.load(open('$SETTINGS_JSON')).get('remote_ssh_port','22'))" 2>/dev/null)
-if [[ -n "$REMOTE_HOST" ]]; then
-    echo "  (role: spoke - remote_ssh_host=$REMOTE_HOST)"
-else
-    echo "  (role: hub - remote_ssh_host empty, sync is a no-op here by design)"
-fi
+REMOTE_HOSTS=$(python3 -c "import json; print(' '.join(json.load(open('$SETTINGS_JSON')).get('remote_hosts', [])))" 2>/dev/null)
+echo "  (remote_hosts: ${REMOTE_HOSTS:-none})"
 
 # ---------------------------------------------------------------------------
 section "Deployment layout"
 
-for pair in ares:ares ares-sync:ares-sync asm:ares asm-sync:ares-sync; do
-    f=${pair%%:*}; target_want="$BIN_DIR/${pair#*:}"
+for f in ares asm; do
+    target_want="$BIN_DIR/ares"
     if [[ -L "$LOCAL_BIN/$f" ]]; then
         target=$(readlink "$LOCAL_BIN/$f")
         [[ "$target" == "$target_want" ]] \
@@ -87,27 +78,24 @@ for pair in ares:ares ares-sync:ares-sync asm:ares asm-sync:ares-sync; do
     fi
 done
 
-for f in session_start.py session_end.sh ares-reindex-and-rsync.sh entrypoint.sh install.sh uninstall.sh; do
+for f in session_start.py install.sh uninstall.sh; do
     [[ -f "$DEPLOY_DIR/$f" ]] && pass "$DEPLOY_DIR/$f present" || fail "$DEPLOY_DIR/$f missing"
 done
-[[ ! -e "$HOME/opt/agent-session-manager/bin" ]] \
-    || fail "the former deploy root ~/opt/agent-session-manager still has its code (re-run install.sh)"
-
-[[ "$(readlink "$HOME/.claude/skills/inject-session")" == "$DEPLOY_DIR/skills/inject-session" && ! -w "$HOME/.claude/skills/inject-session/SKILL.md" ]] \
-    && pass "/inject-session skill linked" \
-    || fail "~/.claude/skills/inject-session is not a link to the read-only copy in $DEPLOY_DIR/skills/"
+for f in bin/ares-sync session_end.sh entrypoint.sh skills; do   # the version before 2026-11-20
+    [[ ! -e "$DEPLOY_DIR/$f" ]] || fail "$DEPLOY_DIR/$f is still there (re-run install.sh)"
+done
 
 # Drift check: if we're running from a git checkout, compare deployed copies
 # against src/ to catch "edited src/ but forgot to re-run install.sh".
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -d "$REPO_DIR/src" ]]; then
     drift=0
-    for f in ares ares-sync; do
+    for f in ares; do
         if [[ -f "$REPO_DIR/src/$f" && -f "$BIN_DIR/$f" ]]; then
             diff -q "$REPO_DIR/src/$f" "$BIN_DIR/$f" &>/dev/null || drift=1
         fi
     done
-    for f in session_start.py session_end.sh ares-reindex-and-rsync.sh entrypoint.sh install.sh uninstall.sh; do
+    for f in session_start.py install.sh uninstall.sh; do
         if [[ -f "$REPO_DIR/src/$f" && -f "$DEPLOY_DIR/$f" ]]; then
             diff -q "$REPO_DIR/src/$f" "$DEPLOY_DIR/$f" &>/dev/null || drift=1
         elif [[ -f "$REPO_DIR/$f" && -f "$DEPLOY_DIR/$f" ]]; then
@@ -121,7 +109,7 @@ else
     warn "not running from a repo checkout - skipping src/ drift check"
 fi
 
-# Claude Code hooks: agent-resume's SessionStart group, and none of asm's old lifecycle hook
+# Claude Code hooks: agent-resume's SessionStart group, and not its former SessionEnd one
 if [[ -f "$CLAUDE_SETTINGS" ]]; then
     hook_ok=$(python3 -c "
 import json
@@ -129,43 +117,20 @@ hooks = json.load(open('$CLAUDE_SETTINGS')).get('hooks', {})
 cmds = lambda evt: [h.get('command', '') for e in hooks.get(evt, []) for h in e.get('hooks', [])]
 start = sum('agent-resume/session_start.py' in c for c in cmds('SessionStart'))
 end = sum('agent-resume/session_end.sh' in c for c in cmds('SessionEnd'))
-old = any('lifecycle_generation.sh' in c for c in cmds('SessionStart') + cmds('SessionEnd'))
-print('1' if start == 1 and end == 1 and not old else '0')
+print('1' if start == 1 and end == 0 else '0')
 " 2>/dev/null)
     [[ "$hook_ok" == "1" ]] \
-        && pass "hooks session_start.py (SessionStart) and session_end.sh (SessionEnd) registered once; no old lifecycle hook" \
-        || fail "hook session_start.py or session_end.sh missing or doubled, or asm's lifecycle_generation.sh still registered"
+        && pass "hook session_start.py (SessionStart) registered once; the former session_end.sh gone" \
+        || fail "hook session_start.py missing or doubled, or the former session_end.sh still registered (re-run install.sh)"
 else
     fail "~/.claude/settings.json not found"
 fi
 
-# Scheduler: this machine's trigger runs entrypoint.sh (for job-runner, separate project) every 30 min
-if $SANDBOX; then
-    warn "sandbox HOME: scheduler not checked (no launchctl / systemctl call)"
-elif [[ "$(uname -s)" == "Darwin" ]]; then
-    launchctl list com.jeanlescut.agent-resume >/dev/null 2>&1 \
-        && pass "LaunchAgent com.jeanlescut.agent-resume loaded" || fail "LaunchAgent com.jeanlescut.agent-resume not loaded (re-run install.sh)"
+# No job since 2026-11-20: the former trigger must be gone (re-run install.sh)
+if [[ -e "$HOME/Library/LaunchAgents/com.jeanlescut.agent-resume.plist" || -e "$HOME/.config/systemd/user/com.jeanlescut.agent-resume.timer" ]]; then
+    fail "the former job com.jeanlescut.agent-resume is still scheduled (re-run install.sh)"
 else
-    systemctl --user is-active --quiet com.jeanlescut.agent-resume.timer \
-        && pass "systemd timer com.jeanlescut.agent-resume active" || fail "systemd timer com.jeanlescut.agent-resume not active (re-run install.sh)"
-fi
-if [[ -f "$HOME/opt/job-runner/lib.sh" ]]; then pass "job-runner installed"
-elif $SANDBOX; then warn "sandbox HOME: no job-runner"
-else fail "job-runner missing: ~/opt/job-runner/lib.sh"; fi
-[[ ! -e "$DEPLOY_DIR/mho_var.sh" ]] || fail "the former multi-host-orchestrator job file mho_var.sh is still there (re-run install.sh)"
-[[ ! -e "$HOME/opt/multi-host-orchestrator/jobs/asm-reindex-and-rsync.conf" ]] \
-    || fail "the former job link jobs/asm-reindex-and-rsync.conf is still there (re-run install.sh)"
-for name in com.jeanlescut.agent-session-manager com.asm.reindex-sync com.csm.reindex-sync com.asm.reindex-and-rsync asm-reindex-and-rsync; do
-    if [[ -e "$HOME/Library/LaunchAgents/$name.plist" || -e "$HOME/.config/systemd/user/$name.timer" ]]; then
-        fail "former scheduling $name still present: the job would run twice (re-run install.sh)"
-    fi
-done
-if [[ "$(uname -s)" != "Darwin" ]] && ! $SANDBOX; then
-    if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
-        pass "loginctl linger enabled (timer survives logout)"
-    else
-        warn "loginctl linger not enabled - timer may only run while logged in"
-    fi
+    pass "no job (the former com.jeanlescut.agent-resume is gone)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -178,8 +143,6 @@ else
 fi
 ares --help &>/dev/null && pass "ares --help exits 0" || fail "ares --help exited non-zero"
 [[ "$(asm --version 2>&1)" == "$(ares --version 2>&1)" ]] && pass "asm is an alias of ares" || fail "asm --version differs from ares --version"
-out=$(ares close 2>&1); rc=$?
-[[ $rc -ne 0 && "$out" == *claude-close-keep-screen* ]] && pass "ares close points to claude-close-keep-screen" || fail "ares close did not print the pointer (rc=$rc): $out"
 ares tmux --help &>/dev/null && pass "ares tmux --help exits 0" || fail "ares tmux --help exited non-zero"
 
 # ---------------------------------------------------------------------------
@@ -261,8 +224,7 @@ for agent, doc in docs_by_agent.items():
         print(f"BACKEND_MISSING={agent}")
         continue
     print(f"AGENT_TYPE_FOUND={agent}")
-    wd = asm_mod.resume_dir(doc)
-    cmd = backend.resume_cmd(doc, None, wd or "/tmp", doc.get("session_id", ""), False)
+    cmd = asm_mod.resume_shell_cmd(doc, backend.resume_cmd(doc, None, doc.get("session_id", ""), False))
     print(f"RESUME_CMD={agent}:{cmd}")
 PYEOF
 )
@@ -464,73 +426,23 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "Sync (ares-sync)"
+section "Other machines (remote_hosts)"
 
-if [[ -z "$REMOTE_HOST" ]]; then
-    pass "hub role: remote_ssh_host empty, ares-sync should no-op"
-    out=$(ares-sync 2>&1)
-    rc=$?
-    [[ $rc -eq 0 ]] && pass "ares-sync exits 0 with no remote configured" || fail "ares-sync exited $rc with no remote configured"
+if [[ -z "$REMOTE_HOSTS" ]]; then
+    pass "no remote_hosts: this machine searches only its own sessions"
 elif $OFFLINE; then
-    warn "skipping live sync checks (--offline)"
+    warn "skipping the pull of the remote hosts' indexes (--offline)"
 else
-    if ssh -p "$REMOTE_PORT" -o BatchMode=yes -o ConnectTimeout=5 "$REMOTE_USER@$REMOTE_HOST" true 2>/dev/null; then
-        pass "SSH reachable: $REMOTE_USER@$REMOTE_HOST:$REMOTE_PORT"
-
-        before_lines=$(wc -l < "$ASM_HOME/sync-log.jsonl" 2>/dev/null || echo 0)
-        if out=$(ares-sync --check 2>&1); then
-            pass "ares-sync --check (dry run) exits 0"
+    for host in $REMOTE_HOSTS; do
+        if python3 -c "
+from importlib.machinery import SourceFileLoader
+m = SourceFileLoader('ares_mod', '$BIN_DIR/ares').load_module()
+raise SystemExit(0 if m._pull_one('$host') else 1)" 2>/dev/null; then
+            pass "$host: its index pulled ($(ls "$ASM_HOME/remote/$host" 2>/dev/null | wc -l | tr -d ' ') sessions in $ASM_HOME/remote/$host/)"
         else
-            fail "ares-sync --check exited non-zero: $out"
+            warn "$host unreachable (expected when away from its network)"
         fi
-        after_lines=$(wc -l < "$ASM_HOME/sync-log.jsonl" 2>/dev/null || echo 0)
-        [[ "$before_lines" == "$after_lines" ]] \
-            && pass "--check performed no writes to sync-log.jsonl (true dry run)" \
-            || warn "sync-log.jsonl grew during --check (expected 0 new lines)"
-
-        # Real sync: safe by design (mtime-wins, index-only), same as the
-        # scheduled job. Confirms end-to-end reachability + rsync auth.
-        before_lines=$(wc -l < "$ASM_HOME/sync-log.jsonl" 2>/dev/null || echo 0)
-        if out=$(ares-sync 2>&1); then
-            pass "ares-sync (live) exits 0"
-        else
-            fail "ares-sync (live) exited non-zero: $out"
-        fi
-        after_lines=$(wc -l < "$ASM_HOME/sync-log.jsonl" 2>/dev/null || echo 0)
-        if [[ "$after_lines" -gt "$before_lines" ]]; then
-            last_line=$(tail -1 "$ASM_HOME/sync-log.jsonl")
-            if echo "$last_line" | grep -q '"outcome": *"success"'; then
-                pass "sync-log.jsonl recorded a successful sync: $last_line"
-            else
-                fail "sync-log.jsonl recorded a non-success outcome: $last_line"
-            fi
-        else
-            fail "ares-sync (live) did not append to sync-log.jsonl"
-        fi
-    else
-        warn "SSH unreachable: $REMOTE_USER@$REMOTE_HOST:$REMOTE_PORT (offline spoke - expected sometimes)"
-        out=$(ares-sync 2>&1)
-        rc=$?
-        [[ $rc -eq 0 ]] && pass "ares-sync still exits 0 cleanly when remote is unreachable" || fail "ares-sync exited $rc when remote unreachable (should always exit 0)"
-        if tail -1 "$ASM_HOME/sync-log.jsonl" 2>/dev/null | grep -q '"outcome": *"unreachable"'; then
-            pass "sync-log.jsonl correctly recorded 'unreachable'"
-        else
-            warn "sync-log.jsonl last line doesn't show 'unreachable' - check manually"
-        fi
-    fi
-fi
-
-# Staleness check, informational.
-if [[ -f "$ASM_HOME/sync-log.jsonl" ]]; then
-    last_ts=$(tail -1 "$ASM_HOME/sync-log.jsonl" | python3 -c "import json,sys; print(json.load(sys.stdin).get('timestamp',''))" 2>/dev/null)
-    if [[ -n "$last_ts" ]]; then
-        age_h=$(python3 -c "
-from datetime import datetime, timezone
-t = datetime.strptime('$last_ts', '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
-print(round((datetime.now(timezone.utc) - t).total_seconds() / 3600, 1))
-" 2>/dev/null)
-        echo "  (last sync-log entry: $last_ts, ${age_h}h ago)"
-    fi
+    done
 fi
 
 # ---------------------------------------------------------------------------

@@ -5,10 +5,10 @@
 # and a fake `codex` that logs (with its CODEX_HOME) and succeeds, so nothing can reach the real machine. When a real
 # `codex` is installed, one section also runs it, with CODEX_HOME in the sandbox, for the plugin round trip. The user's tmux server, ~/opt, ~/.claude are never touched.
 #
-# Covers: install.sh (incl. the migration from ~/opt/agent-session-manager, twice for idempotency) and uninstall.sh;
+# Covers: install.sh (over the version before 2026-11-20, twice for idempotency) and uninstall.sh;
 # test/smoke_test.sh on the sandbox install; reindex and session_state from agent-tracker's lifecycle; the index
-# refreshed at search time; the SessionStart hook (duplicate, cross-machine and changed-folder warnings); the SessionEnd
-# hook (re-index + push); the Codex plugin (its two hooks); `ares close`'s pointer; `ares tmux` end to end.
+# refreshed at search time; the resume folder; the SessionStart hook (duplicate warning) and the Codex plugin; other
+# machines (remote_hosts): their index pulled, searched, resumed there over ssh; `ares tmux` end to end.
 #
 # Usage:  bash test/sandbox_test.sh            # prints PASS/FAIL lines and the totals; details in the log
 # Log:    $S/test.log (its path is printed at the end); the sandbox is left in place for reading, under $TMPDIR.
@@ -40,7 +40,7 @@ cat > "$S/fakebin/claude" <<'EOF'
 echo "claude|$TMUX_PANE|$PWD|$*" >> "$FAKE_LOG"
 exec sleep 600
 EOF
-for tool in launchctl systemctl loginctl ssh osascript; do
+for tool in launchctl systemctl loginctl ssh osascript rsync; do
     printf '#!/bin/bash\necho "%s|$*" >> "$FAKE_LOG"\nexit 1\n' "$tool" > "$S/fakebin/$tool"
 done
 printf '#!/bin/bash\necho "codex|$CODEX_HOME|$*" >> "$FAKE_LOG"\n' > "$S/fakebin/codex"
@@ -60,63 +60,64 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------------------------------------
-section "install.sh: migration from a fake ~/opt/agent-session-manager, run twice"
-OLD="$HOME/opt/agent-session-manager"
-mkdir -p "$OLD/bin" "$OLD/data/indexes" "$OLD/data/lifecycles" "$OLD/skills/inject-session" "$HOME/.local/bin" \
-         "$HOME/.claude/skills" "$HOME/Library/LaunchAgents"
-echo '#!/bin/bash' > "$OLD/bin/asm"; echo '#!/bin/bash' > "$OLD/lifecycle_generation.sh"
-echo '{"session_id": "old-index-entry", "initial_working_dir": null, "initial_hostname": null, "created_at": null, "last_active": null, "session_state": "exited", "conversation": []}' > "$OLD/data/indexes/old-index-entry.json"
-echo '{"event": "start"}' > "$OLD/data/lifecycles/old.jsonl"
-echo '{"timestamp": "2026-11-01T00:00:00Z", "outcome": "success"}' > "$OLD/data/sync-log.jsonl"
-cat > "$OLD/data/settings.json" <<'EOF'
-{"local_index_dir": "~/opt/agent-session-manager/data/indexes", "lifecycle_dir": "~/opt/agent-session-manager/data/lifecycles",
- "remote_ssh_host": "", "remote_index_dir": "~/opt/agent-session-manager/data/indexes"}
+section "install.sh over the version before 2026-11-20 (its job, SessionEnd hook, ares-sync, inject-session), run twice"
+NEW="$HOME/opt/agent-resume"; LABEL=com.jeanlescut.agent-resume
+mkdir -p "$NEW/bin" "$NEW/data/indexes" "$NEW/skills/inject-session" "$HOME/.local/bin" "$HOME/.claude/skills" \
+         "$HOME/.agents/skills" "$HOME/Library/LaunchAgents"
+for f in bin/ares-sync session_end.sh entrypoint.sh entrypoint.conf ares-reindex-and-rsync.sh "$LABEL.plist"; do
+    echo old > "$NEW/$f"
+done
+echo old > "$NEW/skills/inject-session/SKILL.md"; chmod -R a-w "$NEW/skills"
+ln -s "$NEW/bin/ares-sync" "$HOME/.local/bin/ares-sync"; ln -s "$NEW/bin/ares-sync" "$HOME/.local/bin/asm-sync"
+ln -s "$NEW/skills/inject-session" "$HOME/.claude/skills/inject-session"
+ln -s "$NEW/skills/inject-session" "$HOME/.agents/skills/inject-session"
+ln -s "$NEW/$LABEL.plist" "$HOME/Library/LaunchAgents/$LABEL.plist"
+echo '{"timestamp": "2026-11-01T00:00:00Z", "outcome": "success"}' > "$NEW/data/sync-log.jsonl"
+cat > "$NEW/data/settings.json" <<'EOF'
+{"local_index_dir": "~/opt/agent-resume/data/indexes", "remote_ssh_host": "", "remote_ssh_user": "",
+ "remote_ssh_port": "22", "remote_index_dir": "~/opt/agent-resume/data/indexes", "sync_stale_warning_hours": 24}
 EOF
-echo old > "$OLD/skills/inject-session/SKILL.md"; chmod -R a-w "$OLD/skills"
-ln -s "$OLD/bin/asm" "$HOME/.local/bin/asm"
-ln -s "$OLD/skills/inject-session" "$HOME/.claude/skills/inject-session"
-echo '<plist/>' > "$OLD/com.jeanlescut.agent-session-manager.plist"
-ln -s "$OLD/com.jeanlescut.agent-session-manager.plist" "$HOME/Library/LaunchAgents/com.jeanlescut.agent-session-manager.plist"
 cat > "$HOME/.claude/settings.json" <<'EOF'
 {"hooks": {
-  "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "HOOK_EVENT=start \"$HOME/opt/agent-session-manager/lifecycle_generation.sh\""}]},
+  "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 \"$HOME/opt/agent-resume/session_start.py\""}]},
                    {"matcher": "", "hooks": [{"type": "command", "command": "agent-tracker hook start"}]}],
-  "SessionEnd":   [{"matcher": "", "hooks": [{"type": "command", "command": "HOOK_EVENT=end \"$HOME/opt/agent-session-manager/lifecycle_generation.sh\""}]}],
+  "SessionEnd":   [{"matcher": "", "hooks": [{"type": "command", "command": "bash \"$HOME/opt/agent-resume/session_end.sh\""}]},
+                   {"matcher": "", "hooks": [{"type": "command", "command": "agent-tracker hook end"}]}],
   "Stop":         [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/opt/my-setup/chrome/hook.py"}]}]}}
 EOF
 bash "$REPO/install.sh" >>"$LOG" 2>&1 && bash "$REPO/install.sh" >>"$LOG" 2>&1; check "install.sh exits 0 twice" test $? -eq 0
-NEW="$HOME/opt/agent-resume"
-check "old index, settings and sync log moved to ~/opt/agent-resume/data" \
-    test -f "$NEW/data/indexes/old-index-entry.json" -a -f "$NEW/data/sync-log.jsonl" -a -f "$NEW/data/settings.json"
-check "old deploy root: only data/lifecycles left (code, links, job gone)" \
-    bash -c "[ \"\$(ls '$OLD')\" = data ] && [ \"\$(ls '$OLD/data')\" = lifecycles ] && [ ! -e '$HOME/Library/LaunchAgents/com.jeanlescut.agent-session-manager.plist' ]"
-check "settings.json: paths moved, lifecycle_dir dropped" \
-    python3 -c "import json; d=json.load(open('$NEW/data/settings.json')); assert 'lifecycle_dir' not in d and all('agent-session-manager' not in str(v) for v in d.values()), d"
-for pair in ares:ares ares-sync:ares-sync asm:ares asm-sync:ares-sync; do
-    check "~/.local/bin/${pair%%:*} -> bin/${pair#*:}" test "$(readlink "$HOME/.local/bin/${pair%%:*}")" = "$NEW/bin/${pair#*:}"
+check "the former job, files and links are gone; the data stays" python3 - <<EOF
+import os
+assert sorted(os.listdir("$NEW")) == ["bin", "codex-marketplace", "codex-plugin", "data", "install.sh", "session_start.py", "uninstall.sh"], sorted(os.listdir("$NEW"))
+assert [f for f in os.listdir("$NEW/bin") if f != "__pycache__"] == ["ares"], os.listdir("$NEW/bin")
+for p in ("$HOME/Library/LaunchAgents/$LABEL.plist", "$HOME/.local/bin/ares-sync", "$HOME/.local/bin/asm-sync",
+          "$HOME/.claude/skills/inject-session", "$HOME/.agents/skills/inject-session"):
+    assert not os.path.lexists(p), p
+assert os.path.isfile("$NEW/data/sync-log.jsonl")
+EOF
+check "settings.json: the sync settings removed, remote_hosts added" \
+    python3 -c "import json; d=json.load(open('$NEW/data/settings.json')); assert d['remote_hosts'] == [] and not any(k.startswith(('remote_ssh', 'remote_index', 'sync_')) for k in d), d"
+for name in ares asm; do
+    check "~/.local/bin/$name -> bin/ares" test "$(readlink "$HOME/.local/bin/$name")" = "$NEW/bin/ares"
 done
-check "inject-session skill linked to the read-only copy" \
-    bash -c "[ \"\$(readlink '$HOME/.claude/skills/inject-session')\" = '$NEW/skills/inject-session' ] && [ \"\$(readlink '$HOME/.agents/skills/inject-session')\" = '$NEW/skills/inject-session' ] && [ ! -w '$NEW/skills/inject-session/SKILL.md' ]"
-check "hooks: one session_start / session_end group each, asm's lifecycle groups gone, others kept" python3 - <<EOF
+check "hooks: one session_start group, our SessionEnd group gone, others kept" python3 - <<EOF
 import json
 h = json.load(open("$HOME/.claude/settings.json"))["hooks"]
 cmds = lambda ev: [x["command"] for g in h.get(ev, []) for x in g["hooks"]]
 assert sum("agent-resume/session_start.py" in c for c in cmds("SessionStart")) == 1, cmds("SessionStart")
-assert cmds("SessionEnd") == ['bash "\$HOME/opt/agent-resume/session_end.sh"'], cmds("SessionEnd")
-assert "agent-tracker hook start" in cmds("SessionStart") and not any("lifecycle_generation" in c for c in cmds("SessionStart"))
+assert cmds("SessionEnd") == ["agent-tracker hook end"], cmds("SessionEnd")
+assert "agent-tracker hook start" in cmds("SessionStart")
 assert cmds("Stop") == ["python3 ~/opt/my-setup/chrome/hook.py"]
 EOF
-check "LaunchAgent com.jeanlescut.agent-resume written (not loaded)" test -L "$HOME/Library/LaunchAgents/com.jeanlescut.agent-resume.plist"
 check "no launchctl / systemctl / loginctl call (sandbox)" bash -c "! grep -qE '^(launchctl|systemctl|loginctl)\|' '$FAKE_LOG' 2>/dev/null"
-check "codex, with CODEX_HOME in the sandbox: asm@asm-local removed, agent-resume@agent-resume-local added" \
-    bash -c "grep -qx 'codex|$HOME/.codex|plugin remove asm@asm-local' '$FAKE_LOG' && grep -qx 'codex|$HOME/.codex|plugin marketplace add $HOME/opt/agent-resume/codex-marketplace' '$FAKE_LOG' && grep -qx 'codex|$HOME/.codex|plugin add agent-resume@agent-resume-local' '$FAKE_LOG' && ! grep '^codex|' '$FAKE_LOG' | grep -qv '^codex|$HOME/.codex|'"
-check "Codex plugin deployed: its marketplace lists it, its hooks.json runs session_start.py and session_end.sh" python3 - <<EOF
+check "codex, with CODEX_HOME in the sandbox: agent-resume@agent-resume-local added" \
+    bash -c "grep -qx 'codex|$HOME/.codex|plugin marketplace add $HOME/opt/agent-resume/codex-marketplace' '$FAKE_LOG' && grep -qx 'codex|$HOME/.codex|plugin add agent-resume@agent-resume-local' '$FAKE_LOG' && ! grep '^codex|' '$FAKE_LOG' | grep -qv '^codex|$HOME/.codex|'"
+check "Codex plugin deployed: its marketplace lists it, its hooks.json runs session_start.py only" python3 - <<EOF
 import json
 m = json.load(open("$NEW/codex-marketplace/.agents/plugins/marketplace.json"))
 assert m["name"] == "agent-resume-local" and m["plugins"][0]["name"] == "agent-resume"
 h = json.load(open("$NEW/codex-marketplace/plugins/agent-resume/hooks/hooks.json"))["hooks"]
-assert "session_start.py" in h["SessionStart"][0]["hooks"][0]["command"]
-assert "session_end.sh" in h["SessionEnd"][0]["hooks"][0]["command"]
+assert list(h) == ["SessionStart"] and "session_start.py" in h["SessionStart"][0]["hooks"][0]["command"]
 EOF
 check "asm alias: asm --version says ares" bash -c "asm --version | grep -q '^ares v'"
 
@@ -128,11 +129,9 @@ check "smoke_test.sh passes ($(grep -o 'Passed: [0-9]*   Failed: [0-9]*' "$S/smo
 
 section "uninstall.sh, then install.sh again"
 bash "$NEW/uninstall.sh" >>"$LOG" 2>&1; check "uninstall.sh exits 0" test $? -eq 0
-check "uninstall: links, job and hook gone; data and other hooks kept" python3 - <<EOF
+check "uninstall: links and hook gone; data and other hooks kept" python3 - <<EOF
 import json, os
-assert not any(os.path.lexists(os.path.join("$HOME/.local/bin", b)) for b in ("ares", "asm", "ares-sync", "asm-sync"))
-assert not os.path.lexists("$HOME/.claude/skills/inject-session")
-assert not os.path.lexists("$HOME/Library/LaunchAgents/com.jeanlescut.agent-resume.plist")
+assert not any(os.path.lexists(os.path.join("$HOME/.local/bin", b)) for b in ("ares", "asm"))
 assert os.listdir("$NEW") == ["data"], os.listdir("$NEW")
 h = json.load(open("$HOME/.claude/settings.json"))["hooks"]
 assert not any("agent-resume/" in x["command"] for ev in ("SessionStart", "SessionEnd") for g in h.get(ev, []) for x in g["hooks"])
@@ -199,9 +198,6 @@ echo "{\"ts\": 6, \"event\": \"start\", \"pid\": 8, \"boot_ts\": 1, \"cwd\": \"$
 check "--print-cmd resumes in the current folder when that folder is gone" \
     bash -c "cd '$S/here' && ares resume --uuid '$UA' --print-cmd 2>>'$LOG' | grep -q \"^cd $S/here && claude --resume $UA\""
 cp "$S/lifecycle_A.saved" "$AGENT_TRACKER_HOME/data/sessions/$UA/lifecycle.jsonl"   # A back as it was, for ares tmux below
-ares close --uuid x > "$S/close.out" 2>&1; rc=$?
-check "ares close prints the one-line pointer to claude-close-keep-screen, exit 1" \
-    bash -c "[ $rc -eq 1 ] && [ \$(wc -l < '$S/close.out') -eq 1 ] && grep -q claude-close-keep-screen '$S/close.out'"
 
 section "search: hidden non-interactive entries, accent folding, sessions without a date"
 python3 - "$IDX" <<'EOF'
@@ -239,7 +235,7 @@ assert m.find_by_uuid('aaaaaaaa-0000-4000-8000-0000000000a2')['custom_title'] ==
 PY"
 
 # ---------------------------------------------------------------------------------------------------------
-section "SessionStart hook: duplicate, cross-machine and changed-folder warnings"
+section "SessionStart hook: the duplicate warning"
 HOOK="$NEW/session_start.py"
 DUP=dddddddd-0000-4000-8000-000000000001
 mkdir -p "$AGENT_TRACKER_HOME/data/sessions/$DUP"
@@ -266,45 +262,53 @@ kill "$SLEEP_PID"; wait "$SLEEP_PID" 2>/dev/null
 write_lc "$SLEEP_PID" "$PSTART"
 check "the earlier process has exited -> nothing printed" test -z "$(run_hook)"
 check "no lifecycle at all -> nothing printed, exit 0" bash -c "[ -z \"\$(echo '{\"session_id\": \"nope\"}' | python3 '$HOOK')\" ]"
-lc_line() {   # lc_line <pid> <machine> <cwd>: one start line of this boot
-    printf '{"ts":1,"event":"start","agent":"claude","machine":"%s","boot_ts":%s,"pid":%s,"cwd":"%s"}\n' "$2" "$AGENT_TRACKER_BOOT_TS" "$1" "$3"
-}
-run_hook_in() { echo "{\"session_id\": \"$DUP\", \"cwd\": \"$1\"}" | python3 "$HOOK"; }
-LC="$AGENT_TRACKER_HOME/data/sessions/$DUP/lifecycle.jsonl"
-lc_line 999991 other-host "$HOME" > "$LC"
-has() { grep -qF -- "$1" <<<"$out"; }          # has <text>: the hook's last output contains it
-out=$(run_hook_in "$HOME"); echo "$out" >>"$LOG"
-check "previous start on another machine -> Cross-machine warning" \
-    has "Cross-machine resume: previous session ran on 'other-host', now resuming on 'test-machine'"
-check "same folder -> no folder warning" bash -c "! grep -q 'Working directory' <<<\"\$0\"" "$out"
-lc_line 999991 test-machine /no/such/dir > "$LC"
-out=$(run_hook_in "$HOME"); echo "$out" >>"$LOG"
-check "previous start in another folder -> Working directory changed" has "Working directory changed: was '/no/such/dir', now '$HOME'"
-check "... and says the previous folder does not exist here; no Cross-machine" \
-    bash -c "grep -q 'does not exist on this machine' <<<\"\$0\" && ! grep -q Cross-machine <<<\"\$0\"" "$out"
-{ lc_line 999991 test-machine "$HOME"; lc_line $$ other-host /no/such/dir; } > "$LC"
-check "this process's own start line (written first by agent-tracker) is not the previous start -> nothing" test -z "$(run_hook_in "$HOME")"
-lc_line 999991 other-host "$HOME" > "$LC"
+printf '{"ts":1,"event":"start","agent":"claude","machine":"other-host","boot_ts":%s,"pid":999991,"cwd":"/no/such/dir"}\n' \
+    "$AGENT_TRACKER_BOOT_TS" > "$AGENT_TRACKER_HOME/data/sessions/$DUP/lifecycle.jsonl"
+check "a previous start on another machine, in a gone folder -> nothing printed (those warnings were removed)" \
+    test -z "$(echo "{\"session_id\": \"$DUP\", \"cwd\": \"$HOME\"}" | python3 "$HOOK")"
+sleep 300 & SLEEP_PID=$!
+PSTART=$(LC_ALL=C ps -o lstart= -p $SLEEP_PID | python3 -c "import sys, time; print(int(time.mktime(time.strptime(sys.stdin.read().strip(), '%a %b %d %H:%M:%S %Y'))))")
+write_lc "$SLEEP_PID" "$PSTART"
 codex_cmd=$(python3 -c "import json; print(json.load(open('$NEW/codex-plugin/hooks/hooks.json'))['hooks']['SessionStart'][0]['hooks'][0]['command'])")
-out=$(echo "{\"session_id\": \"$DUP\", \"cwd\": \"$HOME\"}" | bash -c "$codex_cmd"); echo "codex hook: $out" >>"$LOG"
-check "the Codex plugin's SessionStart command runs the same hook (Cross-machine warning)" has "Cross-machine resume"
+out=$(echo "{\"session_id\": \"$DUP\"}" | bash -c "$codex_cmd"); echo "codex hook: $out" >>"$LOG"
+check "the Codex plugin's SessionStart command runs the same hook (DUPLICATE SESSION)" grep -q "DUPLICATE SESSION" <<<"$out"
+kill "$SLEEP_PID"; wait "$SLEEP_PID" 2>/dev/null
 
-section "SessionEnd hook: re-index that session, push it to the hub"
-UE=$(uuid H)
-python3 -c "import json; p='$NEW/data/settings.json'; d=json.load(open(p)); d['remote_ssh_host']='fakehub'; json.dump(d, open(p, 'w'))"
-TE=$(python3 -c "import json; print(json.load(open('$IDX/$UE.json'))['jsonl_path'])"); TE=${TE/#\~/$HOME}
-sleep 1
-echo "{\"type\": \"user\", \"sessionId\": \"$UE\", \"timestamp\": \"2026-11-07T13:00:00Z\", \"message\": {\"content\": \"endhookword\"}}" >> "$TE"
-: > "$S/ssh-before"; grep '^ssh|' "$FAKE_LOG" > "$S/ssh-before" 2>/dev/null
-out=$(echo "{\"session_id\": \"$UE\", \"transcript_path\": \"$TE\", \"cwd\": \"$HOME\"}" | ARES_END_DELAY=0 bash "$NEW/session_end.sh"); rc=$?
-check "session_end.sh exits 0 at once and prints nothing on stdout" bash -c "[ $rc -eq 0 ] && [ -z '$out' ]"
-for _ in $(seq 1 20); do grep -q endhookword "$IDX/$UE.json" && tail -1 "$NEW/data/sync-log.jsonl" | grep -q unreachable && break; sleep 0.5; done
-check "its index entry is re-indexed in the background" grep -q endhookword "$IDX/$UE.json"
-check "ares-sync --push is run: ssh to the hub tried, sync-log records it" \
-    bash -c "[ \$(grep -c '^ssh|' '$FAKE_LOG') -gt \$(wc -l < '$S/ssh-before') ] && grep -q fakehub '$FAKE_LOG' && tail -1 '$NEW/data/sync-log.jsonl' | grep -q unreachable"
-codex_end=$(python3 -c "import json; print(json.load(open('$NEW/codex-plugin/hooks/hooks.json'))['hooks']['SessionEnd'][0]['hooks'][0]['command'])")
-check "the Codex plugin's SessionEnd command is session_end.sh" test "$codex_end" = 'bash "$HOME/opt/agent-resume/session_end.sh"'
-python3 -c "import json; p='$NEW/data/settings.json'; d=json.load(open(p)); d['remote_ssh_host']=''; json.dump(d, open(p, 'w'))"
+section "other machines (remote_hosts): their index pulled, searched, resumed there over ssh"
+# A fake rsync copies $FAKE_REMOTE/*.json to its last argument (the destination), or fails when $FAKE_RSYNC_FAIL is set;
+# the fake ssh fails (the reindex there is skipped, as when it is unreachable: the copy still decides).
+cat > "$S/fakebin/rsync" <<'EOF'
+#!/bin/bash
+echo "rsync|$*" >> "$FAKE_LOG"
+[ -n "${FAKE_RSYNC_FAIL:-}" ] && exit 255
+cp "$FAKE_REMOTE"/*.json "${@: -1}"
+EOF
+chmod +x "$S/fakebin/rsync"
+export FAKE_REMOTE="$S/remote-index"; mkdir -p "$FAKE_REMOTE"
+UR=bbbbbbbb-0000-4000-8000-0000000000b1
+python3 - "$FAKE_REMOTE" "$UR" <<'EOF'
+import json, os, sys
+from datetime import datetime, timezone
+la = datetime.now(timezone.utc).isoformat()
+json.dump({"session_id": sys.argv[2], "custom_title": "On the NAS", "title_source": "custom", "interactive": True,
+           "agent_type": "claude", "jsonl_path": "~/.claude/projects/-home-x-proj/%s.jsonl" % sys.argv[2],
+           "latest_working_dir": "/home/x/proj", "latest_hostname": "BabisNAS", "index_hostname": "BabisNAS",
+           "permission_mode": "bypassPermissions", "last_active": la, "created_at": la, "session_state": "exited",
+           "conversation": [{"role": "user", "timestamp": la, "text": "zorblaxword on the nas"}]},
+          open(os.path.join(sys.argv[1], sys.argv[2] + ".json"), "w"))
+EOF
+python3 -c "import json; p='$NEW/data/settings.json'; d=json.load(open(p)); d['remote_hosts']=['fakehost']; json.dump(d, open(p, 'w'))"
+ares resume --uuid "$UR" --print-cmd > "$S/remote.out" 2>>"$LOG"; rc=$?
+check "the pull asks fakehost to reindex, then copies its index (hidden/ left out)" \
+    bash -c "grep -q '^ssh|.* fakehost .*ares reindex' '$FAKE_LOG' && grep -q '^rsync|.*--exclude hidden/ .*fakehost:opt/agent-resume/data/indexes/ $NEW/data/remote/fakehost/' '$FAKE_LOG'"
+check "its session is found by uuid, from the copy in data/remote/fakehost/" bash -c "[ $rc -eq 0 ] && [ -f '$NEW/data/remote/fakehost/$UR.json' ]"
+check "it resumes there: ssh -t fakehost, its folder (else ~), its permission mode and title" \
+    grep -qF "ssh -t fakehost 'PATH=\"\$HOME/.local/bin:\$PATH\"; cd /home/x/proj 2>/dev/null || cd; claude --dangerously-skip-permissions --resume $UR '\"'\"'/rename On the NAS'\"'\"''" "$S/remote.out"
+check "a search finds it among this machine's sessions" bash -c "python3 '$S/search.py' zorblaxword 90 | grep -q b1"
+FAKE_RSYNC_FAIL=1 ares resume --uuid "$UR" --print-cmd > "$S/remote2.out" 2>"$S/remote2.err"
+check "fakehost unreachable: said on stderr, its last copy still used" \
+    bash -c "grep -q 'fakehost unreachable' '$S/remote2.err' && grep -q 'ssh -t fakehost' '$S/remote2.out'"
+python3 -c "import json; p='$NEW/data/settings.json'; d=json.load(open(p)); d['remote_hosts']=[]; json.dump(d, open(p, 'w'))"
 
 # ---------------------------------------------------------------------------------------------------------
 section "ares tmux, end to end in the sandbox tmux server"

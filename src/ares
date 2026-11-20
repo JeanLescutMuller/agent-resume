@@ -56,8 +56,8 @@ def _load_settings() -> Dict[str, Any]:
         "local_projects_dir": "~/.claude/projects",
         "local_index_dir": os.path.join(ARES_DATA_DIR, "indexes"),
         "ignore_path_substrings": [],
-        "sync_stale_warning_hours": 24,
-        "remote_ssh_host": "",
+        # ssh names of the other machines whose sessions ares resume also shows, and resumes there over ssh
+        "remote_hosts": [],
         "codex_sessions_dir": "~/.codex/sessions",
         "codex_session_index_file": "~/.codex/session_index.jsonl",
         # None = auto-detect (enabled iff codex_sessions_dir exists); an explicit
@@ -72,7 +72,7 @@ def _load_settings() -> Dict[str, Any]:
                 defaults[k] = v
             elif isinstance(v, str) and v != "":
                 defaults[k] = v
-            elif isinstance(v, list) and k == "ignore_path_substrings":
+            elif isinstance(v, list):
                 defaults[k] = [s for s in v if isinstance(s, str) and s]
             elif isinstance(v, (int, float)) and not isinstance(v, bool):
                 defaults[k] = v
@@ -85,11 +85,14 @@ _SETTINGS = _load_settings()
 PROJECTS_DIR = os.path.expanduser(_SETTINGS["local_projects_dir"])
 LOCAL_INDEX_DIR = os.path.expanduser(_SETTINGS["local_index_dir"])
 # Entries of sessions nobody typed in (`claude -p`, SDK, Codex sub-agents; ~87% of the files) live apart, so a
-# search reads only the interactive ones. ares-sync (maxdepth 1) leaves this folder out.
+# search reads only the interactive ones. The pull of another machine's index leaves this folder out.
 HIDDEN_INDEX_DIR = os.path.join(LOCAL_INDEX_DIR, "hidden")
 IGNORE_PATH_SUBSTRINGS: List[str] = _SETTINGS.get("ignore_path_substrings", [])
-SYNC_STALE_WARNING_HOURS: float = _SETTINGS.get("sync_stale_warning_hours", 24)
-SYNC_LOG_PATH = os.path.join(ARES_DATA_DIR, "sync-log.jsonl")
+REMOTE_HOSTS: List[str] = _SETTINGS.get("remote_hosts", [])
+# remote/<ssh host>/<uuid>.json: read-only copies of each remote host's index, refreshed by pull_remotes
+REMOTE_INDEX_DIR = os.path.join(ARES_DATA_DIR, "remote")
+SSH_OPTS = ["-o", "ConnectTimeout=3", "-o", "BatchMode=yes"]
+PULL_TIMEOUT_S = 15   # per host, both steps; a reindex there takes ~0.4 s (VM and NAS, 2026-11-20)
 
 CODEX_SESSIONS_DIR = os.path.expanduser(_SETTINGS["codex_sessions_dir"])
 CODEX_SESSION_INDEX_FILE = os.path.expanduser(_SETTINGS["codex_session_index_file"])
@@ -133,7 +136,7 @@ def short_host(host: Optional[str]) -> Optional[str]:
     """Strip the DNS domain: 'mac.home' -> 'mac'. None/empty stays falsy.
 
     Hostnames reach the index from several places (agent-tracker's lifecycle
-    lines, this process, indexes synced from another
+    lines, this process, indexes copied from another
     machine); comparing them only ever makes sense on the short form.
     """
     return host.split(".")[0] if host else None
@@ -196,9 +199,8 @@ def _make_portable_jsonl_path(abs_path: str) -> str:
     """Convert absolute jsonl_path to portable ~/.claude/projects/... format.
 
     $HOME differs across machines (e.g. /Users/alice on a laptop vs
-    /home/bob on a VM), and index files can be copied between machines
-    by ares-sync. Normalizing to ~/.claude/projects/<slug>/<file> makes the
-    path resolve correctly under whichever machine's $HOME reads it.
+    /home/bob on a VM), and another machine's index is copied here (pull_remotes)
+    to be searched and shown.
     """
     marker = "/.claude/projects/"
     idx = abs_path.find(marker)
@@ -618,6 +620,7 @@ def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str
         "last_active": transcript.last_active,
         "session_state": determine_state(lifecycle_events),
         "interactive": transcript.interactive,
+        "permission_mode": transcript.permission_mode,
         "tmux_session": tmux_session,
         "tmux_window": tmux_window,
         "tmux_pane": tmux_pane,
@@ -673,12 +676,19 @@ def is_source_missing(d_fields: Dict[str, Any]) -> bool:
     return not os.path.exists(_resolve_jsonl_path(jsonl_path))
 
 
-def load_index_doc(path: str) -> Optional[Dict[str, Any]]:
-    """Read one index file and tag it with whether its .jsonl still exists."""
+def index_dirs() -> List[Tuple[str, Optional[str]]]:
+    """[(folder of index entries, its ssh host or None for this machine)]: this machine's, then each remote copy."""
+    return [(LOCAL_INDEX_DIR, None)] + [(os.path.join(REMOTE_INDEX_DIR, h), h) for h in REMOTE_HOSTS]
+
+
+def load_index_doc(path: str, host: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Read one index file and tag it: _host, the machine it lives on (None: this one), and _source_missing,
+    whether its .jsonl is gone (checked on this machine only)."""
     doc = read_json(path)
     if doc is None:
         return None
-    doc["_source_missing"] = is_source_missing(doc)
+    doc["_host"] = host
+    doc["_source_missing"] = not host and is_source_missing(doc)
     return doc
 
 
@@ -757,13 +767,13 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
     cutoff_from = now - timedelta(days=opts.from_days) if opts.from_days > 0 else None
     cutoff_until = now - timedelta(days=int(opts.until_days)) if opts.until_days else None
 
-    idx_files = glob.glob(os.path.join(LOCAL_INDEX_DIR, "*.json"))
+    idx_files = [(p, host) for d, host in index_dirs() for p in glob.glob(os.path.join(d, "*.json"))]
     log_verbose(f"PHASE 2: Found {len(idx_files)} index files", verbose)
 
     # (doc, idx_path, searchable text) for everything surviving the filters
     candidates: List[Tuple[Dict[str, Any], str, str]] = []
-    for idx_path in idx_files:
-        doc = load_index_doc(idx_path)
+    for idx_path, host in idx_files:
+        doc = load_index_doc(idx_path, host)
         if doc is None:
             log_verbose(f"PHASE 2: ERROR reading {os.path.basename(idx_path)}", verbose)
             continue
@@ -820,19 +830,20 @@ def find_by_uuid(uuid: str) -> Optional[Dict[str, Any]]:
     exists. Used by --uuid to skip search/fzf entirely. None if 0 matches;
     exits with an error message (not just None) if the prefix is ambiguous,
     since silently picking one would be the wrong failure mode here."""
-    for d in (LOCAL_INDEX_DIR, HIDDEN_INDEX_DIR):
+    l_dirs = index_dirs() + [(HIDDEN_INDEX_DIR, None)]
+    for d, host in l_dirs:
         exact = os.path.join(d, f"{uuid}.json")
         if os.path.isfile(exact):
-            return load_index_doc(exact)
+            return load_index_doc(exact, host)
 
-    candidates = [p for d in (LOCAL_INDEX_DIR, HIDDEN_INDEX_DIR) for p in glob.glob(os.path.join(d, "*.json"))
+    candidates = [(p, host) for d, host in l_dirs for p in glob.glob(os.path.join(d, "*.json"))
                   if Path(p).stem.startswith(uuid)]
     if len(candidates) > 1:
         print(f"ERROR: multiple indexed sessions match uuid prefix '{uuid}':", file=sys.stderr)
-        for p in candidates:
+        for p, _ in candidates:
             print(f"  {Path(p).stem}", file=sys.stderr)
         sys.exit(1)
-    return load_index_doc(candidates[0]) if candidates else None
+    return load_index_doc(*candidates[0]) if candidates else None
 
 
 # -- Session Display & Selection --------------------------------------------
@@ -932,7 +943,7 @@ def host_block(doc: Dict[str, Any]) -> str:
     # disk they are ours, since .jsonl files are never synced between machines.
     host = latest or initial or short_host(clean_field(doc.get("index_hostname")))
     if not host and not doc.get("_source_missing", False):
-        host = LOCAL_HOSTNAME
+        host = doc.get("_host") or LOCAL_HOSTNAME
     if not host:
         return ""
     color = C_HOST_LOCAL if host == LOCAL_HOSTNAME else C_HOST_REMOTE
@@ -1035,16 +1046,27 @@ def resume_dir(doc: Dict[str, Any]) -> str:
     return wd if wd and os.path.isdir(wd) else os.getcwd()
 
 
+def resume_shell_cmd(doc: Dict[str, Any], agent_cmd: str) -> str:
+    """The shell command that resumes a session: `cd <resume_dir> && <agent command>` for one of this machine; for
+    one of another machine, the same there over `ssh -t` (its own folder test: a gone folder falls back to ~).
+    `claude` is my-setup's account selector on every machine (~/.local/bin/claude, 2026-11-20)."""
+    host = doc.get("_host")
+    if not host:
+        return f"cd {shlex.quote(resume_dir(doc))} && {agent_cmd}"
+    wd = doc.get("latest_working_dir") or doc.get("initial_working_dir") or "~"
+    remote = f'PATH="$HOME/.local/bin:$PATH"; cd {shlex.quote(wd)} 2>/dev/null || cd; {agent_cmd}'
+    return f"ssh -t {shlex.quote(host)} {shlex.quote(remote)}"
+
+
 # -- Claude backend adapters --------------------------------------------------
 
-def _claude_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"],
-                       working_dir: str, uuid: str, fork: bool) -> str:
-    """Build the `claude --resume` shell command (same logic cmd_resume always used)."""
-    perm_mode = transcript.permission_mode if transcript else None
+def _claude_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], uuid: str, fork: bool) -> str:
+    """The `claude --resume` command (the folder is resume_shell_cmd's). The transcript, when readable here, gives
+    the newest permission mode and title; else the index's."""
+    perm_mode = transcript.permission_mode if transcript else doc.get("permission_mode")
     title = (transcript.title if transcript else None) or doc.get("custom_title", "")
     claude_flags = "--dangerously-skip-permissions " if perm_mode == "bypassPermissions" else ""
-    cmd = (f"cd {subprocess.list2cmdline([working_dir])} && "
-           f"claude {claude_flags}--resume {subprocess.list2cmdline([uuid])}")
+    cmd = f"claude {claude_flags}--resume {shlex.quote(uuid)}"
     if fork:
         cmd += " --fork-session"
     if title:
@@ -1060,11 +1082,9 @@ def _claude_uuid_of(jsonl_path: str) -> str:
 
 # -- Codex backend adapters ---------------------------------------------------
 
-def _codex_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"],
-                      working_dir: str, uuid: str, fork: bool) -> str:
-    """Build the `codex resume`/`codex fork` shell command."""
-    action = "fork" if fork else "resume"
-    return f"cd {subprocess.list2cmdline([working_dir])} && codex {action} {subprocess.list2cmdline([uuid])}"
+def _codex_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], uuid: str, fork: bool) -> str:
+    """The `codex resume`/`codex fork` command (the folder is resume_shell_cmd's)."""
+    return f"codex {'fork' if fork else 'resume'} {shlex.quote(uuid)}"
 
 
 # Codex names transcripts rollout-<timestamp>-<uuid>.jsonl - the uuid is
@@ -1146,7 +1166,7 @@ class Backend(NamedTuple):
     name: str
     scan: Callable[[], Dict[str, float]]                                  # () -> {jsonl_path: mtime}
     parse: Callable[..., "Transcript"]                                    # (jsonl_path, warn=...) -> Transcript
-    resume_cmd: Callable[[Dict[str, Any], Optional["Transcript"], str, str, bool], str]
+    resume_cmd: Callable[[Dict[str, Any], Optional["Transcript"], str, bool], str]   # (doc, transcript, uuid, fork)
     uuid_of: Callable[[str], str]                                        # jsonl_path -> uuid
 
 
@@ -1347,62 +1367,35 @@ def cmd_reindex(max_sessions: int = 0, force: bool = False, single_uuid: str = "
             "sessions_skipped": d_counts["skipped"], "errors": errors}
 
 
-# -- Sync awareness ---------------------------------------------------------
+# -- Other machines ------------------------------------------------------------
+# Since 2026-11-20 (the user): no sync. Each search refreshes every remote host's own index there, copies it here
+# one way (remote/<host>/), and a session of another machine resumes there, over ssh (resume_shell_cmd). Transcripts
+# never move: a project is worked on in its home machine only.
 
-def _read_sync_log_tail(max_lines: int = 200) -> List[Dict[str, Any]]:
-    """Read up to the last max_lines entries from $AGENT_RESUME_HOME/data/sync-log.jsonl.
-
-    Slices the raw lines before parsing: the log gains an entry per sync
-    attempt forever, and only the tail is ever of interest.
-    """
+def _pull_one(host: str) -> bool:
+    """Refresh the index on host (`ares reindex` there), then copy it into remote/<host>/. True if the copy worked."""
+    dest = os.path.join(REMOTE_INDEX_DIR, host)
+    Path(dest).mkdir(parents=True, exist_ok=True)
     try:
-        with open(SYNC_LOG_PATH, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()[-max_lines:]
-    except OSError:
-        return []
-    entries = []
-    for line in lines:
-        try:
-            entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return entries
+        subprocess.run(["ssh", *SSH_OPTS, host, "~/opt/agent-resume/bin/ares reindex >/dev/null 2>&1"],
+                       timeout=PULL_TIMEOUT_S, capture_output=True, stdin=subprocess.DEVNULL)
+        return subprocess.run(["rsync", "-a", "--delete", "--exclude", "hidden/", "--exclude", "*.tmp",
+                               "-e", shlex.join(["ssh", *SSH_OPTS]), f"{host}:opt/agent-resume/data/indexes/",
+                               dest + "/"],
+                              timeout=PULL_TIMEOUT_S, capture_output=True, stdin=subprocess.DEVNULL).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
-def _maybe_pull_before_resume(verbose: bool = False) -> None:
-    """Opportunistic, rate-limited pull of the remote index before searching.
-
-    Never blocks more than a few seconds and never raises - a failed or timed
-    out pull just means ares resume searches whatever's already local."""
-    entries = _read_sync_log_tail()
-    if entries:
-        last_attempt = parse_ts(entries[-1].get("timestamp"))
-        if last_attempt and (datetime.now(timezone.utc) - last_attempt).total_seconds() < 60:
-            log_verbose("Skipping opportunistic pull (attempted <60s ago)", verbose)
-            return
-    try:
-        subprocess.run(
-            [os.path.join(os.path.dirname(os.path.realpath(__file__)), "ares-sync"), "--pull"],
-            timeout=5, capture_output=True,
-            stdin=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        log_verbose(f"Opportunistic pull skipped: {e}", verbose)
-
-
-def _sync_staleness_warning() -> Optional[str]:
-    """Return a warning string if the last successful sync is stale/missing, else None."""
-    last_success = next(
-        (parse_ts(e.get("timestamp")) for e in reversed(_read_sync_log_tail())
-         if e.get("outcome") == "success"), None)
-    if last_success is None:
-        return "never synced with remote yet"
-    age_hours = (datetime.now(timezone.utc) - last_success).total_seconds() / 3600
-    if age_hours <= SYNC_STALE_WARNING_HOURS:
-        return None
-    if age_hours >= 48:
-        return f"last synced with remote {age_hours / 24:.0f}d ago"
-    return f"last synced with remote {age_hours:.0f}h ago"
+def refresh_all(verbose: bool = False) -> None:
+    """Refresh this machine's index and pull every remote host's, all at once; an unreachable host keeps its
+    last copy, and says so."""
+    with ThreadPoolExecutor(max_workers=len(REMOTE_HOSTS) or 1) as pool:
+        d_pull = {host: pool.submit(_pull_one, host) for host in REMOTE_HOSTS}
+        refresh_index(verbose)
+    for host, fut in d_pull.items():
+        if not fut.result():
+            print(f"\033[38;5;208m⚠ {host} unreachable: its sessions as of the last search\033[0m", file=sys.stderr)
 
 
 # -- Picking a session -------------------------------------------------------
@@ -1412,13 +1405,7 @@ def pick_session(opts: SearchOpts, action_verb: str) -> Tuple[str, Dict[str, Any
 
     Exits the process on an empty result or a cancelled picker; never returns None.
     """
-    if _SETTINGS.get("remote_ssh_host", ""):
-        _maybe_pull_before_resume(opts.verbose)
-        warning = _sync_staleness_warning()
-        if warning:
-            print(f"\033[38;5;208m⚠ {warning}\033[0m", file=sys.stderr)
-
-    refresh_index(opts.verbose)   # after the pull: a local transcript wins over a pulled copy of its entry
+    refresh_all(opts.verbose)
     if not os.path.isdir(LOCAL_INDEX_DIR):
         print(f"ERROR: local index cache not found at {LOCAL_INDEX_DIR}", file=sys.stderr)
         print("  Run 'ares reindex' first to build the local cache.", file=sys.stderr)
@@ -1445,7 +1432,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
     either agent's TUI.
     """
     if opts.uuid:
-        refresh_index(opts.verbose)
+        refresh_all(opts.verbose)
         doc = find_by_uuid(opts.uuid)
         if not doc:
             print(f"ERROR: no indexed session matches uuid '{opts.uuid}'.", file=sys.stderr)
@@ -1455,62 +1442,46 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
         uuid, doc = pick_session(opts, action_verb="Resume")
 
     if doc.get("_source_missing", False):
-        if print_cmd:
-            print(f"ERROR: session {uuid} not found locally, cannot build a resume command.",
-                  file=sys.stderr)
-            sys.exit(1)
-        # The .jsonl itself is gone - either deleted locally, or this doc came
-        # from a machine that has never synced .jsonl files (ares-sync only ever
-        # moves the index, never the transcript), so a real resume is not
-        # possible either way. /inject-session reads the indexed conversation straight
-        # into a new session instead.
-        print("\n\033[38;5;208mSession not found locally.\033[0m")
-        print(f"  UUID:  {uuid}")
-        print(f"  Title: {doc.get('custom_title', '')}")
-        print(f"  Slug:  {doc.get('slug', '')}")
-        print(f"\n  True resume is not possible: the .jsonl transcript isn't on this machine.")
-        print(f"  Open Claude and run: /inject-session {uuid}")
-        sys.exit(0)
+        # Its transcript is gone from this machine (deleted by hand, or by Claude Code after cleanupPeriodDays):
+        # nothing to resume. The index entry still holds the whole conversation.
+        print(f"ERROR: the transcript of session {uuid} is gone from this machine: it cannot be resumed.\n"
+              f"  Its conversation is still in the index: {os.path.join(LOCAL_INDEX_DIR, uuid + '.json')}",
+              file=sys.stderr)
+        sys.exit(1)
 
     backend = BACKENDS.get(doc.get("agent_type") or "claude", BACKENDS["claude"])
+    host = doc.get("_host")
     initial_wd = doc.get("initial_working_dir", "")
     latest_wd = doc.get("latest_working_dir", "")
 
-    # Re-read the transcript: it holds the permission mode, and a title that
-    # may be newer than the indexed one if the session was renamed since.
-    jsonl_path = _resolve_jsonl_path(doc.get("jsonl_path", ""))
+    # Re-read the transcript when it is here: it holds the permission mode, and a title that may be newer than the
+    # indexed one if the session was renamed since. Another machine's session: the index's.
+    jsonl_path = "" if host else _resolve_jsonl_path(doc.get("jsonl_path", ""))
     transcript = backend.parse(jsonl_path, warn=False) if jsonl_path else None
-    perm_mode = transcript.permission_mode if transcript else None
+    perm_mode = transcript.permission_mode if transcript else doc.get("permission_mode")
     title = (transcript.title if transcript else None) or doc.get("custom_title", "")
-
-    working_dir = resume_dir(doc)
-
-    if not print_cmd:
-        # -- Session info (same format used by /info skill) --
-        print("")
-        print(f"Title:              {title or '(not set)'}")
-        print(f"UUID:               {uuid}")
-        print(f"Original WD:        {initial_wd}")
-        print(f"Latest WD:          {latest_wd or initial_wd}")
-        print(f"JSONL file:         {jsonl_path or '(unknown)'}")
-        print(f"Permission mode:    {perm_mode or '(unknown)'}")
-        print(f"Selected local dir: {working_dir}")
-        if working_dir != (latest_wd or initial_wd or working_dir):
-            print("\033[33mThe folder it last ran in no longer exists here: resuming in the current folder.\033[0m")
-
-    cmd = backend.resume_cmd(doc, transcript, working_dir, uuid, fork)
+    working_dir = (latest_wd or initial_wd or "~") if host else resume_dir(doc)
+    cmd = resume_shell_cmd(doc, backend.resume_cmd(doc, transcript, uuid, fork))
 
     if print_cmd:
         print(cmd)
         return
 
+    print("")
+    print(f"Title:              {title or '(not set)'}")
+    print(f"UUID:               {uuid}")
+    print(f"Machine:            {host or 'this one'}")
+    print(f"Original WD:        {initial_wd}")
+    print(f"Latest WD:          {latest_wd or initial_wd}")
+    print(f"JSONL file:         {doc.get('jsonl_path') if host else jsonl_path or '(unknown)'}")
+    print(f"Permission mode:    {perm_mode or '(unknown)'}")
+    print(f"Folder:             {working_dir}")
+    if not host and working_dir != (latest_wd or initial_wd or working_dir):
+        print("\033[33mThe folder it last ran in no longer exists here: resuming in the current folder.\033[0m")
     print(f"Command:            {cmd}")
     print("")
-    print(f"{'Forking' if fork else 'Resuming'} in {working_dir} ...")
-    # A non-interactive bash has no `claude` alias: define it as a function, so the resume goes through my-setup's
-    # claude-account (the account selector) when it is installed, else straight to claude (2026-11-19).
-    via_account = 'claude() { if command -v claude-account >/dev/null 2>&1; then claude-account "$@"; else command claude "$@"; fi; }; '
-    os.execv("/bin/bash", ["/bin/bash", "-c", via_account + cmd])
+    print(f"{'Forking' if fork else 'Resuming'} {'on ' + host if host else ''} in {working_dir} ...")
+    os.execv("/bin/bash", ["/bin/bash", "-c", cmd])
 
 
 # -- Crash restore: ares tmux (agent-tracker IMPLEMENTATION.md §5) -----------
@@ -1992,16 +1963,14 @@ def _epilog_for(command: str) -> str:
 
 TOP_DESCRIPTION = f"""ares {VERSION} - agent-resume (was asm): find and resume agent sessions
 
-  resume  → refreshes the changed index entries, then searches ($AGENT_RESUME_HOME/data/indexes/)
+  resume  → refreshes the changed index entries here and on the remote_hosts, then searches them all
+            ($AGENT_RESUME_HOME/data/indexes/, data/remote/<host>/); another machine's session resumes there (ssh)
   tmux    → after a crash, restores the previous boot's tmux sessions and Claude sessions
   reindex → builds the JSON index from local .jsonl files
 
-`asm` is an alias of `ares`. Closing a running session moved to claude-close-keep-screen."""
+`asm` is an alias of `ares`. Closing a running session: claude-close-keep-screen."""
 
 TOP_EPILOG = "Run `ares <command> --help` for that command's full flag list and examples."
-
-CLOSE_POINTER = "ares close moved to claude-close-keep-screen: run `claude-close-keep-screen close <uuid|%pane>`."
-
 
 def _add_search_args(p: argparse.ArgumentParser) -> None:
     """Search/filter flags of 'resume'."""
@@ -2019,10 +1988,6 @@ def _add_search_args(p: argparse.ArgumentParser) -> None:
 
 def main() -> None:
     """Main entry point."""
-    if sys.argv[1:2] == ["close"]:   # before argparse: any flags after it are close's, not ours
-        print(CLOSE_POINTER, file=sys.stderr)
-        sys.exit(1)
-
     parser = argparse.ArgumentParser(
         prog="ares",
         description=TOP_DESCRIPTION,

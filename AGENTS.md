@@ -6,24 +6,28 @@ Find and resume past Claude Code and Codex sessions from any folder and any mach
 
 - **agent-tracker's files are read, never written**: `$AGENT_TRACKER_HOME/data/sessions/<uuid>/{lifecycle.jsonl,last_seen.json}` (default `~/opt/agent-tracker`); their format is agent-tracker's `IMPLEMENTATION.md` §4. A `lifecycle.jsonl` line without its final newline is ignored. → `DEV_DOC.md` R2.
 - **session_state** (`pending`/`exited`) comes from the lifecycle: pending = a start line with no later end line of the same pid (`open_start` in `src/ares`).
-- **The index is refreshed at search time**: `ares resume` re-indexes only the transcripts (or lifecycles) newer than their index entry (`refresh_index`), then searches. The 30-min job and the VM sync stay (open point: agent-tracker `DESIGN.md` "Open points").
+- **The index is refreshed at search time**: `ares resume` re-indexes only the transcripts (or lifecycles) newer than their index entry (`refresh_index`), then searches. No scheduled job, no SessionEnd hook (removed 2026-11-20).
+- **Other machines: search everywhere, resume where the session lives** (the user, 2026-11-20): `remote_hosts` (settings) are refreshed over ssh and their index copied here one way (`data/remote/<host>/`) at each search; a session of another machine resumes there with `ssh -t`. → `DEV_DOC.md` R6.4, D2.
+- **The resume folder**: the last folder the session ran in, else the current one; `claude --resume <uuid>` finds the transcript from any folder (`resume_dir`). → `DEV_DOC.md` D1.
 - **`ares tmux` follows agent-tracker's `IMPLEMENTATION.md` §5 exactly**: since 2026-11-17 from agent-tracker's snapshot (`data/snapshots/<boot_ts>.tsv`: every pane, its folder and command, the iTerm2 windows and tabs; Claude sessions matched by `pane_id`, no stale rule); without one, the old guess (one per pane, stale rule); always `select-layout`, never touch an existing tmux session. → `DEV_DOC.md` R4.
-- **Two hooks, for Claude Code and Codex** (Codex: the plugin `src/codex-plugin/`, `agent-resume@agent-resume-local`): `src/session_start.py` (SessionStart) prints only the resume warnings (duplicate, cross-machine, changed folder) read from agent-tracker's lifecycle; `src/session_end.sh` (SessionEnd) re-indexes that one session and pushes it to the hub (`ares-sync --push`). Both always exit 0 and write no lifecycle: asm's lifecycle hook and `data/lifecycles/` are gone (agent-tracker's now).
-- **No close here**: `ares close` prints a one-line pointer to claude-close-keep-screen. No `status` script (removed by the user, 2026-11-07).
+- **One hook, for Claude Code and Codex** (Codex: the plugin `src/codex-plugin/`, `agent-resume@agent-resume-local`): `src/session_start.py` (SessionStart) prints only the duplicate warning, read from agent-tracker's lifecycle. It always exits 0 and writes no lifecycle (agent-tracker's).
+- **No close here** (claude-close-keep-screen), no `status` script (removed by the user, 2026-11-07), no `/inject-session` (removed by the user, 2026-11-20: every session resumes).
 - Python stdlib only; `src/ares` is one file (Backend registry: `BACKENDS`).
-- `install.sh` is idempotent and self-migrating (it takes apart `~/opt/agent-session-manager`, doc/deploy_migration.md). In a sandbox `HOME` it calls no `launchctl` / `systemctl`, and runs `codex` only with `CODEX_HOME=$HOME/.codex`.
+- `install.sh` is idempotent and self-migrating (it removes what the version before 2026-11-20 installed: the job, the SessionEnd hook, `ares-sync`, `inject-session`). In a sandbox `HOME` it calls no `launchctl` / `systemctl`, and runs `codex` only with `CODEX_HOME=$HOME/.codex`.
 
 ## Never
 
 - Run `install.sh`, `uninstall.sh` or `ares tmux` against the real `$HOME` or the default tmux server from a test: every tmux call of a test goes to an explicit socket: run the tests under agent-tracker's `tests/tmux_guard.sh` (the user's rule after a test's `TMUX_TMPDIR=… tmux kill-server`, with `TMUX` set, killed the real tmux server on 2026-11-07 15:30); the tests use a sandbox (`test/sandbox_test.sh`, `TMUX_TMPDIR`, `unset TMUX`).
-- Write a session's `.jsonl` transcript or sync it between machines: `ares-sync` moves index files only.
+- Write a session's `.jsonl` transcript or copy it between machines: a session is resumed on its own machine (over ssh).
 
 ## Test, deploy
 
 ```bash
 bash test/sandbox_test.sh          # everything, in a sandbox HOME + sandbox tmux server; log path printed at the end
 bash test/smoke_test.sh --offline  # health check of a real install (read-only)
-bash install.sh                    # deploy to ~/opt/agent-resume (from the Mac's checkout; VM: a temporary clone)
+bash install.sh                    # deploy to ~/opt/agent-resume on the Mac
+bash tools/deploy_remote.sh        # deploy HEAD to the VM and the NAS (a git bundle over ssh: no push needed)
+bash tools/token_cost.sh           # the code's cost in tokens (skill code-minimization)
 ```
 
 ## Vocabulary
@@ -33,6 +37,7 @@ bash install.sh                    # deploy to ~/opt/agent-resume (from the Mac'
 | Claude session | one conversation of Claude Code (or Codex), named by its UUID | "session" alone, when a tmux session could be meant |
 | tmux session · window · pane | tmux's own words; a pane is named by its `%id` and shown as `<tmux session>:<window>.<pane>` | |
 | index · index entry | `~/opt/agent-resume/data/indexes/`, one `<uuid>.json` per Claude session (title, folders, hosts, state, the whole conversation) | cache, catalog |
+| remote host · remote copy | a machine in `remote_hosts` (its ssh name) · `data/remote/<host>/`, the read-only copy of its index | hub, spoke, sync (`ares-sync`, removed 2026-11-20) |
 | lifecycle | agent-tracker's `lifecycle.jsonl` of a Claude session: one line per start and end | sidecar (asm's former files) |
 | last seen | the `ts` of agent-tracker's `last_seen.json`: last time the statusline ran for that Claude session | heartbeat |
 | boot · previous boot | one run of the Mac, named by its start time `boot_ts` · the newest `boot_ts` in agent-tracker's files that is not this boot | |
@@ -45,6 +50,5 @@ bash install.sh                    # deploy to ~/opt/agent-resume (from the Mac'
 | Need | File |
 |---|---|
 | what it does, for the user; commands and settings | `README.md` |
-| requirements R1–R6, design notes D0–D5 | `DEV_DOC.md` |
-| moving a machine from `~/opt/agent-session-manager` | `doc/deploy_migration.md` |
+| requirements R1–R7, design notes D0–D4 | `DEV_DOC.md` |
 | how to run the tests | `TESTING.md` |

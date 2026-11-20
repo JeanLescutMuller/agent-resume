@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""session_start.py - agent-resume's SessionStart hook (Claude Code, and Codex through its plugin): the resume warnings.
+"""session_start.py - agent-resume's SessionStart hook (Claude Code, and Codex through its plugin): the duplicate warning.
 
-Reads:  the hook JSON on stdin ({"session_id", "cwd", ...}); agent-tracker's
+Reads:  the hook JSON on stdin ({"session_id", ...}); agent-tracker's
         $AGENT_TRACKER_HOME/data/sessions/<uuid>/lifecycle.jsonl (agent-tracker is its only writer:
         its SessionStart hook may have appended this very start already); `ps`.
 Writes: nothing. Prints only the warnings, and only when there is one: a banner on /dev/tty (seen
         before Claude's screen takes over, then 3 s to press Ctrl+C; skipped when $ARES_NO_TTY is set,
         for tests) and the same text as the hook's additionalContext on stdout. Exit 0 always: a hook must never block a session.
 
-The warnings (as asm's lifecycle hook gave them until 2026-11-07):
-  DUPLICATE SESSION  an earlier start line of this machine and this boot whose pid is still alive with the
-                     same start time (pid_start), so a reused pid does not count, and which logged no end line of that pid, and which is not this
-                     session's own process (any ancestor of this hook)
-  Cross-machine      the previous start (the newest start line not of this process) ran on another machine
-  Working directory  the previous start's cwd is another folder than this one (compared by realpath)
+The warning (as asm's lifecycle hook gave it until 2026-11-07): DUPLICATE SESSION, an earlier start line of this
+machine and this boot whose pid is still alive with the same start time (pid_start), so a reused pid does not count,
+and which logged no end line of that pid, and which is not this session's own process (any ancestor of this hook).
+Two processes appending to one transcript would mix it up.
+
+The "Cross-machine" and "Working directory changed" warnings were removed on 2026-11-20: a session now resumes only
+on its own machine (ares resume runs it there over ssh), and in any folder (claude --resume finds it from anywhere).
 """
 
 import json
@@ -30,7 +31,7 @@ PID_START_SLACK_S = 2  # ps lstart has 1 s resolution
 def main() -> None:
     try:
         d_in = json.load(sys.stdin)
-        uuid, cwd = d_in.get("session_id") or "", d_in.get("cwd") or os.getcwd()
+        uuid = d_in.get("session_id") or ""
     except (ValueError, AttributeError):
         return
     if not re.fullmatch(r"[A-Za-z0-9-]+", uuid):
@@ -77,15 +78,13 @@ def main() -> None:
                 s_ended.add(int(ev["pid"]))
         except (ValueError, TypeError, AttributeError):
             continue
-    l_warn, s_seen, prev = [], set(), None
+    l_warn, s_seen = [], set()
     for raw in l_raw:
         try:
             ev = json.loads(raw)
             pid = int(ev.get("pid") or 0)
         except (ValueError, TypeError, AttributeError):
             continue
-        if ev.get("event") == "start" and pid not in s_mine:
-            prev = ev   # ends as the newest start of another process: the previous start
         if ev.get("event") != "start" or not pid or pid in s_mine or pid in s_seen or pid in s_ended or pid not in d_proc:
             continue
         if ev.get("machine") and machine and ev["machine"] != machine:
@@ -98,17 +97,9 @@ def main() -> None:
         where = f" (tmux: {ev['pane']})" if ev.get("pane") else ""
         l_warn.append(f"DUPLICATE SESSION: this session is already running in PID {pid}{where}. "
                       f"Consider using --fork-session instead.")
-    if prev and prev.get("machine") and machine and prev["machine"] != machine:
-        l_warn.append(f"Cross-machine resume: previous session ran on '{prev['machine']}', "
-                      f"now resuming on '{machine}'.")
-    if prev and prev.get("cwd") and os.path.realpath(prev["cwd"]) != os.path.realpath(cwd):
-        gone = "" if os.path.isdir(prev["cwd"]) else " The previous directory does not exist on this machine."
-        l_warn.append(f"Working directory changed: was '{prev['cwd']}', now '{cwd}'. "
-                      f"File paths from prior context may not resolve correctly.{gone}")
     if not l_warn:
         return
-    title = ("DUPLICATE SESSION DETECTED" if l_warn[0].startswith("DUPLICATE")
-             else "CROSS-MACHINE RESUME" if l_warn[0].startswith("Cross") else "SESSION WARNING")
+    title = "DUPLICATE SESSION DETECTED"
 
     orange, yellow, bold, rst = "\033[48;5;208m\033[1;97m", "\033[38;5;214m", "\033[1m", "\033[0m"
     try:
