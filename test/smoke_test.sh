@@ -261,7 +261,7 @@ for agent, doc in docs_by_agent.items():
         print(f"BACKEND_MISSING={agent}")
         continue
     print(f"AGENT_TYPE_FOUND={agent}")
-    wd = backend.resolve_working_dir(doc, False)
+    wd = asm_mod.resume_dir(doc)
     cmd = backend.resume_cmd(doc, None, wd or "/tmp", doc.get("session_id", ""), False)
     print(f"RESUME_CMD={agent}:{cmd}")
 PYEOF

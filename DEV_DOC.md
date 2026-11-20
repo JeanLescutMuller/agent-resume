@@ -94,7 +94,7 @@ Per-backend implementations:
 |---|---|---|
 | Session files | `~/.claude/projects/<slug>/<uuid>.jsonl` (slug-encoded dir per project) | `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` (flat, timestamp-sharded) |
 | Transcript line shape | `{type: user/assistant/ai-title/custom-title, ...}` | `{type: session_meta/response_item/event_msg/turn_context/world_state, payload: {...}}` |
-| Working dir | Decoded from the project-slug folder name (`_claude_resolve_working_dir`) | Read directly from `session_meta.payload.cwd` - no decoding needed (`_codex_resolve_working_dir`) |
+| Resume folder | the same for both (`resume_dir`, D1): the last folder it ran in (agent-tracker's newest start, else the transcript's cwd), else the current folder | same |
 | Titles | Embedded in the transcript (`ai-title`/`custom-title` lines) | Separate append-only log, `~/.codex/session_index.jsonl` (`{id, thread_name, updated_at}`, latest line wins) - `_codex_session_titles()` |
 | UUID from filename | Filename stem *is* the UUID (`_claude_uuid_of`) | Regex-extracted from `rollout-<ts>-<uuid>.jsonl` (`_codex_uuid_of`) - the stem is not the bare UUID |
 | Resume/fork command | `claude --resume <uuid>` / `claude --resume <uuid> '/rename <title>'` | `codex resume <uuid>` / `codex fork <uuid>` |
@@ -249,7 +249,7 @@ ares tmux [--dry-run] [--all] [--no-iterm] [--this-boot]
 | first window | `new-session -d -s <name> -n <window name> -x W -y H -c ~` (W×H from the saved `window_layout`), then `move-window` to its saved index if base-index differs |
 | other windows | `new-window -d -t <session>:<index> -n <name> -c ~` |
 | pane sizes | `resize-window -x W -y H`, one `split-window -d -c ~` per extra cell of the layout, `select-layout <window_layout>`, then `set-option -w -u window-size` so the window follows the terminal again once attached |
-| Claude panes | `send-keys "cd <folder> && claude --resume <uuid>" Enter`, in the pane at the cell of its `pane_id`; `<folder>` = the decoded slug of its transcript (as `ares resume`), else the start's `cwd`, else `~` |
+| Claude panes | `send-keys "cd <folder> && claude --resume <uuid>" Enter`, in the pane at the cell of its `pane_id`; `<folder>` = the start's `cwd` of that run (the last folder it ran in, as `ares resume`), else its last seen `cwd`, else `~` |
 | plain panes | stay shells in `~` (their folder is not recorded) |
 | iTerm2 | one new window, one tab per restored tmux session, each typing `tmux attach -t =<name>` (AppleScript via `osascript`; `--no-iterm` skips, `--dry-run` prints the script) |
 
@@ -327,8 +327,8 @@ Reconciles **only** `~/opt/agent-resume/data/indexes/*.json` between the local m
 1. If a remote is configured (R6.4): opportunistic rate-limited pull (trigger 1), then a one-line `⚠` warning if the last successful sync is missing or older than `sync_stale_warning_hours` (default 24).
 2. **Refresh** (`refresh_index`): the dates of all transcripts, index entries and lifecycles first (~50 ms for 3,111 transcripts, measured 2026-11-07 on the Mac), then re-index only the changed ones (2 changed: 15 ms). Silent; a failure leaves the index as it was. `--uuid` refreshes the same way before looking up the UUID.
 3. Search (R3), then `fzf` with the matches; the user picks one.
-4. If the working directory exists on this machine: exec `cd <dir> && claude [--dangerously-skip-permissions] --resume <uuid>` (Claude) or `cd <dir> && codex resume <uuid>` (Codex) - **true resume**.
-5. If not (e.g. a session synced from another machine): print that true resume is not possible and to run `/inject-session <uuid>` inside Claude Code or Codex.
+4. If the transcript is on this machine: exec `cd <dir> && claude [--dangerously-skip-permissions] --resume <uuid>` (Claude) or `cd <dir> && codex resume <uuid>` (Codex) - **true resume**; `<dir>` = the last folder it ran in, or the current folder when that one no longer exists (D1).
+5. If not (a session synced from another machine): print that true resume is not possible and to run `/inject-session <uuid>` inside Claude Code or Codex.
 
 ### R6.6: `/inject-session`
 
@@ -412,21 +412,13 @@ respectively.
 
 ---
 
-## D1: Why `claude --resume` requires the original working directory
+## D1: The resume folder (was: why `claude --resume` required the original working directory)
 
-Claude Code stores session `.jsonl` files in a folder whose name is a slug derived from the absolute path of the working directory at session start:
+Claude Code stores a session's `.jsonl` in a folder named after the absolute path of the folder it started in (`/home/jeanlescut/some-project/` → `~/.claude/projects/-home-jeanlescut-some-project/`). Until 2026, `claude --resume <uuid>` looked only in the folder of the **current** directory, so ares decoded the slug back to a path (D4) and always ran `cd <that folder> && claude --resume <uuid>`.
 
-```
-/home/jeanlescut/some-project/  -->  ~/.claude/projects/-home-jeanlescut-some-project/
-```
+Since then, `claude --resume <uuid>` finds the transcript from any folder: first the current project and its worktrees, then every other project on the machine, when exactly one holds that UUID (Claude Code's docs, "Resume by session ID or name"). No changelog line: still refused in v2.1.140 (issue #58591, May 2026), working in v2.1.323, the oldest version checked here; tested on 2026-11-20 with v2.1.329, `-p` and interactive. The transcript stays in its first project folder; the new turns record the new `cwd`. `codex resume <uuid>` always worked from anywhere.
 
-When `claude --resume <uuid>` is invoked, it looks for `<uuid>.jsonl` only inside the project folder matching the **current** working directory. A session started in `folderA` cannot be resumed from `folderB`, even on the same machine. The resume command must always be prefixed with a `cd`:
-
-```bash
-cd /original/working/directory && claude --dangerously-skip-permissions --resume <uuid>
-```
-
-This is why `asm resume` reads the original working directory from the index (stored explicitly) and always emits a `cd` prefix.
+So `resume_dir` (one function for both agents) picks **the last folder the session ran in** (the user, 2026-11-20): agent-tracker's newest start line, else the transcript's first `cwd`; the current folder when that one no longer exists. The slug decoding (`decode_slug_to_path`, `resolve_working_dir`) was removed on 2026-11-20.
 
 ---
 
@@ -544,6 +536,8 @@ that ever crosses the machine boundary, and it moves only index-file *contents* 
 
 ## D4: Why slug decoding is unreliable and paths must be stored explicitly
 
+(History: since 2026-11-20 nothing decodes a slug, D1.)
+
 The project folder slug encodes `/` as `-`. Decoding reverses this: prepend `/` and replace `-` with `/`. This is ambiguous: a directory named `my-project` contains a `-` that is indistinguishable from a path separator in the slug. For example:
 
 ```
@@ -565,4 +559,4 @@ The clean separation is:
 - `asm resume` (outside Claude) handles **true resume** via `cd <dir> && claude --dangerously-skip-permissions --resume <uuid>`
 - `/inject-session` (inside Claude) handles **context injection** when true resume is not possible
 
-When `asm resume` detects that the original working directory does not exist on the current machine, it prints the UUID and instructs the user to open Claude and run `/inject-session <uuid>`.
+When `ares resume` finds that the session's transcript is not on this machine, it prints the UUID and instructs the user to open Claude and run `/inject-session <uuid>`.

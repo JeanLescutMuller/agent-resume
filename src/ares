@@ -1022,143 +1022,20 @@ def run_fzf(sessions: List[Tuple[Dict[str, Any], str]], keywords: Optional[List[
         return None, None
 
 
-# -- Slug Decoding ---------------------------------------------------------
+# -- Resume folder -------------------------------------------------------------
+# `claude --resume <uuid>` finds the transcript from any folder (Claude Code's docs, "Resume by session ID or name";
+# no changelog line, between v2.1.140 and v2.1.323; tested 2026-11-20 on v2.1.329), and `codex resume` always did.
+# So a session no longer has to resume in the folder of its transcript's project slug (decoded from the slug until
+# 2026-11-20): it resumes in the last folder it ran in (the user, 2026-11-20).
 
-def decode_slug_to_path(slug: str, verbose: bool = False) -> Optional[str]:
-    """Decode a project folder slug back to a filesystem path.
-
-    Claude Code encodes paths by replacing /, _, and . with -.
-    Since this is lossy, we probe the filesystem to resolve ambiguity:
-    at each - in the slug, try /, _, ., and literal -, checking which
-    path components actually exist as directories on disk.
-
-    Returns the decoded path if a valid directory is found, else None.
-    """
-    if not slug or slug[0] != '-':
-        return None
-
-    raw = slug[1:]  # strip leading - (represents /)
-    if not raw:
-        return "/"
-
-    dir_cache: Dict[str, bool] = {}
-    children_cache: Dict[str, List[str]] = {}
-
-    def isdir(p: str) -> bool:
-        if p not in dir_cache:
-            dir_cache[p] = os.path.isdir(p)
-        return dir_cache[p]
-
-    def get_children(d: str) -> List[str]:
-        if d not in children_cache:
-            try:
-                children_cache[d] = os.listdir(d)
-            except OSError:
-                children_cache[d] = []
-        return children_cache[d]
-
-    def recurse(pos: int, current_path: str, component: str) -> Optional[str]:
-        if pos >= len(raw):
-            if component:
-                full = os.path.join(current_path, component)
-                return full if isdir(full) else None
-            return current_path if isdir(current_path) else None
-
-        ch = raw[pos]
-
-        if ch != '-':
-            return recurse(pos + 1, current_path, component + ch)
-
-        # ch is '-': was originally /, _, ., or literal -
-        if component:
-            # Prune: if no entry in current_path starts with component, stop
-            if not any(c.startswith(component) for c in get_children(current_path)):
-                return None
-
-            # Try / first (most common): end component, descend into directory
-            candidate = os.path.join(current_path, component)
-            if isdir(candidate):
-                result = recurse(pos + 1, candidate, "")
-                if result:
-                    return result
-
-            # Then _, then ., then a literal - kept as part of the component
-            for suffix in ("_", ".", "-"):
-                result = recurse(pos + 1, current_path, component + suffix)
-                if result:
-                    return result
-        else:
-            # Right after a / (no component yet)
-            # Could be start of a dotfile (e.g., /.config encoded as --config)
-            for prefix in (".", "_", "-"):
-                result = recurse(pos + 1, current_path, prefix)
-                if result:
-                    return result
-
-        return None
-
-    result = recurse(0, "/", "")
-    log_verbose(f"decode_slug_to_path({slug!r}) -> {result!r}", verbose)
-    return result
-
-
-# -- Working Directory Resolution -------------------------------------------
-
-def resolve_working_dir(slug: str, verbose: bool = False) -> Optional[str]:
-    """Resolve a session's slug to the local working directory for resume.
-
-    Claude --resume requires cd-ing into the directory whose encoded slug
-    matches the folder where the .jsonl lives. This function decodes the
-    slug back to a filesystem path by probing the filesystem.
-
-    For cross-machine resume, it also checks alias slugs in ~/.claude/projects/
-    that resolve to the same real directory (via symlinks).
-    """
-    log_verbose("=== WORKING DIR RESOLUTION ===", verbose)
-    log_verbose(f"slug: {slug}", verbose)
-
-    # 1. Try to decode the slug directly (same-machine case)
-    path = decode_slug_to_path(slug, verbose)
-    if path and os.path.isdir(path):
-        log_verbose(f"Direct decode succeeded: {path}", verbose)
-        return path
-
-    # 2. If direct decode failed, try alias slugs that resolve to the same dir
-    slug_path = os.path.join(PROJECTS_DIR, slug)
-    if not os.path.exists(slug_path):
-        log_verbose(f"Slug folder does not exist in projects: {slug_path}", verbose)
-        return None
-
-    target_real = os.path.realpath(slug_path)
-    log_verbose(f"Slug realpath: {target_real}", verbose)
-    log_verbose(f"Scanning alias slugs in {PROJECTS_DIR}", verbose)
-
-    for name in sorted(os.listdir(PROJECTS_DIR)):
-        if name == slug:
-            continue
-        entry = os.path.join(PROJECTS_DIR, name)
-        if not os.path.exists(entry) or os.path.realpath(entry) != target_real:
-            continue
-
-        log_verbose(f"  Alias slug {name} resolves to same dir", verbose)
-        path = decode_slug_to_path(name, verbose)
-        if path and os.path.isdir(path):
-            log_verbose(f"  Alias decode succeeded: {path}", verbose)
-            return path
-
-    log_verbose("No valid working dir found", verbose)
-    log_verbose("=== END WORKING DIR RESOLUTION ===", verbose)
-    return None
+def resume_dir(doc: Dict[str, Any]) -> str:
+    """The folder a session resumes in: the last one it ran in (agent-tracker's newest start, else the transcript's
+    first cwd) when it still exists, else the current folder."""
+    wd = doc.get("latest_working_dir") or doc.get("initial_working_dir")
+    return wd if wd and os.path.isdir(wd) else os.getcwd()
 
 
 # -- Claude backend adapters --------------------------------------------------
-# Thin doc-shaped wrappers around the two functions above, so they fit the
-# Backend interface (see "Agent backends" below) without changing their own
-# slug-based signatures, which nothing else needs to know about.
-
-def _claude_resolve_working_dir(doc: Dict[str, Any], verbose: bool = False) -> Optional[str]:
-    return resolve_working_dir(doc.get("slug", ""), verbose)
-
 
 def _claude_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"],
                        working_dir: str, uuid: str, fork: bool) -> str:
@@ -1182,12 +1059,6 @@ def _claude_uuid_of(jsonl_path: str) -> str:
 
 
 # -- Codex backend adapters ---------------------------------------------------
-
-def _codex_resolve_working_dir(doc: Dict[str, Any], verbose: bool = False) -> Optional[str]:
-    """Codex records an absolute cwd directly in the transcript (build_doc
-    already copies it into these fields) - no slug-decoding needed."""
-    return doc.get("latest_working_dir") or doc.get("initial_working_dir")
-
 
 def _codex_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"],
                       working_dir: str, uuid: str, fork: bool) -> str:
@@ -1275,7 +1146,6 @@ class Backend(NamedTuple):
     name: str
     scan: Callable[[], Dict[str, float]]                                  # () -> {jsonl_path: mtime}
     parse: Callable[..., "Transcript"]                                    # (jsonl_path, warn=...) -> Transcript
-    resolve_working_dir: Callable[[Dict[str, Any], bool], Optional[str]]  # (doc, verbose) -> path
     resume_cmd: Callable[[Dict[str, Any], Optional["Transcript"], str, str, bool], str]
     uuid_of: Callable[[str], str]                                        # jsonl_path -> uuid
 
@@ -1323,7 +1193,6 @@ BACKENDS: Dict[str, Backend] = {
         name="claude",
         scan=scan_history_jsonl,
         parse=read_transcript,
-        resolve_working_dir=_claude_resolve_working_dir,
         resume_cmd=_claude_resume_cmd,
         uuid_of=_claude_uuid_of,
     ),
@@ -1334,7 +1203,6 @@ if CODEX_ENABLED:
         name="codex",
         scan=scan_codex_sessions,
         parse=read_codex_transcript,
-        resolve_working_dir=_codex_resolve_working_dir,
         resume_cmd=_codex_resume_cmd,
         uuid_of=_codex_uuid_of,
     )
@@ -1605,7 +1473,6 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
         sys.exit(0)
 
     backend = BACKENDS.get(doc.get("agent_type") or "claude", BACKENDS["claude"])
-    slug = doc.get("slug", "")
     initial_wd = doc.get("initial_working_dir", "")
     latest_wd = doc.get("latest_working_dir", "")
 
@@ -1616,7 +1483,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
     perm_mode = transcript.permission_mode if transcript else None
     title = (transcript.title if transcript else None) or doc.get("custom_title", "")
 
-    working_dir = backend.resolve_working_dir(doc, opts.verbose)
+    working_dir = resume_dir(doc)
 
     if not print_cmd:
         # -- Session info (same format used by /info skill) --
@@ -1627,21 +1494,9 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
         print(f"Latest WD:          {latest_wd or initial_wd}")
         print(f"JSONL file:         {jsonl_path or '(unknown)'}")
         print(f"Permission mode:    {perm_mode or '(unknown)'}")
-        print(f"Selected local dir: {working_dir or '(none)'}")
-
-    if not (working_dir and os.path.isdir(working_dir)):
-        if print_cmd:
-            print(f"ERROR: no accessible working directory for session {uuid}.", file=sys.stderr)
-            sys.exit(1)
-        print("Command:            (cannot resume, directory not found)")
-        print("")
-        print(f"\033[33mWARNING: no accessible directory found for slug: {slug}\033[0m")
-        print(f"  Original dir: {initial_wd}")
-        print("")
-        print("True resume is not possible from here.")
-        print(f"Open Claude and run: /inject-session {uuid}")
-        print("")
-        return
+        print(f"Selected local dir: {working_dir}")
+        if working_dir != (latest_wd or initial_wd or working_dir):
+            print("\033[33mThe folder it last ran in no longer exists here: resuming in the current folder.\033[0m")
 
     cmd = backend.resume_cmd(doc, transcript, working_dir, uuid, fork)
 
@@ -1907,14 +1762,9 @@ def _pane_dir(p: Optional[Dict[str, Any]]) -> str:
 
 
 def _tmux_resume_cmd(uuid: str, seen: Dict[str, Any], start: Dict[str, Any]) -> str:
-    """`cd <dir> && claude --resume <uuid>`, in the folder `claude --resume` needs.
-
-    That folder is the one of the transcript's project slug (the folder the session started in);
-    it is decoded like `ares resume` does, else agent-tracker's start cwd, else the last cwd, else ~.
-    """
-    transcript = seen.get("transcript") or ""
-    slug = Path(os.path.expanduser(transcript)).parent.name if transcript else ""
-    wd = (resolve_working_dir(slug) if slug else None) or start.get("cwd") or seen.get("cwd")
+    """`cd <dir> && claude --resume <uuid>`, in the last folder the session ran in (as `ares resume`):
+    agent-tracker's start cwd of that run, else its last seen cwd, else ~ (any folder works: resume_dir)."""
+    wd = start.get("cwd") or seen.get("cwd")
     if not (wd and os.path.isdir(wd)):
         wd = HOME
     return f"cd {shlex.quote(wd)} && claude --resume {shlex.quote(uuid)}"

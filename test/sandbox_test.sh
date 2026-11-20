@@ -188,6 +188,17 @@ check "the changed transcript is re-indexed before the search" grep -q zebracorn
 check "a lifecycle-only change is re-indexed too (I now exited)" test "$(field "$UI" session_state)" = exited
 check "an unchanged session is not re-indexed" test "$(stat -f %m "$IDX/$UH.json")" = "$before_h"
 check "--print-cmd builds cd <project> && claude --resume" grep -q "claude --resume $UA" "$S/printcmd.out"
+# the resume folder (2026-11-20): the last folder the session ran in; gone -> the current folder (claude --resume
+# finds the transcript from any folder)
+mkdir -p "$S/moved" "$S/here"; cp "$AGENT_TRACKER_HOME/data/sessions/$UA/lifecycle.jsonl" "$S/lifecycle_A.saved"; sleep 1
+echo "{\"ts\": 5, \"event\": \"start\", \"pid\": 7, \"boot_ts\": 1, \"cwd\": \"$S/moved\"}" >> "$AGENT_TRACKER_HOME/data/sessions/$UA/lifecycle.jsonl"
+check "--print-cmd resumes in the last folder it ran in" \
+    bash -c "ares resume --uuid '$UA' --print-cmd 2>>'$LOG' | grep -q \"^cd $S/moved && claude --resume $UA\""
+sleep 1
+echo "{\"ts\": 6, \"event\": \"start\", \"pid\": 8, \"boot_ts\": 1, \"cwd\": \"$S/gone\"}" >> "$AGENT_TRACKER_HOME/data/sessions/$UA/lifecycle.jsonl"
+check "--print-cmd resumes in the current folder when that folder is gone" \
+    bash -c "cd '$S/here' && ares resume --uuid '$UA' --print-cmd 2>>'$LOG' | grep -q \"^cd $S/here && claude --resume $UA\""
+cp "$S/lifecycle_A.saved" "$AGENT_TRACKER_HOME/data/sessions/$UA/lifecycle.jsonl"   # A back as it was, for ares tmux below
 ares close --uuid x > "$S/close.out" 2>&1; rc=$?
 check "ares close prints the one-line pointer to claude-close-keep-screen, exit 1" \
     bash -c "[ $rc -eq 1 ] && [ \$(wc -l < '$S/close.out') -eq 1 ] && grep -q claude-close-keep-screen '$S/close.out'"
