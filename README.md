@@ -244,3 +244,7 @@ This must be set on each machine independently. (Codex CLI's own session-retenti
 ## Several Claude accounts (2026-11-19)
 
 `claude` is my-setup's account selector on every machine (`~/.local/bin/claude`, since 2026-11-20), so `ares resume` and `ares tmux` just run `claude --resume <uuid>`: the selector appears before the session opens, preselecting the session's last account. Over ssh, `ares resume` puts `~/.local/bin` on the remote `PATH` first (a non-interactive ssh shell may not have it).
+
+## See also: several Claude accounts
+
+Several Claude accounts on one machine: the overview (why, designs, how to use it, every piece and where it lives) is `/Users/jeanlescut/dev/my-setup/doc/claude_accounts.html`.
