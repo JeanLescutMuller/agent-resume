@@ -25,10 +25,13 @@ import os
 import re
 import json
 import glob
+import io
 import unicodedata
 import argparse
 import subprocess
 import shlex
+import shutil
+import tarfile
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -89,10 +92,14 @@ LOCAL_INDEX_DIR = os.path.expanduser(_SETTINGS["local_index_dir"])
 HIDDEN_INDEX_DIR = os.path.join(LOCAL_INDEX_DIR, "hidden")
 IGNORE_PATH_SUBSTRINGS: List[str] = _SETTINGS.get("ignore_path_substrings", [])
 REMOTE_HOSTS: List[str] = _SETTINGS.get("remote_hosts", [])
-# remote/<ssh host>/<uuid>.json: read-only copies of each remote host's index, refreshed by pull_remotes
+# remote/<ssh host>/<uuid>.json: read-only copies of each remote host's index, refreshed by _pull_one
 REMOTE_INDEX_DIR = os.path.join(ARES_DATA_DIR, "remote")
 SSH_OPTS = ["-o", "ConnectTimeout=3", "-o", "BatchMode=yes"]
-PULL_TIMEOUT_S = 15   # per host, both steps; a reindex there takes ~0.4 s (VM and NAS, 2026-11-20)
+PULL_TIMEOUT_S = 15   # per host; a reindex there takes ~0.4 s (VM and NAS, 2026-11-20)
+# One ssh call per host: refresh its index there, then send it back as a .tar.gz (its hidden/ entries left out).
+# Not rsync: the Mac's /usr/bin/rsync (openrsync) gets "invalid path" from the NAS's rsync 3.4.1 (2026-11-20).
+PULL_REMOTE_CMD = ("~/opt/agent-resume/bin/ares reindex >/dev/null 2>&1; "
+                   "cd ~/opt/agent-resume/data/indexes && tar czf - --exclude=./hidden --exclude='*.tmp' .")
 
 CODEX_SESSIONS_DIR = os.path.expanduser(_SETTINGS["codex_sessions_dir"])
 CODEX_SESSION_INDEX_FILE = os.path.expanduser(_SETTINGS["codex_session_index_file"])
@@ -1368,22 +1375,35 @@ def cmd_reindex(max_sessions: int = 0, force: bool = False, single_uuid: str = "
 
 
 # -- Other machines ------------------------------------------------------------
-# Since 2026-11-20 (the user): no sync. Each search refreshes every remote host's own index there, copies it here
-# one way (remote/<host>/), and a session of another machine resumes there, over ssh (resume_shell_cmd). Transcripts
+# Since 2026-11-20 (the user): no sync. Each search refreshes every remote host's own index there and copies it here
+# one way (remote/<host>/), over one ssh call; a session of another machine resumes there, over ssh (resume_shell_cmd). Transcripts
 # never move: a project is worked on in its home machine only.
 
 def _pull_one(host: str) -> bool:
-    """Refresh the index on host (`ares reindex` there), then copy it into remote/<host>/. True if the copy worked."""
-    dest = os.path.join(REMOTE_INDEX_DIR, host)
-    Path(dest).mkdir(parents=True, exist_ok=True)
+    """Refresh the index on host and copy it into remote/<host>/ (replaced whole: a session gone there goes here
+    too). True if the copy worked; on any failure the last copy stays."""
     try:
-        subprocess.run(["ssh", *SSH_OPTS, host, "~/opt/agent-resume/bin/ares reindex >/dev/null 2>&1"],
-                       timeout=PULL_TIMEOUT_S, capture_output=True, stdin=subprocess.DEVNULL)
-        return subprocess.run(["rsync", "-a", "--delete", "--exclude", "hidden/", "--exclude", "*.tmp",
-                               "-e", shlex.join(["ssh", *SSH_OPTS]), f"{host}:opt/agent-resume/data/indexes/",
-                               dest + "/"],
-                              timeout=PULL_TIMEOUT_S, capture_output=True, stdin=subprocess.DEVNULL).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
+        res = subprocess.run(["ssh", *SSH_OPTS, host, PULL_REMOTE_CMD], timeout=PULL_TIMEOUT_S,
+                             capture_output=True, stdin=subprocess.DEVNULL)
+        if res.returncode != 0:
+            return False
+        dest = os.path.join(REMOTE_INDEX_DIR, host)
+        new, old = dest + ".new", dest + ".old"
+        for d in (new, old):
+            shutil.rmtree(d, ignore_errors=True)   # a leftover of an interrupted pull
+        os.makedirs(new)
+        with tarfile.open(fileobj=io.BytesIO(res.stdout), mode="r:gz") as tf:
+            for ti in tf:   # only flat <uuid>.json files: nothing in the archive can write elsewhere
+                name = os.path.basename(ti.name)
+                if ti.isfile() and ti.name in (name, "./" + name) and name.endswith(".json"):
+                    with open(os.path.join(new, name), "wb") as f:
+                        f.write(tf.extractfile(ti).read())
+        if os.path.isdir(dest):
+            os.replace(dest, old)
+        os.replace(new, dest)
+        shutil.rmtree(old, ignore_errors=True)
+        return True
+    except (OSError, subprocess.TimeoutExpired, tarfile.TarError):
         return False
 
 

@@ -9,7 +9,7 @@ flowchart LR
   R["ares"] --> RS["ares resume<br/>(refresh changed entries, search, resume)"]
   R --> RT["ares tmux<br/>(after a crash)"]
   R --> X["index<br/>~/opt/agent-resume/data/indexes/"]
-  RS -->|ssh: reindex there, rsync its index here| V["other machines<br/>(remote_hosts: VM, NAS)"]
+  RS -->|ssh: reindex there, its index sent back| V["other machines<br/>(remote_hosts: VM, NAS)"]
 ```
 
 ## What Claude Code / Codex Provide Natively
@@ -36,7 +36,7 @@ ares indexes **all** local sessions across **all** project directories into a si
 
 List the other machines in `remote_hosts` (`~/opt/agent-resume/data/settings.json`, their ssh names, e.g. `["H-Frank-1", "babisnas"]`). Then each `ares resume`, at the same time as it refreshes this machine's index:
 
-- runs `ares reindex` on each of them over ssh (~0.4 s), then copies its index here with `rsync`, one way, into `~/opt/agent-resume/data/remote/<host>/` (read-only copies; their non-interactive entries left out);
+- runs `ares reindex` on each of them over ssh (~0.4 s), then sends its index back (a `.tar.gz`, in the same ssh call), one way, into `~/opt/agent-resume/data/remote/<host>/` (read-only copies; their non-interactive entries left out);
 - searches them with this machine's sessions, in one picker;
 - resumes a session of another machine **there**: `ssh -t <host> 'cd <last folder> && claude --resume <uuid>'`. Transcripts never move: a project is worked on in its home machine only.
 
@@ -106,7 +106,7 @@ The JSON index stores structured metadata for every session: conversation messag
  agent-tracker's lifecycle.jsonl                                        │
         │ refresh (only what changed)                     ssh: ares reindex there
         ▼                                                               ▼
- data/indexes/*.json  ◄──── one picker ────►  data/remote/<host>/*.json  ◄── rsync (one way, at each search)
+ data/indexes/*.json  ◄──── one picker ────►  data/remote/<host>/*.json  ◄── ssh: its index as .tar.gz (one way, each search)
         │                     (fzf)                                     │
         ▼                                                               ▼
  cd <last folder> && claude --resume <uuid>          ssh -t <host> 'cd <last folder> && claude --resume <uuid>'
@@ -195,7 +195,7 @@ git clone <repo-url> agent-resume
 bash agent-resume/install.sh
 ```
 
-Requires `fzf` and `python3`, and agent-tracker for the session state, the duplicate warning and `ares tmux`; `ssh` and `rsync` for the `remote_hosts`. `install.sh` is idempotent, and self-migrating: it removes what the version before 2026-11-20 installed (the 30-min job, the SessionEnd hook, `ares-sync`, the skill `inject-session`). `uninstall.sh` removes everything but `~/opt/agent-resume/data/`. On the VM and the NAS: `bash tools/deploy_remote.sh` from the Mac's checkout (a git bundle over ssh, no GitHub needed).
+Requires `fzf` and `python3`, and agent-tracker for the session state, the duplicate warning and `ares tmux`; `ssh` (and `tar` there) for the `remote_hosts`. `install.sh` is idempotent, and self-migrating: it removes what the version before 2026-11-20 installed (the 30-min job, the SessionEnd hook, `ares-sync`, the skill `inject-session`). `uninstall.sh` removes everything but `~/opt/agent-resume/data/`. On the VM and the NAS: `bash tools/deploy_remote.sh` from the Mac's checkout (a git bundle over ssh, no GitHub needed).
 
 | Artifact | Destination |
 |---|---|

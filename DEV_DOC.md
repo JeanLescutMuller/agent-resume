@@ -295,7 +295,7 @@ Removed on 2026-11-20: the "Cross-machine resume" and "Working directory changed
 Since 2026-11-20 (the user), replacing `ares-sync` (an index-only, hub-and-spoke sync over ssh with a 30-min job, configured on no machine):
 
 - `remote_hosts` (settings): the ssh names of the other machines (the Mac: `["H-Frank-1", "babisnas"]`; empty on the VM and the NAS, which cannot reach the Mac).
-- At each `ares resume`, at the same time as the local refresh, and in parallel for every host (`refresh_all`, `_pull_one`): `ssh <host> '~/opt/agent-resume/bin/ares reindex'` (~0.4 s, VM and NAS, 2026-11-20), then `rsync -a --delete --exclude hidden/ <host>:opt/agent-resume/data/indexes/ data/remote/<host>/`: a one-way, read-only copy. `ConnectTimeout=3`, `BatchMode=yes`, 15 s per step. A failure leaves the last copy and prints `⚠ <host> unreachable`.
+- At each `ares resume`, at the same time as the local refresh, and in parallel for every host (`refresh_all`, `_pull_one`): one `ssh <host>` that runs `~/opt/agent-resume/bin/ares reindex` there (~0.4 s, VM and NAS, 2026-11-20) and sends back its `indexes/` as a `.tar.gz` (`hidden/` left out); it replaces `data/remote/<host>/` whole (a session gone there goes here too): a one-way, read-only copy. Not rsync: the Mac's `/usr/bin/rsync` (openrsync) gets "invalid path" from the NAS's rsync 3.4.1. `ConnectTimeout=3`, `BatchMode=yes`, 15 s per host. A failure leaves the last copy and prints `⚠ <host> unreachable`.
 - Search reads `data/indexes/` and every `data/remote/<host>/` (`index_dirs`); each doc is tagged `_host` (None: this machine).
 - A session of another machine resumes there (`resume_shell_cmd`): `ssh -t <host> 'PATH="$HOME/.local/bin:$PATH"; cd <last folder> 2>/dev/null || cd; claude [--dangerously-skip-permissions] --resume <uuid> ...'`. The permission mode comes from the index (`permission_mode`, since 2026-11-20). Transcripts never move between machines: a project is worked on in its home machine only.
 
@@ -342,7 +342,7 @@ Codex (if detected: `codex_enabled`, or `~/.codex/sessions` exists, and `codex` 
 | File | Written by |
 |---|---|
 | `~/opt/agent-resume/data/indexes/<uuid>.json` (and `hidden/`: sessions nobody typed in) | `ares reindex`, `ares resume` (refresh) |
-| `~/opt/agent-resume/data/remote/<host>/<uuid>.json` | `ares resume`: rsync of that host's `indexes/` (read-only copies) |
+| `~/opt/agent-resume/data/remote/<host>/<uuid>.json` | `ares resume`: that host's `indexes/`, sent as a `.tar.gz` over ssh (read-only copies) |
 | `~/opt/agent-resume/data/settings.json` | user-edited / created by `install.sh` |
 | `~/opt/agent-tracker/data/sessions/<uuid>/{lifecycle.jsonl,last_seen.json}` | agent-tracker (read only here) |
 

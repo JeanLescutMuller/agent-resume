@@ -40,7 +40,7 @@ cat > "$S/fakebin/claude" <<'EOF'
 echo "claude|$TMUX_PANE|$PWD|$*" >> "$FAKE_LOG"
 exec sleep 600
 EOF
-for tool in launchctl systemctl loginctl ssh osascript rsync; do
+for tool in launchctl systemctl loginctl ssh osascript; do
     printf '#!/bin/bash\necho "%s|$*" >> "$FAKE_LOG"\nexit 1\n' "$tool" > "$S/fakebin/$tool"
 done
 printf '#!/bin/bash\necho "codex|$CODEX_HOME|$*" >> "$FAKE_LOG"\n' > "$S/fakebin/codex"
@@ -275,16 +275,18 @@ check "the Codex plugin's SessionStart command runs the same hook (DUPLICATE SES
 kill "$SLEEP_PID"; wait "$SLEEP_PID" 2>/dev/null
 
 section "other machines (remote_hosts): their index pulled, searched, resumed there over ssh"
-# A fake rsync copies $FAKE_REMOTE/*.json to its last argument (the destination), or fails when $FAKE_RSYNC_FAIL is set;
-# the fake ssh fails (the reindex there is skipped, as when it is unreachable: the copy still decides).
-cat > "$S/fakebin/rsync" <<'EOF'
+# A fake ssh answers the pull (its command holds "tar czf") with a .tar.gz of $FAKE_REMOTE, made with the same
+# excludes, or fails when $FAKE_SSH_FAIL is set (unreachable). Any other ssh call: logged, fails (as before).
+cat > "$S/fakebin/ssh" <<'EOF'
 #!/bin/bash
-echo "rsync|$*" >> "$FAKE_LOG"
-[ -n "${FAKE_RSYNC_FAIL:-}" ] && exit 255
-cp "$FAKE_REMOTE"/*.json "${@: -1}"
+echo "ssh|$*" >> "$FAKE_LOG"
+[[ "$*" == *"tar czf"* && -z "${FAKE_SSH_FAIL:-}" ]] || exit 255
+cd "$FAKE_REMOTE" && tar czf - --exclude=./hidden --exclude='*.tmp' .
 EOF
-chmod +x "$S/fakebin/rsync"
-export FAKE_REMOTE="$S/remote-index"; mkdir -p "$FAKE_REMOTE"
+chmod +x "$S/fakebin/ssh"
+export FAKE_REMOTE="$S/remote-index"; mkdir -p "$FAKE_REMOTE/hidden"
+echo '{"session_id": "hidden-there"}' > "$FAKE_REMOTE/hidden/hidden-there.json"
+echo '{"session_id": "bbbbbbbb-0000-4000-8000-0000000000b2"}' > "$FAKE_REMOTE/bbbbbbbb-0000-4000-8000-0000000000b2.json"
 UR=bbbbbbbb-0000-4000-8000-0000000000b1
 python3 - "$FAKE_REMOTE" "$UR" <<'EOF'
 import json, os, sys
@@ -299,13 +301,16 @@ json.dump({"session_id": sys.argv[2], "custom_title": "On the NAS", "title_sourc
 EOF
 python3 -c "import json; p='$NEW/data/settings.json'; d=json.load(open(p)); d['remote_hosts']=['fakehost']; json.dump(d, open(p, 'w'))"
 ares resume --uuid "$UR" --print-cmd > "$S/remote.out" 2>>"$LOG"; rc=$?
-check "the pull asks fakehost to reindex, then copies its index (hidden/ left out)" \
-    bash -c "grep -q '^ssh|.* fakehost .*ares reindex' '$FAKE_LOG' && grep -q '^rsync|.*--exclude hidden/ .*fakehost:opt/agent-resume/data/indexes/ $NEW/data/remote/fakehost/' '$FAKE_LOG'"
+check "the pull: one ssh to fakehost (reindex there, then its index as a .tar.gz), hidden/ left out" \
+    bash -c "grep -q '^ssh|.* fakehost .*ares reindex.*tar czf' '$FAKE_LOG' && [ -f '$NEW/data/remote/fakehost/bbbbbbbb-0000-4000-8000-0000000000b2.json' ] && [ ! -e '$NEW/data/remote/fakehost/hidden' ] && [ ! -e '$NEW/data/remote/fakehost/hidden-there.json' ]"
 check "its session is found by uuid, from the copy in data/remote/fakehost/" bash -c "[ $rc -eq 0 ] && [ -f '$NEW/data/remote/fakehost/$UR.json' ]"
 check "it resumes there: ssh -t fakehost, its folder (else ~), its permission mode and title" \
     grep -qF "ssh -t fakehost 'PATH=\"\$HOME/.local/bin:\$PATH\"; cd /home/x/proj 2>/dev/null || cd; claude --dangerously-skip-permissions --resume $UR '\"'\"'/rename On the NAS'\"'\"''" "$S/remote.out"
 check "a search finds it among this machine's sessions" bash -c "python3 '$S/search.py' zorblaxword 90 | grep -q b1"
-FAKE_RSYNC_FAIL=1 ares resume --uuid "$UR" --print-cmd > "$S/remote2.out" 2>"$S/remote2.err"
+rm "$FAKE_REMOTE/bbbbbbbb-0000-4000-8000-0000000000b2.json"
+ares resume --uuid "$UR" --print-cmd >/dev/null 2>>"$LOG"
+check "a session gone there is gone here at the next pull" test ! -e "$NEW/data/remote/fakehost/bbbbbbbb-0000-4000-8000-0000000000b2.json"
+FAKE_SSH_FAIL=1 ares resume --uuid "$UR" --print-cmd > "$S/remote2.out" 2>"$S/remote2.err"
 check "fakehost unreachable: said on stderr, its last copy still used" \
     bash -c "grep -q 'fakehost unreachable' '$S/remote2.err' && grep -q 'ssh -t fakehost' '$S/remote2.out'"
 python3 -c "import json; p='$NEW/data/settings.json'; d=json.load(open(p)); d['remote_hosts']=[]; json.dump(d, open(p, 'w'))"
