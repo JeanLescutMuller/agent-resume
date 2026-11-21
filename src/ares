@@ -1019,8 +1019,11 @@ def run_fzf(sessions: List[Tuple[Dict[str, Any], str]], keywords: Optional[List[
 
 def resume_dir(doc: Dict[str, Any]) -> str:
     """The folder a session resumes in: the last one it ran in (agent-tracker's newest start, else the transcript's
-    first cwd) when it still exists, else the current folder."""
+    first cwd) when it still exists, else the current folder. A session of another machine: that folder as is, else
+    ~ (it is tested there: resume_shell_cmd)."""
     wd = doc.get("latest_working_dir") or doc.get("initial_working_dir")
+    if doc.get("_host"):
+        return wd or "~"
     return wd if wd and os.path.isdir(wd) else os.getcwd()
 
 
@@ -1028,11 +1031,10 @@ def resume_shell_cmd(doc: Dict[str, Any], agent_cmd: str) -> str:
     """The shell command that resumes a session: `cd <resume_dir> && <agent command>` for one of this machine; for
     one of another machine, the same there over `ssh -t` (its own folder test: a gone folder falls back to ~).
     `claude` is my-setup's account selector on every machine (~/.local/bin/claude, 2026-11-20)."""
-    host = doc.get("_host")
+    host, wd = doc.get("_host"), shlex.quote(resume_dir(doc))
     if not host:
-        return f"cd {shlex.quote(resume_dir(doc))} && {agent_cmd}"
-    wd = doc.get("latest_working_dir") or doc.get("initial_working_dir") or "~"
-    remote = f'PATH="$HOME/.local/bin:$PATH"; cd {shlex.quote(wd)} 2>/dev/null || cd; {agent_cmd}'
+        return f"cd {wd} && {agent_cmd}"
+    remote = f'PATH="$HOME/.local/bin:$PATH"; cd {wd} 2>/dev/null || cd; {agent_cmd}'
     return f"ssh -t {shlex.quote(host)} {shlex.quote(remote)}"
 
 
@@ -1392,7 +1394,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
     transcript = backend.parse(jsonl_path, warn=False) if jsonl_path else None
     perm_mode = transcript.permission_mode if transcript else doc.get("permission_mode")
     title = (transcript.title if transcript else None) or doc.get("custom_title", "")
-    working_dir = (latest_wd or initial_wd or "~") if host else resume_dir(doc)
+    working_dir = resume_dir(doc)
     cmd = resume_shell_cmd(doc, backend.resume_cmd(doc, transcript, uuid, fork))
 
     if print_cmd:
@@ -1508,39 +1510,41 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
 
     l_cand = []
     for r in l_rows:
-        start = killed_start(r["events"], lambda b: same_boot(b, prev))   # both modes: see its docstring
-        if not start or not same_boot(start.get("boot_ts"), prev) or (start.get("agent") or "claude") != "claude":
+        # killed_start is of that boot (in_boot), in both modes: see its docstring
+        start = killed_start(r["events"], lambda b: same_boot(b, prev))
+        if not start or (start.get("agent") or "claude") != "claude":
             continue
         if this_boot and pid_alive(start.get("pid")):
             continue   # still running: nothing to restore (after a reboot, a pid is a new process: not checked)
-        r["start"] = start
-        r["seen"] = r["seen"] if same_boot(r["seen"].get("boot_ts"), prev) else {}
+        seen = r["seen"] if same_boot(r["seen"].get("boot_ts"), prev) else {}
+        r["start"], r["seen"] = start, seen
+        r["ts"] = int(seen.get("ts") or start.get("ts") or 0)
+        r["cmd"] = _tmux_resume_cmd(r["uuid"], seen, start)
         l_cand.append(r)
+
+    # One candidate per pane_id: the newest wins (the pane was reused). One in no pane: by hand.
+    d_by_pane: Dict[str, Dict[str, Any]] = {}
+    l_no_pane: List[Dict[str, Any]] = []
+    for r in l_cand:
+        pane_id = r["seen"].get("pane_id") or r["start"].get("pane_id")
+        if not pane_id:
+            l_no_pane.append(r)
+        elif pane_id not in d_by_pane or r["ts"] > d_by_pane[pane_id]["ts"]:
+            d_by_pane[pane_id] = r
 
     if not this_boot:   # --this-boot: the snapshot may already show the tmux server started after the death
         snap = read_snapshot(prev, same_boot)
         if snap:
-            return snapshot_plan(prev, snap, l_cand)
+            return snapshot_plan(prev, snap, d_by_pane, l_no_pane)
 
     # The moment of the crash, roughly: the newest tick among the candidates (this boot also holds live ones).
     newest_ts = max((int(r["seen"]["ts"]) for r in l_cand if r["seen"].get("ts")), default=0)
 
-    d_by_pane: Dict[str, Dict[str, Any]] = {}
-    l_outside: List[Dict[str, Any]] = []
-    for r in l_cand:
-        start, seen = r["start"], r["seen"]
-        r["ts"] = int(seen.get("ts") or start.get("ts") or 0)
-        r["stale"] = not seen.get("ts") or r["ts"] < newest_ts - STALE_AFTER_S
-        r["cmd"] = _tmux_resume_cmd(r["uuid"], seen, start)
-        pane_id = seen.get("pane_id") or start.get("pane_id")
-        if not pane_id:
-            l_outside.append(r)
-        elif pane_id not in d_by_pane or r["ts"] > d_by_pane[pane_id]["ts"]:
-            d_by_pane[pane_id] = r
-
     d_sessions: Dict[str, Dict[int, Dict[str, Any]]] = {}
     l_stale = []
+    l_outside = l_no_pane
     for pane_id, r in sorted(d_by_pane.items(), key=lambda kv: -kv[1]["ts"]):   # newest first
+        r["stale"] = not r["seen"].get("ts") or r["ts"] < newest_ts - STALE_AFTER_S
         if r["stale"] and not include_stale:
             l_stale.append(r)
             continue
@@ -1608,25 +1612,14 @@ def read_snapshot(boot_ts: int, same_boot) -> Optional[Dict[str, Any]]:
     return d if d["panes"] else None
 
 
-def snapshot_plan(prev: int, snap: Dict[str, Any], l_cand: List[Dict[str, Any]]) -> Dict[str, Any]:
+def snapshot_plan(prev: int, snap: Dict[str, Any], d_cand: Dict[str, Dict[str, Any]],
+                  l_no_pane: List[Dict[str, Any]]) -> Dict[str, Any]:
     """tmux_plan from the previous boot's snapshot: every tmux session, window and pane it lists. A pane gets
-    `claude --resume` when a candidate (killed_start in that boot) has its pane_id and the pane's command was not
-    a shell (Claude was still running there); else a shell in its folder. No stale rule. Candidates newer than the
-    snapshot (started after it) are listed as "outside", to resume by hand. Same shape as tmux_plan, plus
-    "iterm": [{"bounds", "tabs": [tmux session]}] front window first, and "snapshot": its path."""
-    d_cand: Dict[str, Dict[str, Any]] = {}
-    l_outside: List[Dict[str, Any]] = []
-    for r in l_cand:
-        start, seen = r["start"], r["seen"]
-        r["ts"] = int(seen.get("ts") or start.get("ts") or 0)
-        r["stale"] = False
-        r["cmd"] = _tmux_resume_cmd(r["uuid"], seen, start)
-        pane_id = seen.get("pane_id") or start.get("pane_id")
-        if pane_id and (pane_id not in d_cand or r["ts"] > d_cand[pane_id]["ts"]):
-            d_cand[pane_id] = r
-        elif not pane_id and r["ts"] > snap["ts"]:
-            l_outside.append(r)
-
+    `claude --resume` when a candidate (killed_start in that boot; d_cand: by pane_id) has its pane_id and the
+    pane's command was not a shell (Claude was still running there); else a shell in its folder. No stale rule.
+    Candidates newer than the snapshot (started after it) are listed as "outside", to resume by hand. Same shape as
+    tmux_plan, plus "iterm": [{"bounds", "tabs": [tmux session]}] front window first, and "snapshot": its path."""
+    l_outside = [r for r in l_no_pane if r["ts"] > snap["ts"]]
     d_sessions: Dict[str, Dict[int, Dict[str, Any]]] = {}
     set_used = set()
     for p in sorted(snap["panes"], key=lambda p: (p["window_index"], p["pane_index"])):
@@ -1635,7 +1628,7 @@ def snapshot_plan(prev: int, snap: Dict[str, Any], l_cand: List[Dict[str, Any]])
         r = d_cand.get(p["pane_id"])
         if r and p["command"] not in SHELLS:
             set_used.add(r["uuid"])
-            w["panes"].append(dict(r, cwd=p["cwd"]))
+            w["panes"].append(dict(r, cwd=p["cwd"], stale=False))
         else:
             w["panes"].append({"cmd": None, "cwd": p["cwd"]})
     for d_windows in d_sessions.values():
