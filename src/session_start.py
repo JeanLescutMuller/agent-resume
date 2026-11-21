@@ -70,22 +70,22 @@ def main() -> None:
     elif not boot:
         boot = next((l.split()[1] for l in open("/proc/stat") if l.startswith("btime ")), None)
 
-    s_ended = set()   # pids that logged an end (after /clear the process lives on and logs a new start)
+    l_ev = []   # (lifecycle line, its pid or 0); a line that is not an object with an integer pid is skipped
     for raw in l_raw:
         try:
             ev = json.loads(raw)
-            if ev.get("event") == "end" and ev.get("pid"):
-                s_ended.add(int(ev["pid"]))
+            l_ev.append((ev, int(ev.get("pid") or 0)))
         except (ValueError, TypeError, AttributeError):
             continue
+    # pids that logged an end (after /clear the process lives on and logs a new start)
+    s_ended = {pid for ev, pid in l_ev if ev.get("event") == "end" and pid}
     l_warn, s_seen = [], set()
-    for raw in l_raw:
-        try:
-            ev = json.loads(raw)
-            pid = int(ev.get("pid") or 0)
-        except (ValueError, TypeError, AttributeError):
-            continue
-        if ev.get("event") != "start" or not pid or pid in s_mine or pid in s_seen or pid in s_ended or pid not in d_proc:
+    for ev, pid in l_ev:
+        if (ev.get("event") != "start" or not pid
+                or pid in s_mine          # this session's own process
+                or pid in s_seen          # already warned about
+                or pid in s_ended         # it ended (or was /clear-ed: no longer this session)
+                or pid not in d_proc):    # no longer running
             continue
         if ev.get("machine") and machine and ev["machine"] != machine:
             continue
