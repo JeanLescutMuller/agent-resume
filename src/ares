@@ -639,14 +639,6 @@ class SearchOpts(NamedTuple):
 
 # -- Session Search ---------------------------------------------------------
 
-def is_source_missing(d_fields: Dict[str, Any]) -> bool:
-    """Check if the source .jsonl file has been deleted from disk."""
-    jsonl_path = d_fields.get("jsonl_path", "")
-    if not jsonl_path:
-        return True
-    return not os.path.exists(_resolve_jsonl_path(jsonl_path))
-
-
 def index_dirs() -> List[Tuple[str, Optional[str]]]:
     """[(folder of index entries, its ssh host or None for this machine)]: this machine's, then each remote copy."""
     return [(LOCAL_INDEX_DIR, None)] + [(os.path.join(REMOTE_INDEX_DIR, h), h) for h in REMOTE_HOSTS]
@@ -659,7 +651,8 @@ def load_index_doc(path: str, host: Optional[str] = None) -> Optional[Dict[str, 
     if doc is None:
         return None
     doc["_host"] = host
-    doc["_source_missing"] = not host and is_source_missing(doc)
+    jsonl_path = doc.get("jsonl_path")   # none, or deleted from disk: the source is missing
+    doc["_source_missing"] = not host and not (jsonl_path and os.path.exists(_resolve_jsonl_path(jsonl_path)))
     return doc
 
 
