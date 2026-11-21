@@ -36,9 +36,8 @@ for event in ("SessionStart", "SessionEnd"):
     l_kept = [g for g in l_all if not any(o in h.get("command", "") for h in g.get("hooks", []) for o in OURS)]
     if len(l_kept) != len(l_all):
         changed = True
-        if l_kept:
-            d_hooks[event] = l_kept
-        else:
+        d_hooks[event] = l_kept
+        if not l_kept:
             d_hooks.pop(event)
 if changed:
     if not d_hooks:
