@@ -36,6 +36,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
@@ -390,24 +391,19 @@ def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
 # mapped onto Transcript.ai_title (Codex has no /rename-equivalent "custom"
 # title source, so custom_title is always None for this backend).
 
-_codex_titles_cache: Optional[Dict[str, str]] = None
-
-
+@lru_cache(maxsize=None)
 def _codex_session_titles() -> Dict[str, str]:
     """uuid -> latest thread_name from ~/.codex/session_index.jsonl.
 
     Cached for the lifetime of the process: the file only grows during a
     reindex run, and re-reading it once per session would be O(sessions^2).
     """
-    global _codex_titles_cache
-    if _codex_titles_cache is None:
-        titles: Dict[str, str] = {}
-        for entry in iter_entries(CODEX_SESSION_INDEX_FILE):
-            sid, name = entry.get("id"), entry.get("thread_name")
-            if sid and name:
-                titles[sid] = name
-        _codex_titles_cache = titles
-    return _codex_titles_cache
+    titles: Dict[str, str] = {}
+    for entry in iter_entries(CODEX_SESSION_INDEX_FILE):
+        sid, name = entry.get("id"), entry.get("thread_name")
+        if sid and name:
+            titles[sid] = name
+    return titles
 
 
 def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
@@ -522,7 +518,8 @@ def open_start(lifecycle_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     return list(d_open.values())[-1] if d_open else None
 
 
-def killed_start(lifecycle_events: List[Dict[str, Any]], in_boot) -> Optional[Dict[str, Any]]:
+def killed_start(lifecycle_events: List[Dict[str, Any]],
+                 in_boot) -> Optional[Dict[str, Any]]:
     """The Claude session's NEWEST start line, when it is of the boot `in_boot` accepts and its process ended
     without a clean exit: no end line of its pid after it (a power cut), or one with reason "other" (what
     Claude Code logs when the tmux server or the terminal dies under it: 2026-11-07 15:30). None otherwise:
@@ -685,8 +682,11 @@ def searchable_text(doc: Dict[str, Any]) -> str:
 
 # The text filters of 'resume': (option, the index fields it is matched against, a missing field's value, the test
 # (field value, option value) -> match), both sides lower-cased. A session passes when one of its fields matches.
+# An index entry's host fields, the best first: where it last ran, where it was born (agent-tracker's start lines),
+# which machine indexed it.
+HOST_FIELDS = ("latest_hostname", "initial_hostname", "index_hostname")
 FIELD_FILTERS = (
-    ("host", ("initial_hostname", "latest_hostname", "index_hostname"), "", str.__contains__),   # part of the name
+    ("host", HOST_FIELDS, "", str.__contains__),                                                  # part of the name
     ("agent", ("agent_type",), "claude", str.__eq__),                                              # the whole name
     ("tmux", ("tmux_session",), "", str.__contains__),                                             # part of the name
 )
@@ -761,17 +761,16 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
 
     l_kw = [fold(kw) for kw in opts.keywords]
 
-    def matches(text: str, fuzzy: bool = False) -> bool:
-        return all((kw[:3] if fuzzy else kw) in text for kw in l_kw)
-
-    fuzzy = False
-    sessions = [(doc, path) for doc, path, text in candidates
-                if not opts.keywords or matches(text)]
-
-    if not sessions and opts.keywords:
-        fuzzy = True
-        log_verbose("PHASE 4: Trying fuzzy match...", verbose)
-        sessions = [(doc, path) for doc, path, text in candidates if matches(text, fuzzy=True)]
+    # Two passes: every keyword as a substring, then (none found) only their first 3 characters.
+    # Without keywords, the first pass keeps every candidate.
+    for fuzzy in (False, True):
+        if fuzzy:
+            log_verbose("PHASE 4: Trying fuzzy match...", verbose)
+        l_kw_pass = [kw[:3] if fuzzy else kw for kw in l_kw]
+        sessions = [(doc, path) for doc, path, text in candidates
+                    if all(kw in text for kw in l_kw_pass)]
+        if sessions or not opts.keywords:
+            break
 
     # Rank matched sessions. Title match is the strongest signal.
     # Within title-matching sessions, prefer most recent (stable sort preserves recency).
@@ -905,13 +904,12 @@ def agent_block(doc: Dict[str, Any]) -> str:
 
 def host_block(doc: Dict[str, Any]) -> str:
     """The hostname segment: 'mac' in blue if local, another host in dark red."""
-    latest = short_host(clean_field(doc.get("latest_hostname")))
-    initial = short_host(clean_field(doc.get("initial_hostname")))
-
+    # The first host field set, in HOST_FIELDS' order.
     # Sessions predating the lifecycle hook have no lifecycle and, until they get
     # reindexed, no index_hostname either - but if their .jsonl is still on this
     # disk they are ours, since .jsonl files are never synced between machines.
-    host = latest or initial or short_host(clean_field(doc.get("index_hostname")))
+    l_hosts = [short_host(clean_field(doc.get(k))) for k in HOST_FIELDS]
+    host = next((h for h in l_hosts if h), None)
     if not host and not doc.get("_source_missing", False):
         host = doc.get("_host") or LOCAL_HOSTNAME
     if not host:
@@ -1030,7 +1028,8 @@ def resume_shell_cmd(doc: Dict[str, Any], agent_cmd: str) -> str:
 
 # -- Claude backend adapters --------------------------------------------------
 
-def _claude_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], uuid: str, fork: bool) -> str:
+def _claude_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"],
+                       uuid: str, fork: bool) -> str:
     """The `claude --resume` command (the folder is resume_shell_cmd's). The transcript, when readable here, gives
     the newest permission mode and title; else the index's."""
     perm_mode = transcript.permission_mode if transcript else doc.get("permission_mode")
@@ -1052,7 +1051,8 @@ def _claude_uuid_of(jsonl_path: str) -> str:
 
 # -- Codex backend adapters ---------------------------------------------------
 
-def _codex_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], uuid: str, fork: bool) -> str:
+def _codex_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"],
+                      uuid: str, fork: bool) -> str:
     """The `codex resume`/`codex fork` command (the folder is resume_shell_cmd's)."""
     return f"codex {'fork' if fork else 'resume'} {shlex.quote(uuid)}"
 
@@ -1217,7 +1217,8 @@ def run_reindex(l_todo: List[Tuple[str, str, "Backend"]],
     """
     indexed = errors = 0
 
-    def worker(jsonl_path: str, idx_path: str, backend: Backend) -> Tuple[str, Optional[Exception], str, str]:
+    def worker(jsonl_path: str, idx_path: str,
+               backend: Backend) -> Tuple[str, Optional[Exception], str, str]:
         uuid = backend.uuid_of(jsonl_path)
         try:
             title, source = index_one(backend, jsonl_path, idx_path)
@@ -1632,7 +1633,8 @@ def read_snapshot(boot_ts: int, same_boot) -> Optional[Dict[str, Any]]:
     return d if d["panes"] else None
 
 
-def snapshot_plan(prev: int, snap: Dict[str, Any], l_cand: List[Dict[str, Any]]) -> Dict[str, Any]:
+def snapshot_plan(prev: int, snap: Dict[str, Any],
+                  l_cand: List[Dict[str, Any]]) -> Dict[str, Any]:
     """tmux_plan from the previous boot's snapshot: every tmux session, window and pane it lists. A pane gets
     `claude --resume` when a candidate (killed_start in that boot) has its pane_id and the pane's command was not
     a shell (Claude was still running there); else a shell in its folder. No stale rule. Candidates newer than the
@@ -1706,7 +1708,8 @@ def _applescript_str(s: str) -> str:
 BOUNDS_RE = re.compile(r"-?\d+(,-?\d+){3}")
 
 
-def iterm_windows(plan: Dict[str, Any], l_restored: List[str]) -> List[Tuple[Optional[str], List[str]]]:
+def iterm_windows(plan: Dict[str, Any],
+                  l_restored: List[str]) -> List[Tuple[Optional[str], List[str]]]:
     """[(bounds or None, [tmux session, in tab order])], front window first: the snapshot's iTerm2 windows with
     only the restored tmux sessions; a restored one in no tab becomes a tab of the first window. No snapshot:
     one window, one tab per restored tmux session."""
@@ -1745,7 +1748,8 @@ def _iterm_tabs(l_osa: List[str], l_sessions: List[str]) -> None:
         l_osa.append(f"  tell current session of w to write text {_applescript_str(cmd)}")
 
 
-def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = True, this_boot: bool = False) -> int:
+def cmd_tmux(dry_run: bool = False, include_stale: bool = False,
+             iterm: bool = True, this_boot: bool = False) -> int:
     """Print the plan; unless dry_run, carry it out. Returns the exit status."""
     plan = tmux_plan(include_stale, this_boot)
     if not this_boot:   # a tmux server killed without a reboot leaves this boot's sessions to restore too
@@ -1796,7 +1800,10 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
             size = f"{w['size'][0]}x{w['size'][1]}" if w["size"] else "default size"
             print(f"    window {widx} {w['name']!r}, {size}, {len(w['panes'])} pane(s), layout {w['layout']}")
             for i, r in enumerate(w["panes"]):
-                print(f"      pane {i}  {r['cmd'] + ('   (stale)' if r['stale'] else '') if _is_claude(r) else 'shell in ' + _pane_dir(r)}")
+                if _is_claude(r):
+                    print(f"      pane {i}  {r['cmd']}" + ("   (stale)" if r["stale"] else ""))
+                else:
+                    print(f"      pane {i}  shell in {_pane_dir(r)}")
         if dry_run:
             l_restored.append(name)
             continue
@@ -1866,7 +1873,8 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
         l_windows = iterm_windows(plan, l_restored)
         script = iterm_script(l_windows)
         if dry_run:
-            print(f"  iTerm2   {len(l_windows)} window(s): " + " | ".join(", ".join(t) for _, t in l_windows) + "\n" + "\n".join("    " + l for l in script.splitlines()))
+            print(f"  iTerm2   {len(l_windows)} window(s): " + " | ".join(", ".join(t) for _, t in l_windows))
+            print("\n".join("    " + l for l in script.splitlines()))
         elif sys.platform != "darwin":
             print("  iTerm2   skipped (not macOS)")
         else:
@@ -1878,40 +1886,48 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
                 print(f"  ERROR    iTerm2: {out.stderr.strip()}", file=sys.stderr)
     if not dry_run and l_started:
         n_ok = len(l_started) - len(l_failed)
-        print(f"  summary  {n_ok} of {len(l_started)} Claude pane(s) running" + (f", {len(l_failed)} without claude" if l_failed else ""))
+        print(f"  summary  {n_ok} of {len(l_started)} Claude pane(s) running"
+              + (f", {len(l_failed)} without claude" if l_failed else ""))
     return 1 if errors else 0
 
 
 # -- Main -------------------------------------------------------------------
 
-# Examples are written once here and filtered per-subcommand into that
+# Examples are written once here and rendered per-subcommand into that
 # subparser's --help epilog, instead of a hand-maintained HELP blob that
 # duplicates flag descriptions already given to argparse via add_argument().
-EXAMPLES: List[Tuple[str, str, Optional[str]]] = [
-    ("resume", "ares resume", None),
-    ("resume", "ares resume profiling hallucination", None),
-    ("resume", "ares resume -f 30 cai benchmarking", None),
-    ("resume", "ares resume --host myserver", None),
-    ("resume", "ares resume --state pending", None),
-    ("resume", "ares resume --agent codex", "only sessions from a given agent"),
-    ("resume", "ares resume --tmux mywork", 'only sessions started in tmux session "mywork"'),
-    ("resume", "ares resume --fork", "fork instead of resume"),
-    ("resume", "ares resume --uuid <uuid> --print-cmd", "print the resume command, don't run it"),
-    ("resume", "ares resume --max-scan 200", None),
-    ("resume", "ares resume -v", "with verbose logging"),
-    ("resume", "ares resume --uuid 31967223-656d-41a3-8ed3-56dbcc37ef38", "skip search, resume directly"),
-    ("tmux", "ares tmux --dry-run", "after a crash: print what would be restored"),
-    ("tmux", "ares tmux", "restore it, then the iTerm2 windows and tabs as they were"),
-    ("tmux", "ares tmux --all --no-iterm", "also the stale Claude sessions; no iTerm2 tab"),
-    ("reindex", "ares reindex", None),
-    ("reindex", "ares reindex -n 5", "reindex at most 5 sessions"),
-    ("reindex", "ares reindex --force", "force reindex, ignoring mtime-based skip"),
-]
+# Per command: (example, its note or None).
+EXAMPLES: Dict[str, List[Tuple[str, Optional[str]]]] = {
+    "resume": [
+        ("ares resume", None),
+        ("ares resume profiling hallucination", None),
+        ("ares resume -f 30 cai benchmarking", None),
+        ("ares resume --host myserver", None),
+        ("ares resume --state pending", None),
+        ("ares resume --agent codex", "only sessions from a given agent"),
+        ("ares resume --tmux mywork", 'only sessions started in tmux session "mywork"'),
+        ("ares resume --fork", "fork instead of resume"),
+        ("ares resume --uuid <uuid> --print-cmd", "print the resume command, don't run it"),
+        ("ares resume --max-scan 200", None),
+        ("ares resume -v", "with verbose logging"),
+        ("ares resume --uuid 31967223-656d-41a3-8ed3-56dbcc37ef38", "skip search, resume directly"),
+    ],
+    "tmux": [
+        ("ares tmux --dry-run", "after a crash: print what would be restored"),
+        ("ares tmux", "restore it, then the iTerm2 windows and tabs as they were"),
+        ("ares tmux --all --no-iterm", "also the stale Claude sessions; no iTerm2 tab"),
+    ],
+    "reindex": [
+        ("ares reindex", None),
+        ("ares reindex -n 5", "reindex at most 5 sessions"),
+        ("ares reindex --force", "force reindex, ignoring mtime-based skip"),
+    ],
+}
 
 
 def _epilog_for(command: str) -> str:
-    """Render this command's slice of EXAMPLES as a --help epilog."""
-    rows = [(ex, note) for cmd, ex, note in EXAMPLES if cmd == command]
+    """Render this command's EXAMPLES as a --help epilog."""
+    rows = EXAMPLES[command]
     width = max(len(ex) for ex, _ in rows)
     lines = ["Examples:"]
     for ex, note in rows:

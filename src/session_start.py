@@ -78,10 +78,13 @@ def main() -> None:
         except (ValueError, TypeError, AttributeError):
             continue
     # pids that logged an end (after /clear the process lives on and logs a new start)
-    s_ended = {pid for ev, pid in l_ev if ev.get("event") == "end" and pid}
+    s_ended = {pid for ev, pid in l_ev
+               if ev.get("event") == "end" and pid}
     l_warn, s_seen = [], set()
     for ev, pid in l_ev:
-        if ev.get("event") != "start" or not pid or pid in s_mine or pid in s_seen or pid in s_ended or pid not in d_proc:
+        if ev.get("event") != "start" or not pid or pid not in d_proc:
+            continue
+        if pid in s_mine or pid in s_seen or pid in s_ended:   # this session's own process, already warned, or ended
             continue
         if ev.get("machine") and machine and ev["machine"] != machine:
             continue
