@@ -523,8 +523,8 @@ def open_start(lifecycle_events):
     return list(d_open.values())[-1] if d_open else None
 
 
-def killed_start(lifecycle_events, in_boot):
-    """The Claude session's NEWEST start line, when it is of the boot `in_boot` accepts and its process ended
+def killed_start(lifecycle_events, boot_ts):
+    """The Claude session's NEWEST start line, when it is of that boot (same_boot) and its process ended
     without a clean exit: no end line of its pid after it (a power cut), or one with reason "other" (what
     Claude Code logs when the tmux server or the terminal dies under it: 2026-11-07 15:30). None otherwise:
     resumed again later (by hand, or in a newer boot), or ended cleanly (prompt_input_exit, clear, logout).
@@ -534,7 +534,7 @@ def killed_start(lifecycle_events, in_boot):
         return None
     i = l_idx[-1]
     st = lifecycle_events[i]
-    if not in_boot(st.get("boot_ts")):
+    if not same_boot(st.get("boot_ts"), boot_ts):
         return None
     for ev in lifecycle_events[i + 1:]:
         if ev.get("event") == "end" and (ev.get("pid") is None or ev.get("pid") == st.get("pid")):
@@ -1426,6 +1426,11 @@ def layout_cells(layout):
     return size, [int(n) for _, _, n in l_cells if n]
 
 
+def same_boot(a, b):
+    """Whether two boot_ts are of one boot (SAME_BOOT_S apart at most); never when one is missing."""
+    return a is not None and b is not None and abs(int(a) - int(b)) <= SAME_BOOT_S
+
+
 def _fmt_ts(ts):
     try:
         return datetime.fromtimestamp(int(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1445,7 +1450,6 @@ def tmux_plan(include_stale, this_boot):
     "panes": [row or None]} (None = a plain shell).
     """
     boot_now = current_boot_ts()
-    same_boot = lambda a, b: a is not None and b is not None and abs(int(a) - int(b)) <= SAME_BOOT_S
 
     l_rows = []
     for folder in sorted(glob.glob(os.path.join(TRACKER_SESSIONS_DIR, "*", ""))):
@@ -1466,8 +1470,8 @@ def tmux_plan(include_stale, this_boot):
 
     l_cand = []
     for r in l_rows:
-        start = killed_start(r["events"], lambda b: same_boot(b, prev))   # both modes: see its docstring
-        if not start or not same_boot(start.get("boot_ts"), prev) or (start.get("agent") or "claude") != "claude":
+        start = killed_start(r["events"], prev)   # both modes: see its docstring; it is of that boot
+        if not start or (start.get("agent") or "claude") != "claude":
             continue
         if this_boot and pid_alive(start.get("pid")):
             continue   # still running: nothing to restore (after a reboot, a pid is a new process: not checked)
@@ -1484,7 +1488,7 @@ def tmux_plan(include_stale, this_boot):
         l_cand.append(r)
 
     if not this_boot:   # --this-boot: the snapshot may already show the tmux server started after the death
-        snap = read_snapshot(prev, same_boot)
+        snap = read_snapshot(prev)
         if snap:
             return snapshot_plan(prev, snap, l_cand)
 
@@ -1538,7 +1542,7 @@ def tmux_plan(include_stale, this_boot):
             "outside": l_outside}
 
 
-def read_snapshot(boot_ts, same_boot):
+def read_snapshot(boot_ts):
     """agent-tracker's terminal snapshot of that boot (its FOR_READERS.md §4, rule 18), or None.
 
     The newest data/snapshots/<boot_ts>.tsv whose name is that boot (macOS may shift boot_ts by a few seconds).
