@@ -28,11 +28,14 @@ import glob
 import io
 import unicodedata
 import argparse
+import collections
+import functools
 import subprocess
 import shlex
 import shutil
 import tarfile
 import tempfile
+import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -68,16 +71,12 @@ def _load_settings() -> Dict[str, Any]:
         "codex_enabled": None,
     }
     try:
-        with open(SETTINGS_PATH) as f:
-            user = json.load(f)
+        user = json.loads(Path(SETTINGS_PATH).read_text())
         for k, v in user.items():
-            if isinstance(v, bool):
-                defaults[k] = v
-            elif isinstance(v, str) and v != "":
-                defaults[k] = v
-            elif isinstance(v, list):
+            # a list keeps its non-empty strings; a bool, a number or a non-empty string is taken as is; else ignored
+            if isinstance(v, list):
                 defaults[k] = [s for s in v if isinstance(s, str) and s]
-            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            elif isinstance(v, (bool, int, float)) or (isinstance(v, str) and v):
                 defaults[k] = v
     except (OSError, json.JSONDecodeError):
         pass
@@ -209,13 +208,11 @@ def _make_portable_jsonl_path(abs_path: str) -> str:
     /home/bob on a VM), and another machine's index is copied here (pull_remotes)
     to be searched and shown.
     """
-    marker = "/.claude/projects/"
-    idx = abs_path.find(marker)
-    if idx != -1:
-        return "~/.claude/projects/" + abs_path[idx + len(marker):]
-    home = os.path.expanduser("~")
-    if abs_path.startswith(home + "/"):
-        return "~/" + abs_path[len(home) + 1:]
+    _, marker, rest = abs_path.partition("/.claude/projects/")   # its first occurrence
+    if marker:
+        return "~/.claude/projects/" + rest
+    if abs_path.startswith(HOME + "/"):
+        return "~/" + abs_path[len(HOME) + 1:]
     return abs_path
 
 
@@ -229,8 +226,7 @@ def _resolve_jsonl_path(stored_path: str) -> str:
 def read_json(path: str) -> Optional[Dict[str, Any]]:
     """Load one JSON file, or None if it is missing or malformed."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return json.load(f)
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -239,8 +235,9 @@ def read_json(path: str) -> Optional[Dict[str, Any]]:
 
 def write_json_atomic(doc: Dict[str, Any], json_path: str) -> None:
     """Write JSON to temp file then rename (atomic on POSIX)."""
-    Path(json_path).parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(Path(json_path).parent), suffix=".tmp")
+    folder = Path(json_path).parent
+    folder.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(doc, f, ensure_ascii=False, indent=2)
@@ -279,11 +276,8 @@ def iter_entries(jsonl_path: Any, warn: bool = False) -> Iterator[Dict[str, Any]
     try:
         with open(jsonl_path, encoding="utf-8", errors="replace") as f:
             for raw in f:
-                raw = raw.strip()
-                if not raw:
-                    continue
                 try:
-                    yield json.loads(raw)
+                    yield json.loads(raw.strip())   # a blank line raises JSONDecodeError too
                 except json.JSONDecodeError:
                     continue
     except OSError as e:
@@ -291,13 +285,13 @@ def iter_entries(jsonl_path: Any, warn: bool = False) -> Iterator[Dict[str, Any]
             print(f"  WARNING: could not read {jsonl_path}: {e}", file=sys.stderr)
 
 
-def extract_text(content: Any) -> str:
-    """Flatten a message's content (str, or list of blocks) to clean text."""
+def extract_text(content: Any, block_types: Tuple[str, ...] = ("text",)) -> str:
+    """Flatten a message's content (str, or list of blocks of one of block_types) to clean text."""
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
         parts = [b.get("text", "") for b in content
-                 if isinstance(b, dict) and b.get("type") == "text"]
+                 if isinstance(b, dict) and b.get("type") in block_types]
         text = "\n".join(p for p in parts if p)
     else:
         return ""
@@ -404,24 +398,19 @@ def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
 # mapped onto Transcript.ai_title (Codex has no /rename-equivalent "custom"
 # title source, so custom_title is always None for this backend).
 
-_codex_titles_cache: Optional[Dict[str, str]] = None
-
-
+@functools.cache   # Python 3.9+
 def _codex_session_titles() -> Dict[str, str]:
     """uuid -> latest thread_name from ~/.codex/session_index.jsonl.
 
     Cached for the lifetime of the process: the file only grows during a
     reindex run, and re-reading it once per session would be O(sessions^2).
     """
-    global _codex_titles_cache
-    if _codex_titles_cache is None:
-        titles: Dict[str, str] = {}
-        for entry in iter_entries(CODEX_SESSION_INDEX_FILE):
-            sid, name = entry.get("id"), entry.get("thread_name")
-            if sid and name:
-                titles[sid] = name
-        _codex_titles_cache = titles
-    return _codex_titles_cache
+    titles: Dict[str, str] = {}
+    for entry in iter_entries(CODEX_SESSION_INDEX_FILE):
+        sid, name = entry.get("id"), entry.get("thread_name")
+        if sid and name:
+            titles[sid] = name
+    return titles
 
 
 def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
@@ -455,11 +444,8 @@ def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
 
         content = payload.get("content")
         text = ""
-        if isinstance(content, list):
-            parts = [b.get("text", "") for b in content
-                     if isinstance(b, dict) and b.get("type") in ("input_text", "output_text")]
-            text = "\n".join(p for p in parts if p)
-        text = NOISE_RE.sub("", text).strip()
+        if isinstance(content, list):   # only a list of blocks counts here (a plain string does not)
+            text = extract_text(content, ("input_text", "output_text"))
         if text:
             ts = entry.get("timestamp")
             if created_at is None:
@@ -510,8 +496,7 @@ def read_lifecycle(uuid: str) -> List[Dict[str, Any]]:
     (agent-tracker's contract), as is any line that is not a JSON object.
     """
     try:
-        with open(lifecycle_path(uuid), encoding="utf-8", errors="replace") as f:
-            data = f.read()
+        data = Path(lifecycle_path(uuid)).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
     l_events = []
@@ -543,7 +528,7 @@ def open_start(lifecycle_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any
                 d_open.clear()
             else:
                 d_open.pop(ev["pid"], None)
-    return list(d_open.values())[-1] if d_open else None
+    return next(reversed(d_open.values()), None)
 
 
 def killed_start(lifecycle_events: List[Dict[str, Any]], in_boot) -> Optional[Dict[str, Any]]:
@@ -631,10 +616,7 @@ def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str
         "tmux_session": tmux_session,
         "tmux_window": tmux_window,
         "tmux_pane": tmux_pane,
-        "conversation": [
-            {"role": m["role"], "timestamp": m["timestamp"], "text": m["text"]}
-            for m in transcript.messages
-        ],
+        "conversation": transcript.messages,   # [{"role", "timestamp", "text"}]: both parsers build exactly these
     }
 
 
@@ -677,7 +659,7 @@ class SearchOpts(NamedTuple):
 
 def is_source_missing(d_fields: Dict[str, Any]) -> bool:
     """Check if the source .jsonl file has been deleted from disk."""
-    jsonl_path = d_fields.get("jsonl_path", "")
+    jsonl_path = d_fields.get("jsonl_path")
     if not jsonl_path:
         return True
     return not os.path.exists(_resolve_jsonl_path(jsonl_path))
@@ -725,7 +707,7 @@ def passes_filters(doc: Dict[str, Any], opts: SearchOpts,
     if doc.get("interactive") is False:
         return False
 
-    missing = doc.get("_source_missing", False)
+    missing = doc.get("_source_missing")
     if opts.state:
         # 'deleted' is not a session_state in the index - it means the source
         # .jsonl is gone - so it is matched against _source_missing instead.
@@ -748,7 +730,7 @@ def passes_filters(doc: Dict[str, Any], opts: SearchOpts,
         if opts.tmux.lower() not in (doc.get("tmux_session") or "").lower():
             return False
 
-    ts = parse_ts(doc.get("last_active", ""))
+    ts = parse_ts(doc.get("last_active"))
     if ts:
         if cutoff_from and ts < cutoff_from:
             return False
@@ -789,7 +771,7 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
             candidates.append((doc, idx_path, fold(text) if opts.keywords else text))
 
     # Sort by last_active (most recent first)
-    candidates.sort(key=lambda item: item[0].get("last_active", "") or "", reverse=True)
+    candidates.sort(key=lambda item: item[0].get("last_active") or "", reverse=True)
     log_verbose(f"PHASE 3: {len(candidates)} sessions after filtering", verbose)
 
     # Apply max_scan limit (only when no keywords)
@@ -913,7 +895,7 @@ def status_block(doc: Dict[str, Any]) -> str:
     # its state was never observed - say "Unknown" rather than assert "Exited".
     has_lifecycle = bool(clean_field(doc.get("initial_hostname")))
 
-    if doc.get("_source_missing", False):
+    if doc.get("_source_missing"):
         label, color = "Deleted", C_DELETED
     elif not has_lifecycle:
         label, color = "Unknown", C_INACTIVE
@@ -949,7 +931,7 @@ def host_block(doc: Dict[str, Any]) -> str:
     # reindexed, no index_hostname either - but if their .jsonl is still on this
     # disk they are ours, since .jsonl files are never synced between machines.
     host = latest or initial or short_host(clean_field(doc.get("index_hostname")))
-    if not host and not doc.get("_source_missing", False):
+    if not host and not doc.get("_source_missing"):
         host = doc.get("_host") or LOCAL_HOSTNAME
     if not host:
         return ""
@@ -1071,7 +1053,7 @@ def _claude_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], 
     """The `claude --resume` command (the folder is resume_shell_cmd's). The transcript, when readable here, gives
     the newest permission mode and title; else the index's."""
     perm_mode = transcript.permission_mode if transcript else doc.get("permission_mode")
-    title = (transcript.title if transcript else None) or doc.get("custom_title", "")
+    title = (transcript.title if transcript else None) or doc.get("custom_title")
     claude_flags = "--dangerously-skip-permissions " if perm_mode == "bypassPermissions" else ""
     cmd = f"claude {claude_flags}--resume {shlex.quote(uuid)}"
     if fork:
@@ -1111,47 +1093,24 @@ def scan_codex_sessions() -> Dict[str, float]:
     Codex shards sessions by date (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl)
     rather than Claude's per-project-slug layout, hence the recursive walk.
     """
-    d: Dict[str, float] = {}
-    root = Path(CODEX_SESSIONS_DIR)
-    if not root.exists():
-        return d
-    for f in root.rglob("*.jsonl"):
-        if f.is_file():
-            d[str(f)] = f.stat().st_mtime
-    return d
+    # pathlib's glob (unlike the glob module) also matches hidden names, and yields nothing for a missing folder
+    return {str(f): f.stat().st_mtime
+            for f in Path(CODEX_SESSIONS_DIR).rglob("*.jsonl") if f.is_file()}
 
 
 # -- Indexing Operations ----------------------------------------------------
 
 def scan_history_jsonl() -> Dict[str, float]:
     """Scan all local .jsonl history files. Returns {path: mtime}."""
-    d: Dict[str, float] = {}
-    projects_dir = Path(PROJECTS_DIR)
-    if not projects_dir.exists():
-        return d
-    for slug_dir in projects_dir.iterdir():
-        if not slug_dir.is_dir():
-            continue
-        try:
-            for f in slug_dir.iterdir():
-                # agent-*.jsonl are subagent transcripts, not resumable sessions
-                if f.is_file() and f.suffix == ".jsonl" and not f.name.startswith("agent-"):
-                    d[str(f)] = f.stat().st_mtime
-        except OSError:
-            continue
-    return d
+    # <slug>/<uuid>.jsonl; agent-*.jsonl are subagent transcripts, not resumable sessions
+    return {str(f): f.stat().st_mtime for f in Path(PROJECTS_DIR).glob("*/*.jsonl")
+            if f.is_file() and not f.name.startswith("agent-")}
 
 
 def scan_index_dir(index_dir: str) -> Dict[str, float]:
     """Scan a flat directory of .json index files. Returns {path: mtime}."""
-    d: Dict[str, float] = {}
-    idx_dir = Path(index_dir)
-    if not idx_dir.exists():
-        return d
-    for f in idx_dir.iterdir():
-        if f.is_file() and f.name.endswith(".json"):
-            d[str(f)] = f.stat().st_mtime
-    return d
+    return {str(f): f.stat().st_mtime
+            for f in Path(index_dir).glob("*.json") if f.is_file()}
 
 
 def is_ignored_session(jsonl_path: str) -> bool:
@@ -1186,16 +1145,13 @@ def index_one(backend: Backend, jsonl_path: str, idx_path: str) -> Tuple[str, st
     lifecycle_events = read_lifecycle(uuid)
 
     doc = build_doc(uuid, transcript, lifecycle_events, jsonl_path, backend.name)
+    hidden = os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json")
     if doc.get("interactive") is False:
-        Path(HIDDEN_INDEX_DIR).mkdir(parents=True, exist_ok=True)
-        write_json_atomic(doc, os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json"))
-        if os.path.exists(idx_path):
-            os.remove(idx_path)   # an entry from before this split
+        write_json_atomic(doc, hidden)   # it makes the folder
+        Path(idx_path).unlink(missing_ok=True)   # an entry from before this split
     else:
         write_json_atomic(doc, idx_path)
-        hidden = os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json")
-        if os.path.exists(hidden):
-            os.remove(hidden)
+        Path(hidden).unlink(missing_ok=True)
 
     return doc["custom_title"], doc["title_source"]
 
@@ -1254,7 +1210,8 @@ def plan_reindex(force: bool = False, single_uuid: str = "",
     idx_mtime_by_uuid = {Path(p).stem: mtime for p, mtime in d_index.items()}
 
     l_todo: List[Tuple[str, str, Backend]] = []
-    d_counts = {"history": len(d_history), "index": len(d_index), "skipped": 0, "ignored": 0, "duplicates": 0}
+    # a Counter: "skipped", "ignored" and "duplicates" start at 0
+    d_counts = collections.Counter(history=len(d_history), index=len(d_index))
     s_seen: set = set()
     for jsonl_path, (jsonl_mtime, backend) in d_history.items():
         if max_sessions and len(s_seen) >= max_sessions:
@@ -1286,9 +1243,9 @@ def run_reindex(l_todo: List[Tuple[str, str, "Backend"]],
         uuid = backend.uuid_of(jsonl_path)
         try:
             title, source = index_one(backend, jsonl_path, idx_path)
-            return (uuid, None, title, source)
+            return uuid, None, title, source
         except Exception as e:
-            return (uuid, e, "", "")
+            return uuid, e, "", ""
 
     if not l_todo:
         return 0, 0
@@ -1396,8 +1353,7 @@ def _pull_one(host: str) -> bool:
             for ti in tf:   # only flat <uuid>.json files: nothing in the archive can write elsewhere
                 name = os.path.basename(ti.name)
                 if ti.isfile() and ti.name in (name, "./" + name) and name.endswith(".json"):
-                    with open(os.path.join(new, name), "wb") as f:
-                        f.write(tf.extractfile(ti).read())
+                    Path(new, name).write_bytes(tf.extractfile(ti).read())
         if os.path.isdir(dest):
             os.replace(dest, old)
         os.replace(new, dest)
@@ -1461,7 +1417,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
     else:
         uuid, doc = pick_session(opts, action_verb="Resume")
 
-    if doc.get("_source_missing", False):
+    if doc.get("_source_missing"):
         # Its transcript is gone from this machine (deleted by hand, or by Claude Code after cleanupPeriodDays):
         # nothing to resume. The index entry still holds the whole conversation.
         print(f"ERROR: the transcript of session {uuid} is gone from this machine: it cannot be resumed.\n"
@@ -1479,7 +1435,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
     jsonl_path = "" if host else _resolve_jsonl_path(doc.get("jsonl_path", ""))
     transcript = backend.parse(jsonl_path, warn=False) if jsonl_path else None
     perm_mode = transcript.permission_mode if transcript else doc.get("permission_mode")
-    title = (transcript.title if transcript else None) or doc.get("custom_title", "")
+    title = (transcript.title if transcript else None) or doc.get("custom_title")
     working_dir = (latest_wd or initial_wd or "~") if host else resume_dir(doc)
     cmd = resume_shell_cmd(doc, backend.resume_cmd(doc, transcript, uuid, fork))
 
@@ -1579,7 +1535,7 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
 
     l_rows = []
     for folder in sorted(glob.glob(os.path.join(TRACKER_SESSIONS_DIR, "*", ""))):
-        uuid = os.path.basename(folder.rstrip("/"))
+        uuid = Path(folder).name   # the trailing "/" is dropped
         seen = read_json(os.path.join(folder, "last_seen.json")) or {}
         l_events = read_lifecycle(uuid)
         l_rows.append({"uuid": uuid, "seen": seen, "start": open_start(l_events), "events": l_events,
@@ -1588,11 +1544,10 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
     if this_boot:
         prev = boot_now
     else:
-        l_boots = sorted({int(b) for r in l_rows for b in r["boots"] if isinstance(b, (int, float))
-                          and not same_boot(b, boot_now)}, reverse=True)
-        if not l_boots:
+        prev = max((int(b) for r in l_rows for b in r["boots"] if isinstance(b, (int, float))
+                    and not same_boot(b, boot_now)), default=None)
+        if prev is None:
             return {"boot_ts": None}
-        prev = l_boots[0]
 
     l_cand = []
     for r in l_rows:
@@ -1671,7 +1626,7 @@ def read_snapshot(boot_ts: int, same_boot) -> Optional[Dict[str, Any]]:
     "command", "cwd", "layout", "window_name"}], "clients": {tty: tmux session}, "iterm": [{"window", "tab",
     "tty", "bounds"}]}. A line without its final newline is ignored."""
     l_files = [f for f in glob.glob(os.path.join(TRACKER_SNAPSHOTS_DIR, "*.tsv"))
-               if os.path.basename(f)[:-4].isdigit() and same_boot(int(os.path.basename(f)[:-4]), boot_ts)]
+               if Path(f).stem.isdigit() and same_boot(int(Path(f).stem), boot_ts)]
     if not l_files:
         return None
     path = max(l_files, key=os.path.getmtime)
@@ -1746,6 +1701,12 @@ def _is_claude(p: Optional[Dict[str, Any]]) -> bool:
     return bool(p and p.get("cmd"))
 
 
+def _n_claude(d_sessions: Dict[str, Dict[int, Dict[str, Any]]]) -> int:
+    """How many planned panes get `claude --resume`."""
+    return sum(1 for d_windows in d_sessions.values() for w in d_windows.values()
+               for p in w["panes"] if _is_claude(p))
+
+
 def _pane_dir(p: Optional[Dict[str, Any]]) -> str:
     """The folder a planned pane's shell starts in: its saved folder when it still exists, else ~."""
     wd = (p or {}).get("cwd")
@@ -1811,7 +1772,7 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
     """Print the plan; unless dry_run, carry it out. Returns the exit status."""
     plan = tmux_plan(include_stale, this_boot)
     if not this_boot:   # a tmux server killed without a reboot leaves this boot's sessions to restore too
-        n_now = sum(1 for d in tmux_plan(True, True)["sessions"].values() for w in d.values() for p in w["panes"] if _is_claude(p))
+        n_now = _n_claude(tmux_plan(True, True)["sessions"])
         if n_now:
             print(f"ares tmux: {n_now} Claude session(s) of THIS boot ended without a clean exit (tmux server killed?):"
                   f" ares tmux --this-boot --dry-run")
@@ -1824,14 +1785,14 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
         """Run one tmux command; its output, stripped. Raises on failure."""
         out = subprocess.run(["tmux", *l_args], capture_output=True, text=True)
         if out.returncode != 0:
-            raise RuntimeError(f"tmux {' '.join(shlex.quote(a) for a in l_args)}: {out.stderr.strip()}")
+            raise RuntimeError(f"tmux {shlex.join(l_args)}: {out.stderr.strip()}")
         return out.stdout.strip()
 
     def exists(name: str) -> bool:
         return subprocess.run(["tmux", "has-session", "-t", f"={name}"],
                               capture_output=True).returncode == 0
 
-    n_claude = sum(1 for ws in plan["sessions"].values() for w in ws.values() for p in w["panes"] if _is_claude(p))
+    n_claude = _n_claude(plan["sessions"])
     which = "this boot (tmux died without a reboot)" if this_boot else "previous boot"
     head = f"ares tmux{' --this-boot' if this_boot else ''}{' --dry-run' if dry_run else ''}: {which} {_fmt_ts(plan['boot_ts'])}, "
     if plan.get("snapshot"):
@@ -1928,7 +1889,8 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
         l_windows = iterm_windows(plan, l_restored)
         script = iterm_script(l_windows)
         if dry_run:
-            print(f"  iTerm2   {len(l_windows)} window(s): " + " | ".join(", ".join(t) for _, t in l_windows) + "\n" + "\n".join("    " + l for l in script.splitlines()))
+            print(f"  iTerm2   {len(l_windows)} window(s): " + " | ".join(", ".join(t) for _, t in l_windows))
+            print(textwrap.indent(script, "    "))   # no blank line in it: every line gets the indent
         elif sys.platform != "darwin":
             print("  iTerm2   skipped (not macOS)")
         else:
@@ -2017,19 +1979,18 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=f"ares {VERSION}")
     subparsers = parser.add_subparsers(dest="command")
 
-    resume_parser = subparsers.add_parser(
-        "resume", help="Find and resume a past session",
-        epilog=_epilog_for("resume"), formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    def add_command(name: str, help: str) -> argparse.ArgumentParser:
+        """One subcommand, its examples as the --help epilog."""
+        return subparsers.add_parser(name, help=help, epilog=_epilog_for(name),
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    resume_parser = add_command("resume", "Find and resume a past session")
     _add_search_args(resume_parser)
     resume_parser.add_argument("--fork", action="store_true", help="Fork the session instead of resuming it")
     resume_parser.add_argument("--print-cmd", action="store_true",
                                help="Print the resume/fork command instead of running it (scripting/testing)")
 
-    tmux_parser = subparsers.add_parser(
-        "tmux", help="After a crash: restore the previous boot's tmux sessions and Claude sessions",
-        epilog=_epilog_for("tmux"), formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    tmux_parser = add_command("tmux", "After a crash: restore the previous boot's tmux sessions and Claude sessions")
     tmux_parser.add_argument("--dry-run", action="store_true", help="Print the plan, change nothing")
     tmux_parser.add_argument("--this-boot", action="store_true",
                              help="The tmux server died without a reboot: restore this boot's Claude sessions whose "
@@ -2038,10 +1999,7 @@ def main() -> None:
                              help="No snapshot of that boot only: also restore stale Claude sessions (stopped ticking > 2 min before the others)")
     tmux_parser.add_argument("--no-iterm", action="store_true", help="Do not open iTerm2 tabs")
 
-    reindex_parser = subparsers.add_parser(
-        "reindex", help="Re-index all sessions now",
-        epilog=_epilog_for("reindex"), formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    reindex_parser = add_command("reindex", "Re-index all sessions now")
     reindex_parser.add_argument("-n", "--max", type=int, default=0, help="Max sessions to process (0 = unlimited, default: 0)")
     reindex_parser.add_argument("--force", action="store_true", help="Force reindex all sessions, ignoring mtime-based skip")
     reindex_parser.add_argument("--uuid", default="", help="Reindex a single session by UUID")
