@@ -354,7 +354,7 @@ Codex (if detected: `codex_enabled`, or `~/.codex/sessions` exists, and `codex` 
 | `~/opt/agent-resume/` | deployment: `bin/ares`, `session_start.py`, `codex-plugin/`, `codex-marketplace/`, `install.sh`/`uninstall.sh`, and `data/` (above) |
 | `~/.local/bin/{ares,asm}` | symlinks into `~/opt/agent-resume/bin/ares` (`asm` = alias) |
 
-`uninstall.sh` removes everything under `~/opt/agent-resume/` **except** `data/`.
+`uninstall.sh` removes everything under `~/opt/agent-resume/` **except** `data/`. It sources the `install.sh` next to it (which then stops before installing anything) for its settings and the two functions both use: `remove_links` and `edit_hooks add|remove` (our groups in `~/.claude/settings.json`).
 
 ---
 

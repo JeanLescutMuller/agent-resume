@@ -17,6 +17,9 @@
 # Sandbox: when $HOME is not the user's real home (tests), nothing outside $HOME is touched: no launchctl, systemctl
 # or loginctl call, and codex runs with CODEX_HOME=$HOME/.codex.
 #
+# uninstall.sh sources this file for its settings (SERVICE_DIR, SANDBOX...) and its functions remove_links and
+# edit_hooks: sourced, it stops before "Installing agent-resume..." and changes nothing.
+#
 # First install:  git clone <repo-url> agent-resume && bash agent-resume/install.sh
 # Re-install:     bash ~/dev/agent-resume/install.sh   (VM, NAS: bash ~/dev/agent-resume/tools/deploy_remote.sh)
 
@@ -31,6 +34,50 @@ IS_MACOS=$( [[ "$(uname -s)" == "Darwin" ]] && echo true || echo false )
 REAL_HOME=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
 SANDBOX=$( [[ "$HOME" != "$REAL_HOME" ]] && echo true || echo false )
 $SANDBOX && export CODEX_HOME="$HOME/.codex"   # never the real ~/.codex/config.toml from a sandbox
+
+# -- Shared with uninstall.sh, which sources this file down to the `return` below --------------------------------
+
+# remove_links LINK...: removes each one that is a link into ~/opt/agent-resume, and says so
+remove_links() {
+    for link in "$@"; do
+        [ -L "$link" ] && [[ "$(readlink "$link")" == "$SERVICE_DIR/"* ]] && rm "$link" && echo "  removed $link"
+    done
+    return 0   # (set -e) a link not there is no error
+}
+
+# edit_hooks add|remove: in ~/.claude/settings.json, our hook groups (session_start.py, the former session_end.sh)
+# are removed; `add` (install) then appends our SessionStart group and always rewrites the file, `remove` (uninstall)
+# rewrites it only when it removed a group, and says so. We own only those groups (config-ownership skill).
+# The lifecycle (start / end lines) is agent-tracker's: its own install.sh registers `agent-tracker hook start|end`.
+edit_hooks() {
+    python3 - "$SETTINGS_JSON" "$1" <<'PY'
+import json, sys
+path, add = sys.argv[1], sys.argv[2] == "add"
+d_settings = json.load(open(path))
+d_hooks = d_settings.setdefault("hooks", {})   # (remove: written only if changed, so only if it was there)
+OURS = ("agent-resume/session_start.py", "agent-resume/session_end.sh")
+HOOK = {"type": "command", "timeout": 10, "command": 'python3 "$HOME/opt/agent-resume/session_start.py"'}
+changed = False
+for event in ("SessionStart", "SessionEnd"):
+    l_all = d_hooks.get(event, [])
+    l_kept = [g for g in l_all if not any(o in h.get("command", "") for h in g.get("hooks", []) for o in OURS)]
+    if add and event == "SessionStart":
+        l_kept.append({"matcher": "", "hooks": [HOOK]})
+    if add or len(l_kept) != len(l_all):   # an event left empty is removed
+        changed = True
+        d_hooks[event] = l_kept
+        if not l_kept:
+            d_hooks.pop(event)
+if changed:   # always, with add
+    if not d_hooks:
+        d_settings.pop("hooks")
+    open(path, "w").write(json.dumps(d_settings, indent=2) + "\n")
+    if not add:
+        print(f"  removed the SessionStart hook from {path}")
+PY
+}
+
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0   # sourced (by uninstall.sh): nothing else runs
 
 echo "Installing agent-resume..."
 $SANDBOX && echo "  (sandbox HOME=$HOME: no launchctl / systemctl call; CODEX_HOME=$CODEX_HOME)"
@@ -59,10 +106,8 @@ for f in "$LABEL.plist" "$LABEL.service" "$LABEL.timer" entrypoint.sh entrypoint
          session_end.sh bin/ares-sync; do
     [ -e "$SERVICE_DIR/$f" ] && rm -f "$SERVICE_DIR/$f" && echo "  removed $SERVICE_DIR/$f"
 done
-for link in "$HOME/.local/bin/ares-sync" "$HOME/.local/bin/asm-sync" \
-            "$HOME/.claude/skills/inject-session" "$HOME/.agents/skills/inject-session"; do
-    [ -L "$link" ] && [[ "$(readlink "$link")" == "$SERVICE_DIR/"* ]] && rm "$link" && echo "  removed $link"
-done
+remove_links "$HOME/.local/bin/ares-sync" "$HOME/.local/bin/asm-sync" \
+             "$HOME/.claude/skills/inject-session" "$HOME/.agents/skills/inject-session"
 if [ -d "$SERVICE_DIR/skills" ]; then   # the read-only copy of the skill inject-session
     chmod -R u+w "$SERVICE_DIR/skills" && rm -r "$SERVICE_DIR/skills" && echo "  removed $SERVICE_DIR/skills"
 fi
@@ -95,33 +140,13 @@ GONE = ("remote_ssh_host", "remote_ssh_user", "remote_ssh_port", "remote_index_d
 d_new = {k: v for k, v in d_user.items() if k not in GONE}
 d_new.setdefault("remote_hosts", [])
 if d_new != d_user:
-    with open(path, "w") as f:
-        json.dump(d_new, f, indent=2)
-        f.write("\n")
+    open(path, "w").write(json.dumps(d_new, indent=2) + "\n")
     print(f"  {path}: sync settings removed, remote_hosts added")
 PY
 
-# -- ~/.claude/settings.json: the SessionStart hook; the former SessionEnd one removed -------------
-# The lifecycle (start / end lines) is agent-tracker's: its own install.sh registers `agent-tracker hook start|end`.
+# -- ~/.claude/settings.json: the SessionStart hook; the former SessionEnd one removed (edit_hooks above) ----------
 if [ -f "$SETTINGS_JSON" ]; then
-    python3 - "$SETTINGS_JSON" <<'PY'
-import json, sys
-path = sys.argv[1]
-d_settings = json.load(open(path))
-d_hooks = d_settings.setdefault("hooks", {})
-OURS = ("agent-resume/session_start.py", "agent-resume/session_end.sh")
-d_new = {"SessionStart": {"type": "command", "timeout": 10, "command": 'python3 "$HOME/opt/agent-resume/session_start.py"'},
-         "SessionEnd": None}   # None: our former group only removed
-for event, hook in d_new.items():   # replace only our own groups (config-ownership skill)
-    l_kept = [g for g in d_hooks.get(event, [])
-              if not any(o in h.get("command", "") for h in g.get("hooks", []) for o in OURS)]
-    d_hooks[event] = l_kept + ([{"matcher": "", "hooks": [hook]}] if hook else [])
-    if not d_hooks[event]:
-        d_hooks.pop(event)
-with open(path, "w") as f:
-    json.dump(d_settings, f, indent=2)
-    f.write("\n")
-PY
+    edit_hooks add
     echo "  $SETTINGS_JSON: SessionStart session_start.py (our former SessionEnd hook removed, if it was there)"
 else
     echo "  WARNING: $SETTINGS_JSON not found: hooks not registered (re-run install.sh once Claude Code is set up)"
@@ -129,11 +154,12 @@ fi
 
 # -- Codex: the same hook, as a plugin in a local marketplace (`codex plugin`, idempotent) -----
 # Codex has no settings.json to edit; its hook payload has the same shape as Claude Code's (session_id, cwd on stdin).
-CODEX_ENABLED=$(python3 -c "
+# When ares has Codex enabled (its setting codex_enabled, else ~/.codex/sessions exists: CODEX_ENABLED) and codex is
+# installed. The python exits 0 for enabled, 1 for disabled or when ares fails to load.
+if python3 -c "
 from importlib.machinery import SourceFileLoader
-print('true' if SourceFileLoader('ares_mod', '$SERVICE_DIR/bin/ares').load_module().CODEX_ENABLED else 'false')
-" 2>/dev/null || echo false)
-if [ "$CODEX_ENABLED" = true ] && command -v codex &>/dev/null; then
+raise SystemExit(not SourceFileLoader('ares_mod', '$SERVICE_DIR/bin/ares').load_module().CODEX_ENABLED)
+" &>/dev/null && command -v codex &>/dev/null; then
     rm -rf "$SERVICE_DIR/codex-plugin" && cp -R "$SRC_DIR/codex-plugin" "$SERVICE_DIR/codex-plugin"
     MARKET="$SERVICE_DIR/codex-marketplace"
     mkdir -p "$MARKET/.agents/plugins" "$MARKET/plugins"

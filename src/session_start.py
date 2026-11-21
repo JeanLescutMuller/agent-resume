@@ -29,20 +29,15 @@ PID_START_SLACK_S = 2  # ps lstart has 1 s resolution
 
 
 def main() -> None:
-    try:
-        d_in = json.load(sys.stdin)
-        uuid = d_in.get("session_id") or ""
-    except (ValueError, AttributeError):
-        return
+    # Any error (no JSON object on stdin, no lifecycle file, no ps...) ends the hook without a warning: the caller
+    # at the bottom catches it and exits 0.
+    uuid = json.load(sys.stdin).get("session_id") or ""
     if not re.fullmatch(r"[A-Za-z0-9-]+", uuid):
         return
     home = os.environ.get("AGENT_TRACKER_HOME") or os.path.expanduser("~/opt/agent-tracker")
-    try:
-        with open(os.path.join(home, "data", "sessions", uuid, "lifecycle.jsonl"), encoding="utf-8",
-                  errors="replace") as f:
-            l_raw = f.read().split("\n")[:-1]   # a line without its final newline is still being written
-    except OSError:
-        return
+    with open(os.path.join(home, "data", "sessions", uuid, "lifecycle.jsonl"), encoding="utf-8",
+              errors="replace") as f:
+        l_raw = f.read().split("\n")[:-1]   # a line without its final newline is still being written
 
     # ps once: pid -> (ppid, start time); LC_ALL=C so lstart parses on any locale
     ps = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,lstart="], capture_output=True, text=True,
@@ -54,9 +49,10 @@ def main() -> None:
             d_proc[int(f[0])] = (int(f[1]), time.mktime(time.strptime(f[2].strip(), "%a %b %d %H:%M:%S %Y")))
         except (IndexError, ValueError):
             continue
-    s_mine, pid = set(), os.getpid()   # this hook and its ancestors: Claude Code's own process among them
-    while pid > 1 and pid not in s_mine:
-        s_mine.add(pid)
+    # s_skip: the pids never warned about. First this hook and its ancestors: Claude Code's own process among them
+    s_skip, pid = set(), os.getpid()
+    while pid > 1 and pid not in s_skip:
+        s_skip.add(pid)
         pid = d_proc.get(pid, (0, 0))[0]
 
     machine = os.environ.get("JR_MACHINE_NAME") or (
@@ -70,22 +66,18 @@ def main() -> None:
     elif not boot:
         boot = next((l.split()[1] for l in open("/proc/stat") if l.startswith("btime ")), None)
 
-    s_ended = set()   # pids that logged an end (after /clear the process lives on and logs a new start)
+    l_ev = []   # (lifecycle line, its pid or 0); a line that is not a JSON object, or whose pid is no number, is left out
     for raw in l_raw:
         try:
             ev = json.loads(raw)
-            if ev.get("event") == "end" and ev.get("pid"):
-                s_ended.add(int(ev["pid"]))
+            l_ev.append((ev, int(ev.get("pid") or 0)))
         except (ValueError, TypeError, AttributeError):
             continue
-    l_warn, s_seen = [], set()
-    for raw in l_raw:
-        try:
-            ev = json.loads(raw)
-            pid = int(ev.get("pid") or 0)
-        except (ValueError, TypeError, AttributeError):
-            continue
-        if ev.get("event") != "start" or not pid or pid in s_mine or pid in s_seen or pid in s_ended or pid not in d_proc:
+    # then the pids that logged an end (after /clear the process lives on and logs a new start)
+    s_skip.update(pid for ev, pid in l_ev if ev.get("event") == "end")
+    l_warn = []
+    for ev, pid in l_ev:
+        if ev.get("event") != "start" or not pid or pid in s_skip or pid not in d_proc:
             continue
         if ev.get("machine") and machine and ev["machine"] != machine:
             continue
@@ -93,28 +85,25 @@ def main() -> None:
             continue
         if ev.get("pid_start") and abs(d_proc[pid][1] - int(ev["pid_start"])) > PID_START_SLACK_S:
             continue   # the pid was reused by another process
-        s_seen.add(pid)
+        s_skip.add(pid)   # and the pids already warned about: one warning per pid
         where = f" (tmux: {ev['pane']})" if ev.get("pane") else ""
         l_warn.append(f"DUPLICATE SESSION: this session is already running in PID {pid}{where}. "
                       f"Consider using --fork-session instead.")
     if not l_warn:
         return
-    title = "DUPLICATE SESSION DETECTED"
 
     orange, yellow, bold, rst = "\033[48;5;208m\033[1;97m", "\033[38;5;214m", "\033[1m", "\033[0m"
-    try:
-        if os.environ.get("ARES_NO_TTY"):   # tests: no banner, no 3 s wait
-            raise OSError
-        with open("/dev/tty", "w") as tty:
-            tty.write(f"\n{orange}{' ' * 72}{rst}\n{orange}  ⚠️  agent-resume: {title:<51} {rst}\n"
-                      f"{orange}{' ' * 72}{rst}\n\n")
-            for w in l_warn:
-                tty.write(f"  {yellow}⚠️{bold}{w}{rst}\n")
-            tty.write(f"\n  {yellow}Press Ctrl+C to abort, or continue at your own risk.{rst}\n\n")
-            tty.flush()
+    if not os.environ.get("ARES_NO_TTY"):   # tests: no banner, no 3 s wait
+        try:
+            with open("/dev/tty", "w") as tty:   # closed, so flushed, before the 3 s
+                tty.write(f"\n{orange}{' ' * 72}{rst}\n{orange}  ⚠️  agent-resume: {'DUPLICATE SESSION DETECTED':<51} {rst}\n"
+                          f"{orange}{' ' * 72}{rst}\n\n")
+                for w in l_warn:
+                    tty.write(f"  {yellow}⚠️{bold}{w}{rst}\n")
+                tty.write(f"\n  {yellow}Press Ctrl+C to abort, or continue at your own risk.{rst}\n\n")
             time.sleep(3)
-    except OSError:
-        pass
+        except OSError:
+            pass
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                              "additionalContext": " | ".join(l_warn)}}))
 

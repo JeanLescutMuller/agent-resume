@@ -10,48 +10,19 @@
 
 set -euo pipefail
 
-SERVICE_DIR="$HOME/opt/agent-resume"
-REAL_HOME=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
-SANDBOX=$( [[ "$HOME" != "$REAL_HOME" ]] && echo true || echo false )
+# install.sh next to this file, sourced: only its settings (SERVICE_DIR, SETTINGS_JSON, SANDBOX, CODEX_HOME in a
+# sandbox) and its functions remove_links and edit_hooks; it installs nothing.
+source "$(dirname "${BASH_SOURCE[0]}")/install.sh"
 
 echo "Uninstalling agent-resume..."
 
 # -- Links into ~/opt/agent-resume ------------------------------------------------
-for link in "$HOME/.local/bin/ares" "$HOME/.local/bin/asm"; do
-    [ -L "$link" ] && [[ "$(readlink "$link")" == "$SERVICE_DIR/"* ]] && rm "$link" && echo "  removed $link"
-done
+remove_links "$HOME/.local/bin/ares" "$HOME/.local/bin/asm"
 
 # -- The hook group in ~/.claude/settings.json ---------------------------------------
-SETTINGS_JSON="$HOME/.claude/settings.json"
-if [ -f "$SETTINGS_JSON" ]; then
-    python3 - "$SETTINGS_JSON" <<'PY'
-import json, sys
-path = sys.argv[1]
-d_settings = json.load(open(path))
-d_hooks = d_settings.get("hooks", {})
-OURS = ("agent-resume/session_start.py", "agent-resume/session_end.sh")
-changed = False
-for event in ("SessionStart", "SessionEnd"):
-    l_all = d_hooks.get(event, [])
-    l_kept = [g for g in l_all if not any(o in h.get("command", "") for h in g.get("hooks", []) for o in OURS)]
-    if len(l_kept) != len(l_all):
-        changed = True
-        if l_kept:
-            d_hooks[event] = l_kept
-        else:
-            d_hooks.pop(event)
-if changed:
-    if not d_hooks:
-        d_settings.pop("hooks")
-    with open(path, "w") as f:
-        json.dump(d_settings, f, indent=2)
-        f.write("\n")
-    print(f"  removed the SessionStart hook from {path}")
-PY
-fi
+[ -f "$SETTINGS_JSON" ] && edit_hooks remove
 
 # -- The Codex plugin -------------------------------------------------------------------
-$SANDBOX && export CODEX_HOME="$HOME/.codex"   # never the real ~/.codex/config.toml from a sandbox
 if command -v codex &>/dev/null && [ -d "$SERVICE_DIR/codex-plugin" ]; then
     codex plugin remove agent-resume@agent-resume-local >/dev/null 2>&1 || true
     codex plugin marketplace remove agent-resume-local >/dev/null 2>&1 || true
