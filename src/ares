@@ -77,7 +77,7 @@ def _load_settings() -> Dict[str, Any]:
                 defaults[k] = v
             elif isinstance(v, list):
                 defaults[k] = [s for s in v if isinstance(s, str) and s]
-            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            elif isinstance(v, (int, float)):   # bool is caught first
                 defaults[k] = v
     except (OSError, json.JSONDecodeError):
         pass
@@ -90,8 +90,8 @@ LOCAL_INDEX_DIR = os.path.expanduser(_SETTINGS["local_index_dir"])
 # Entries of sessions nobody typed in (`claude -p`, SDK, Codex sub-agents; ~87% of the files) live apart, so a
 # search reads only the interactive ones. The pull of another machine's index leaves this folder out.
 HIDDEN_INDEX_DIR = os.path.join(LOCAL_INDEX_DIR, "hidden")
-IGNORE_PATH_SUBSTRINGS: List[str] = _SETTINGS.get("ignore_path_substrings", [])
-REMOTE_HOSTS: List[str] = _SETTINGS.get("remote_hosts", [])
+IGNORE_PATH_SUBSTRINGS: List[str] = _SETTINGS["ignore_path_substrings"]
+REMOTE_HOSTS: List[str] = _SETTINGS["remote_hosts"]
 # remote/<ssh host>/<uuid>.json: read-only copies of each remote host's index, refreshed by _pull_one
 REMOTE_INDEX_DIR = os.path.join(ARES_DATA_DIR, "remote")
 SSH_OPTS = ["-o", "ConnectTimeout=3", "-o", "BatchMode=yes"]
@@ -103,7 +103,7 @@ PULL_REMOTE_CMD = ("~/opt/agent-resume/bin/ares reindex >/dev/null 2>&1; "
 
 CODEX_SESSIONS_DIR = os.path.expanduser(_SETTINGS["codex_sessions_dir"])
 CODEX_SESSION_INDEX_FILE = os.path.expanduser(_SETTINGS["codex_session_index_file"])
-_codex_enabled_setting = _SETTINGS.get("codex_enabled")
+_codex_enabled_setting = _SETTINGS["codex_enabled"]
 CODEX_ENABLED = (_codex_enabled_setting if isinstance(_codex_enabled_setting, bool)
                  else os.path.isdir(CODEX_SESSIONS_DIR))
 
@@ -180,7 +180,7 @@ TITLE_SOURCE_LABELS = {
 
 # -- Utilities --------------------------------------------------------------
 
-def log_verbose(msg: str, verbose: bool = False) -> None:
+def log_verbose(msg: str, verbose: bool) -> None:
     """Print message to stderr with timestamp if verbose."""
     if verbose:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -213,17 +213,16 @@ def _make_portable_jsonl_path(abs_path: str) -> str:
     idx = abs_path.find(marker)
     if idx != -1:
         return "~/.claude/projects/" + abs_path[idx + len(marker):]
-    home = os.path.expanduser("~")
-    if abs_path.startswith(home + "/"):
-        return "~/" + abs_path[len(home) + 1:]
+    if abs_path.startswith(HOME + "/"):
+        return "~/" + abs_path[len(HOME) + 1:]
     return abs_path
 
 
 def _resolve_jsonl_path(stored_path: str) -> str:
-    """Resolve a stored jsonl_path (possibly with ~) to an absolute path."""
-    if stored_path.startswith("~/"):
-        return os.path.expanduser(stored_path)
-    return stored_path
+    """Resolve a stored jsonl_path (possibly with ~) to an absolute path.
+
+    A stored path is "~/..." or absolute (_make_portable_jsonl_path): expanduser leaves an absolute one as is."""
+    return os.path.expanduser(stored_path)
 
 
 def read_json(path: str) -> Optional[Dict[str, Any]]:
@@ -320,7 +319,6 @@ class Transcript(NamedTuple):
     the whole file with their own near-identical loop - and the title-priority
     rule had already drifted between the two copies.
     """
-    session_id: str
     custom_title: Optional[str]     # set explicitly via /rename
     ai_title: Optional[str]         # Claude Code's own auto-generated title
     permission_mode: Optional[str]
@@ -330,7 +328,7 @@ class Transcript(NamedTuple):
     messages: List[Dict[str, Any]]
     # False for a session no human typed in: `claude -p` / Agent SDK runs,
     # Codex sub-agents and `codex exec`. Kept in the index, hidden in the picker.
-    interactive: bool = True
+    interactive: bool
 
     @property
     def title(self) -> Optional[str]:
@@ -340,7 +338,7 @@ class Transcript(NamedTuple):
 
 def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
     """Parse a session .jsonl into a Transcript (single pass over the file)."""
-    session_id = custom_title = ai_title = permission_mode = None
+    custom_title = ai_title = permission_mode = None
     cwd = created_at = last_active = entrypoint = None
     messages: List[Dict[str, Any]] = []
 
@@ -353,16 +351,12 @@ def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
 
         if etype == "custom-title":
             custom_title = entry.get("customTitle") or custom_title
-            session_id = entry.get("sessionId") or session_id
             continue
 
         if etype == "ai-title":
             ai_title = entry.get("aiTitle") or ai_title
-            session_id = entry.get("sessionId") or session_id
             continue
 
-        if not session_id:
-            session_id = entry.get("sessionId")
         if not cwd:
             cwd = entry.get("cwd")
 
@@ -378,11 +372,9 @@ def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
                 if created_at is None:
                     created_at = ts
                 last_active = ts
-                role = "assistant" if etype == "assistant" else "user"
-                messages.append({"role": role, "timestamp": ts, "text": text})
+                messages.append({"role": etype, "timestamp": ts, "text": text})
 
     return Transcript(
-        session_id=session_id or Path(jsonl_path).stem,
         custom_title=custom_title,
         ai_title=ai_title,
         permission_mode=permission_mode,
@@ -468,7 +460,6 @@ def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
             messages.append({"role": role, "timestamp": ts, "text": text})
 
     return Transcript(
-        session_id=session_id or Path(jsonl_path).stem,
         custom_title=None,
         ai_title=_codex_session_titles().get(session_id or ""),
         permission_mode=None,
@@ -591,7 +582,7 @@ def split_pane(pane: Optional[str]) -> Tuple[Optional[str], Optional[str], Optio
 
 
 def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str, Any]],
-              jsonl_path: str, agent_type: str = "claude") -> Dict[str, Any]:
+              jsonl_path: str, agent_type: str) -> Dict[str, Any]:
     """Build the index document for one session."""
     title, title_source = resolve_title(transcript)
 
@@ -631,10 +622,7 @@ def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str
         "tmux_session": tmux_session,
         "tmux_window": tmux_window,
         "tmux_pane": tmux_pane,
-        "conversation": [
-            {"role": m["role"], "timestamp": m["timestamp"], "text": m["text"]}
-            for m in transcript.messages
-        ],
+        "conversation": transcript.messages,   # already {role, timestamp, text}
     }
 
 
@@ -677,10 +665,7 @@ class SearchOpts(NamedTuple):
 
 def is_source_missing(d_fields: Dict[str, Any]) -> bool:
     """Check if the source .jsonl file has been deleted from disk."""
-    jsonl_path = d_fields.get("jsonl_path", "")
-    if not jsonl_path:
-        return True
-    return not os.path.exists(_resolve_jsonl_path(jsonl_path))
+    return not os.path.exists(_resolve_jsonl_path(d_fields.get("jsonl_path") or ""))   # "" never exists
 
 
 def index_dirs() -> List[Tuple[str, Optional[str]]]:
@@ -877,7 +862,7 @@ def time_ago(ts_str: Optional[str]) -> str:
     return ts.strftime("%Y-%m-%d")
 
 
-def extract_snippet(conversation: List[Dict[str, Any]], keywords: Optional[List[str]] = None,
+def extract_snippet(conversation: List[Dict[str, Any]], keywords: Optional[List[str]],
                     max_chars: int = 120) -> str:
     """One line of context for the picker's preview pane.
 
@@ -907,7 +892,7 @@ def extract_snippet(conversation: List[Dict[str, Any]], keywords: Optional[List[
 
 def status_block(doc: Dict[str, Any]) -> str:
     """The '[ Pending  5 min ago ]' prefix, colored by state and freshness."""
-    state = clean_field(doc.get("session_state")) or "?"
+    state = clean_field(doc.get("session_state"))
     last_active = doc.get("last_active") or ""
     # A session with no lifecycle line has no start/end events at all, so
     # its state was never observed - say "Unknown" rather than assert "Exited".
@@ -984,8 +969,7 @@ def format_session_for_fzf(doc: Dict[str, Any], idx_path: str,
 
 
 def run_fzf(sessions: List[Tuple[Dict[str, Any], str]], keywords: Optional[List[str]],
-            verbose: bool = False,
-            action_verb: str = "Resume") -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+            verbose: bool) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """Run fzf picker and return (UUID, doc) tuple. Returns (None, None) if cancelled."""
     if not sessions:
         print("No sessions found.", file=sys.stderr)
@@ -1012,7 +996,7 @@ def run_fzf(sessions: List[Tuple[Dict[str, Any], str]], keywords: Optional[List[
                 "--with-nth=1",
                 "--preview", preview_cmd,
                 "--preview-window=down:3:wrap",
-                f"--prompt=[{VERSION}] {action_verb} session: ",
+                f"--prompt=[{VERSION}] Resume session: ",
                 "--height=80%",
                 "--layout=reverse",
                 "--no-multi",
@@ -1187,7 +1171,6 @@ def index_one(backend: Backend, jsonl_path: str, idx_path: str) -> Tuple[str, st
 
     doc = build_doc(uuid, transcript, lifecycle_events, jsonl_path, backend.name)
     if doc.get("interactive") is False:
-        Path(HIDDEN_INDEX_DIR).mkdir(parents=True, exist_ok=True)
         write_json_atomic(doc, os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json"))
         if os.path.exists(idx_path):
             os.remove(idx_path)   # an entry from before this split
@@ -1302,27 +1285,23 @@ def run_reindex(l_todo: List[Tuple[str, str, "Backend"]],
     return indexed, errors
 
 
-def migrate_hidden_entries() -> int:
+def migrate_hidden_entries() -> None:
     """Move the entries of non-interactive sessions from indexes/ to indexes/hidden/ (once per machine).
 
     A marker file ends it; entries synced in later by an older ares are moved by the next `ares reindex --force`.
-    Returns how many were moved.
     """
     marker = os.path.join(HIDDEN_INDEX_DIR, ".migrated")
     if os.path.exists(marker) or not os.path.isdir(LOCAL_INDEX_DIR):
         return 0
     Path(HIDDEN_INDEX_DIR).mkdir(parents=True, exist_ok=True)
-    n = 0
     for path in glob.glob(os.path.join(LOCAL_INDEX_DIR, "*.json")):
         doc = read_json(path)
         if doc is not None and doc.get("interactive") is False:
             os.replace(path, os.path.join(HIDDEN_INDEX_DIR, os.path.basename(path)))
-            n += 1
     Path(marker).touch()
-    return n
 
 
-def refresh_index(verbose: bool = False) -> None:
+def refresh_index(verbose: bool) -> None:
     """Before a search: re-index only the transcripts newer than their index entry (agent-tracker DESIGN §3).
 
     Silent, and never fatal: a failure just means the search reads the index as it was.
@@ -1336,7 +1315,7 @@ def refresh_index(verbose: bool = False) -> None:
         log_verbose(f"refresh skipped: {e}", verbose)
 
 
-def cmd_reindex(max_sessions: int = 0, force: bool = False, single_uuid: str = "") -> Dict[str, int]:
+def cmd_reindex(max_sessions: int, force: bool, single_uuid: str) -> None:
     """Build/refresh index JSON files from local JSONL files, with a progress log.
 
     Step 1: scan local .jsonl history files; Step 2: scan the .json index files;
@@ -1363,15 +1342,13 @@ def cmd_reindex(max_sessions: int = 0, force: bool = False, single_uuid: str = "
         nonlocal done
         done += 1
         if exc is None:
-            marker = TITLE_SOURCE_MARKERS.get(source, "⚠️")
+            marker = TITLE_SOURCE_MARKERS[source]   # resolve_title gives one of its 4 keys
             print(f"    [{done}/{len(l_todo)}] {uuid[:8]}  indexed {marker} {title[:60]}", flush=True)
         else:
             print(f"    [{done}/{len(l_todo)}] {uuid[:8]}  ERROR: {exc}", file=sys.stderr, flush=True)
 
     indexed, errors = run_reindex(l_todo, report)
     print(f"  Step 3b: indexed={indexed}, errors={errors}")
-    return {"sessions_scanned": d_counts["scanned"], "sessions_indexed": indexed,
-            "sessions_skipped": d_counts["skipped"], "errors": errors}
 
 
 # -- Other machines ------------------------------------------------------------
@@ -1407,7 +1384,7 @@ def _pull_one(host: str) -> bool:
         return False
 
 
-def refresh_all(verbose: bool = False) -> None:
+def refresh_all(verbose: bool) -> None:
     """Refresh this machine's index and pull every remote host's, all at once; an unreachable host keeps its
     last copy, and says so."""
     with ThreadPoolExecutor(max_workers=len(REMOTE_HOSTS) or 1) as pool:
@@ -1420,7 +1397,7 @@ def refresh_all(verbose: bool = False) -> None:
 
 # -- Picking a session -------------------------------------------------------
 
-def pick_session(opts: SearchOpts, action_verb: str) -> Tuple[str, Dict[str, Any]]:
+def pick_session(opts: SearchOpts) -> Tuple[str, Dict[str, Any]]:
     """Refresh the index, search it and let the user pick one session in fzf.
 
     Exits the process on an empty result or a cancelled picker; never returns None.
@@ -1435,7 +1412,7 @@ def pick_session(opts: SearchOpts, action_verb: str) -> Tuple[str, Dict[str, Any
     if fuzzy:
         print("  (no exact matches - showing fuzzy results)", file=sys.stderr)
 
-    uuid, doc = run_fzf(sessions, opts.keywords, opts.verbose, action_verb)
+    uuid, doc = run_fzf(sessions, opts.keywords, opts.verbose)
     if not uuid or not doc:
         sys.exit(0)
     return uuid, doc
@@ -1443,7 +1420,7 @@ def pick_session(opts: SearchOpts, action_verb: str) -> Tuple[str, Dict[str, Any
 
 # -- Resume -----------------------------------------------------------------
 
-def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) -> None:
+def cmd_resume(opts: SearchOpts, fork: bool, print_cmd: bool) -> None:
     """Find and resume a session.
 
     print_cmd builds the exact command and prints it to stdout (nothing else)
@@ -1459,7 +1436,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
             sys.exit(1)
         uuid = doc.get("session_id", opts.uuid)
     else:
-        uuid, doc = pick_session(opts, action_verb="Resume")
+        uuid, doc = pick_session(opts)
 
     if doc.get("_source_missing", False):
         # Its transcript is gone from this machine (deleted by hand, or by Claude Code after cleanupPeriodDays):
@@ -1563,7 +1540,7 @@ def _fmt_ts(ts: Any) -> str:
         return "?"
 
 
-def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
+def tmux_plan(include_stale: bool, this_boot: bool) -> Dict[str, Any]:
     """Read agent-tracker's files and decide what to restore (no tmux call).
 
     this_boot: the tmux server died without a reboot: candidates are this boot's Claude sessions
@@ -1582,7 +1559,7 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
         uuid = os.path.basename(folder.rstrip("/"))
         seen = read_json(os.path.join(folder, "last_seen.json")) or {}
         l_events = read_lifecycle(uuid)
-        l_rows.append({"uuid": uuid, "seen": seen, "start": open_start(l_events), "events": l_events,
+        l_rows.append({"uuid": uuid, "seen": seen, "events": l_events,
                        "boots": [seen.get("boot_ts")] + [e.get("boot_ts") for e in l_events]})
 
     if this_boot:
@@ -1596,8 +1573,8 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
 
     l_cand = []
     for r in l_rows:
-        start = killed_start(r["events"], lambda b: same_boot(b, prev))   # both modes: see its docstring
-        if not start or not same_boot(start.get("boot_ts"), prev) or (start.get("agent") or "claude") != "claude":
+        start = killed_start(r["events"], lambda b: same_boot(b, prev))   # both modes: see its docstring; of boot prev
+        if not start or (start.get("agent") or "claude") != "claude":
             continue
         if this_boot and pid_alive(start.get("pid")):
             continue   # still running: nothing to restore (after a reboot, a pid is a new process: not checked)
@@ -1807,7 +1784,7 @@ def _iterm_tabs(l_osa: List[str], l_sessions: List[str]) -> None:
         l_osa.append(f"  tell current session of w to write text {_applescript_str(cmd)}")
 
 
-def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = True, this_boot: bool = False) -> int:
+def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -> int:
     """Print the plan; unless dry_run, carry it out. Returns the exit status."""
     plan = tmux_plan(include_stale, this_boot)
     if not this_boot:   # a tmux server killed without a reboot leaves this boot's sessions to restore too
