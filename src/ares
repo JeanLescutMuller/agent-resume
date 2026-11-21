@@ -627,21 +627,7 @@ class SearchOpts(NamedTuple):
     max_scan: int = 50
     uuid: str = ""
     verbose: bool = False
-
-    @classmethod
-    def from_args(cls, args: argparse.Namespace) -> "SearchOpts":
-        return cls(
-            keywords=args.keywords,
-            from_days=args.from_days_ago,
-            until_days=args.until_days_ago,
-            host=args.host,
-            state=args.state,
-            agent=args.agent,
-            tmux=args.tmux,
-            max_scan=args.max_scan,
-            uuid=args.uuid,
-            verbose=args.verbose,
-        )
+    # main() builds it from the parsed flags of 'resume': each field is the dest of one flag
 
 
 # -- Session Search ---------------------------------------------------------
@@ -1876,14 +1862,15 @@ EXAMPLES: List[Tuple[str, str, Optional[str]]] = [
 ]
 
 
-def _epilog_for(command: str) -> str:
-    """Render this command's slice of EXAMPLES as a --help epilog."""
+def _add_command(subparsers: Any, command: str, help_text: str) -> argparse.ArgumentParser:
+    """Add one command's parser, with its slice of EXAMPLES rendered as its --help epilog."""
     rows = [(ex, note) for cmd, ex, note in EXAMPLES if cmd == command]
     width = max(len(ex) for ex, _ in rows)
     lines = ["Examples:"]
     for ex, note in rows:
         lines.append(f"  {ex.ljust(width)}   # {note}" if note else f"  {ex}")
-    return "\n".join(lines)
+    return subparsers.add_parser(command, help=help_text, epilog="\n".join(lines),
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
 
 
 TOP_DESCRIPTION = f"""ares {VERSION} - agent-resume (was asm): find and resume agent sessions
@@ -1897,20 +1884,6 @@ TOP_DESCRIPTION = f"""ares {VERSION} - agent-resume (was asm): find and resume a
 
 TOP_EPILOG = "Run `ares <command> --help` for that command's full flag list and examples."
 
-def _add_search_args(p: argparse.ArgumentParser) -> None:
-    """Search/filter flags of 'resume'."""
-    p.add_argument("-f", "--from-days-ago", type=int, default=90, help="Only sessions active in last N days (default: 90)")
-    p.add_argument("-u", "--until-days-ago", type=int, help="Only sessions active more than N days ago")
-    p.add_argument("--host", default="", help="Filter by hostname")
-    p.add_argument("--state", default="", help="Filter by session state (pending, exited, deleted)")
-    p.add_argument("--agent", default="", help=f"Filter by agent type ({', '.join(sorted(BACKENDS))})")
-    p.add_argument("--tmux", default="", help="Filter by tmux session name")
-    p.add_argument("--max-scan", type=int, default=50, help="Max recent files to scan without keywords (default: 50)")
-    p.add_argument("--uuid", default="", help="Skip the search, directly act on this session UUID")
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
-    p.add_argument("keywords", nargs="*", help="Keywords to search for")
-
-
 def main() -> None:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -1922,34 +1895,37 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=f"ares {VERSION}")
     subparsers = parser.add_subparsers(dest="command")
 
-    resume_parser = subparsers.add_parser(
-        "resume", help="Find and resume a past session",
-        epilog=_epilog_for("resume"), formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    _add_search_args(resume_parser)
-    resume_parser.add_argument("--fork", action="store_true", help="Fork the session instead of resuming it")
-    resume_parser.add_argument("--print-cmd", action="store_true",
-                               help="Print the resume/fork command instead of running it (scripting/testing)")
+    # The search/filter flags of 'resume': their dests are SearchOpts' fields (metavar: the name the help shows)
+    p = _add_command(subparsers, "resume", "Find and resume a past session")
+    p.add_argument("-f", "--from-days-ago", dest="from_days", metavar="FROM_DAYS_AGO", type=int, default=90,
+                   help="Only sessions active in last N days (default: 90)")
+    p.add_argument("-u", "--until-days-ago", dest="until_days", metavar="UNTIL_DAYS_AGO", type=int,
+                   help="Only sessions active more than N days ago")
+    p.add_argument("--host", default="", help="Filter by hostname")
+    p.add_argument("--state", default="", help="Filter by session state (pending, exited, deleted)")
+    p.add_argument("--agent", default="", help=f"Filter by agent type ({', '.join(sorted(BACKENDS))})")
+    p.add_argument("--tmux", default="", help="Filter by tmux session name")
+    p.add_argument("--max-scan", type=int, default=50, help="Max recent files to scan without keywords (default: 50)")
+    p.add_argument("--uuid", default="", help="Skip the search, directly act on this session UUID")
+    p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
+    p.add_argument("keywords", nargs="*", help="Keywords to search for")
+    p.add_argument("--fork", action="store_true", help="Fork the session instead of resuming it")
+    p.add_argument("--print-cmd", action="store_true",
+                   help="Print the resume/fork command instead of running it (scripting/testing)")
 
-    tmux_parser = subparsers.add_parser(
-        "tmux", help="After a crash: restore the previous boot's tmux sessions and Claude sessions",
-        epilog=_epilog_for("tmux"), formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    tmux_parser.add_argument("--dry-run", action="store_true", help="Print the plan, change nothing")
-    tmux_parser.add_argument("--this-boot", action="store_true",
-                             help="The tmux server died without a reboot: restore this boot's Claude sessions whose "
-                                  "process is gone without a clean exit")
-    tmux_parser.add_argument("--all", action="store_true",
-                             help="No snapshot of that boot only: also restore stale Claude sessions (stopped ticking > 2 min before the others)")
-    tmux_parser.add_argument("--no-iterm", action="store_true", help="Do not open iTerm2 tabs")
+    p = _add_command(subparsers, "tmux", "After a crash: restore the previous boot's tmux sessions and Claude sessions")
+    p.add_argument("--dry-run", action="store_true", help="Print the plan, change nothing")
+    p.add_argument("--this-boot", action="store_true",
+                   help="The tmux server died without a reboot: restore this boot's Claude sessions whose "
+                        "process is gone without a clean exit")
+    p.add_argument("--all", action="store_true",
+                   help="No snapshot of that boot only: also restore stale Claude sessions (stopped ticking > 2 min before the others)")
+    p.add_argument("--no-iterm", action="store_true", help="Do not open iTerm2 tabs")
 
-    reindex_parser = subparsers.add_parser(
-        "reindex", help="Re-index all sessions now",
-        epilog=_epilog_for("reindex"), formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    reindex_parser.add_argument("-n", "--max", type=int, default=0, help="Max sessions to process (0 = unlimited, default: 0)")
-    reindex_parser.add_argument("--force", action="store_true", help="Force reindex all sessions, ignoring mtime-based skip")
-    reindex_parser.add_argument("--uuid", default="", help="Reindex a single session by UUID")
+    p = _add_command(subparsers, "reindex", "Re-index all sessions now")
+    p.add_argument("-n", "--max", type=int, default=0, help="Max sessions to process (0 = unlimited, default: 0)")
+    p.add_argument("--force", action="store_true", help="Force reindex all sessions, ignoring mtime-based skip")
+    p.add_argument("--uuid", default="", help="Reindex a single session by UUID")
 
     args = parser.parse_args()
 
@@ -1958,7 +1934,8 @@ def main() -> None:
         sys.exit(1)
 
     if args.command == "resume":
-        cmd_resume(SearchOpts.from_args(args), args.fork, args.print_cmd)
+        opts = SearchOpts(**{field: getattr(args, field) for field in SearchOpts._fields})
+        cmd_resume(opts, args.fork, args.print_cmd)
     elif args.command == "tmux":
         sys.exit(cmd_tmux(args.dry_run, args.all, not args.no_iterm, args.this_boot))
     elif args.command == "reindex":
