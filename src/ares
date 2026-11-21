@@ -34,6 +34,7 @@ import shutil
 import tarfile
 import tempfile
 import time
+import functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -291,13 +292,16 @@ def iter_entries(jsonl_path: Any, warn: bool = False) -> Iterator[Dict[str, Any]
             print(f"  WARNING: could not read {jsonl_path}: {e}", file=sys.stderr)
 
 
-def extract_text(content: Any) -> str:
-    """Flatten a message's content (str, or list of blocks) to clean text."""
+def extract_text(content: Any, kinds: Tuple[str, ...] = ("text",)) -> str:
+    """Flatten a message's content (str, or list of blocks of one of these kinds) to clean text.
+
+    Claude's text blocks are "text"; Codex's are "input_text" / "output_text".
+    """
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
         parts = [b.get("text", "") for b in content
-                 if isinstance(b, dict) and b.get("type") == "text"]
+                 if isinstance(b, dict) and b.get("type") in kinds]
         text = "\n".join(p for p in parts if p)
     else:
         return ""
@@ -313,35 +317,42 @@ def is_tool_result(entry: Dict[str, Any]) -> bool:
 
 
 class Transcript(NamedTuple):
-    """Everything ares reads out of one .jsonl session transcript.
+    """Everything ares reads out of one .jsonl session transcript (Claude's or Codex's).
 
-    Built by a single pass in read_transcript(). Indexing needs the messages,
+    Built by a single pass in read_transcript() / read_codex_transcript(). Indexing needs the messages,
     resume needs only the title and permission mode, but both used to walk
     the whole file with their own near-identical loop - and the title-priority
     rule had already drifted between the two copies.
     """
     session_id: str
-    custom_title: Optional[str]     # set explicitly via /rename
-    ai_title: Optional[str]         # Claude Code's own auto-generated title
-    permission_mode: Optional[str]
     cwd: Optional[str]
-    created_at: Optional[str]
-    last_active: Optional[str]
-    messages: List[Dict[str, Any]]
+    messages: List[Dict[str, Any]]    # {"role", "timestamp", "text"}: the real conversation turns, in order
     # False for a session no human typed in: `claude -p` / Agent SDK runs,
     # Codex sub-agents and `codex exec`. Kept in the index, hidden in the picker.
     interactive: bool = True
+    custom_title: Optional[str] = None     # set explicitly via /rename (Claude only)
+    ai_title: Optional[str] = None         # Claude Code's own auto-generated title; Codex's thread name
+    permission_mode: Optional[str] = None  # Claude only
 
     @property
     def title(self) -> Optional[str]:
         """Best available title: an explicit /rename beats Claude's ai-title."""
         return self.custom_title or self.ai_title
 
+    @property
+    def created_at(self) -> Optional[str]:
+        """The first timestamp of a conversation turn (a turn without one is skipped)."""
+        return next((m["timestamp"] for m in self.messages if m["timestamp"] is not None), None)
+
+    @property
+    def last_active(self) -> Optional[str]:
+        """The timestamp of the last conversation turn."""
+        return self.messages[-1]["timestamp"] if self.messages else None
+
 
 def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
     """Parse a session .jsonl into a Transcript (single pass over the file)."""
-    session_id = custom_title = ai_title = permission_mode = None
-    cwd = created_at = last_active = entrypoint = None
+    session_id = custom_title = ai_title = permission_mode = cwd = entrypoint = None
     messages: List[Dict[str, Any]] = []
 
     for entry in iter_entries(jsonl_path, warn=warn):
@@ -373,25 +384,11 @@ def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
         # bookkeeping, and an entry whose text is entirely noise tags is too.
         if etype == "assistant" or (etype == "user" and not is_tool_result(entry)):
             text = extract_text(entry.get("message", {}).get("content", ""))
-            if text:
-                ts = entry.get("timestamp")
-                if created_at is None:
-                    created_at = ts
-                last_active = ts
-                role = "assistant" if etype == "assistant" else "user"
-                messages.append({"role": role, "timestamp": ts, "text": text})
+            if text:   # etype is the role: "user" or "assistant"
+                messages.append({"role": etype, "timestamp": entry.get("timestamp"), "text": text})
 
-    return Transcript(
-        session_id=session_id or Path(jsonl_path).stem,
-        custom_title=custom_title,
-        ai_title=ai_title,
-        permission_mode=permission_mode,
-        cwd=cwd,
-        created_at=created_at,
-        last_active=last_active,
-        messages=messages,
-        interactive=not (entrypoint or "").startswith("sdk-"),
-    )
+    return Transcript(session_id or Path(jsonl_path).stem, cwd, messages,
+                      not (entrypoint or "").startswith("sdk-"), custom_title, ai_title, permission_mode)
 
 
 # -- Codex backend: transcript parsing ---------------------------------------
@@ -404,29 +401,24 @@ def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
 # mapped onto Transcript.ai_title (Codex has no /rename-equivalent "custom"
 # title source, so custom_title is always None for this backend).
 
-_codex_titles_cache: Optional[Dict[str, str]] = None
-
-
+@functools.lru_cache(maxsize=None)
 def _codex_session_titles() -> Dict[str, str]:
     """uuid -> latest thread_name from ~/.codex/session_index.jsonl.
 
     Cached for the lifetime of the process: the file only grows during a
     reindex run, and re-reading it once per session would be O(sessions^2).
     """
-    global _codex_titles_cache
-    if _codex_titles_cache is None:
-        titles: Dict[str, str] = {}
-        for entry in iter_entries(CODEX_SESSION_INDEX_FILE):
-            sid, name = entry.get("id"), entry.get("thread_name")
-            if sid and name:
-                titles[sid] = name
-        _codex_titles_cache = titles
-    return _codex_titles_cache
+    titles: Dict[str, str] = {}
+    for entry in iter_entries(CODEX_SESSION_INDEX_FILE):
+        sid, name = entry.get("id"), entry.get("thread_name")
+        if sid and name:
+            titles[sid] = name
+    return titles
 
 
 def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
     """Parse a Codex rollout .jsonl into a Transcript (single pass over the file)."""
-    session_id = cwd = created_at = last_active = None
+    session_id = cwd = None
     interactive = True
     messages: List[Dict[str, Any]] = []
 
@@ -453,31 +445,13 @@ def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
         if role not in ("user", "assistant"):
             continue
 
-        content = payload.get("content")
-        text = ""
-        if isinstance(content, list):
-            parts = [b.get("text", "") for b in content
-                     if isinstance(b, dict) and b.get("type") in ("input_text", "output_text")]
-            text = "\n".join(p for p in parts if p)
-        text = NOISE_RE.sub("", text).strip()
+        content = payload.get("content")   # a list of blocks (a plain string is not read here, unlike Claude's)
+        text = extract_text(content if isinstance(content, list) else None, ("input_text", "output_text"))
         if text:
-            ts = entry.get("timestamp")
-            if created_at is None:
-                created_at = ts
-            last_active = ts
-            messages.append({"role": role, "timestamp": ts, "text": text})
+            messages.append({"role": role, "timestamp": entry.get("timestamp"), "text": text})
 
-    return Transcript(
-        session_id=session_id or Path(jsonl_path).stem,
-        custom_title=None,
-        ai_title=_codex_session_titles().get(session_id or ""),
-        permission_mode=None,
-        cwd=cwd,
-        created_at=created_at,
-        last_active=last_active,
-        messages=messages,
-        interactive=interactive,
-    )
+    return Transcript(session_id or Path(jsonl_path).stem, cwd, messages, interactive,
+                      ai_title=_codex_session_titles().get(session_id or ""))
 
 
 # -- Session Index Building -------------------------------------------------
@@ -631,10 +605,7 @@ def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str
         "tmux_session": tmux_session,
         "tmux_window": tmux_window,
         "tmux_pane": tmux_pane,
-        "conversation": [
-            {"role": m["role"], "timestamp": m["timestamp"], "text": m["text"]}
-            for m in transcript.messages
-        ],
+        "conversation": transcript.messages,   # each {"role", "timestamp", "text"}
     }
 
 
@@ -1065,7 +1036,11 @@ def resume_shell_cmd(doc: Dict[str, Any], agent_cmd: str) -> str:
     return f"ssh -t {shlex.quote(host)} {shlex.quote(remote)}"
 
 
-# -- Claude backend adapters --------------------------------------------------
+# -- Agent backends ----------------------------------------------------------
+# The seam between "how to find/parse/resolve/resume a session for this
+# agent" (agent-specific) and everything else - search, filtering, ranking,
+# fzf display, host coloring - which already operates purely on index-doc
+# dicts and doesn't care where they came from.
 
 def _claude_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], uuid: str, fork: bool) -> str:
     """The `claude --resume` command (the folder is resume_shell_cmd's). The transcript, when readable here, gives
@@ -1082,18 +1057,6 @@ def _claude_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], 
     return cmd
 
 
-def _claude_uuid_of(jsonl_path: str) -> str:
-    """Claude names transcripts <uuid>.jsonl directly - the stem is the uuid."""
-    return Path(jsonl_path).stem
-
-
-# -- Codex backend adapters ---------------------------------------------------
-
-def _codex_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], uuid: str, fork: bool) -> str:
-    """The `codex resume`/`codex fork` command (the folder is resume_shell_cmd's)."""
-    return f"codex {'fork' if fork else 'resume'} {shlex.quote(uuid)}"
-
-
 # Codex names transcripts rollout-<timestamp>-<uuid>.jsonl - the uuid is
 # always the last 36 characters before the extension.
 _CODEX_UUID_RE = re.compile(
@@ -1105,53 +1068,16 @@ def _codex_uuid_of(jsonl_path: str) -> str:
     return m.group(1) if m else Path(jsonl_path).stem
 
 
-def scan_codex_sessions() -> Dict[str, float]:
-    """Scan all local Codex rollout .jsonl files. Returns {path: mtime}.
+def mtimes(paths: Iterator[Path]) -> Dict[str, float]:
+    """{path: mtime} of the files among these paths (a folder that does not exist gives none)."""
+    return {str(f): f.stat().st_mtime for f in paths if f.is_file()}
 
-    Codex shards sessions by date (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl)
-    rather than Claude's per-project-slug layout, hence the recursive walk.
-    """
-    d: Dict[str, float] = {}
-    root = Path(CODEX_SESSIONS_DIR)
-    if not root.exists():
-        return d
-    for f in root.rglob("*.jsonl"):
-        if f.is_file():
-            d[str(f)] = f.stat().st_mtime
-    return d
-
-
-# -- Indexing Operations ----------------------------------------------------
 
 def scan_history_jsonl() -> Dict[str, float]:
-    """Scan all local .jsonl history files. Returns {path: mtime}."""
-    d: Dict[str, float] = {}
-    projects_dir = Path(PROJECTS_DIR)
-    if not projects_dir.exists():
-        return d
-    for slug_dir in projects_dir.iterdir():
-        if not slug_dir.is_dir():
-            continue
-        try:
-            for f in slug_dir.iterdir():
-                # agent-*.jsonl are subagent transcripts, not resumable sessions
-                if f.is_file() and f.suffix == ".jsonl" and not f.name.startswith("agent-"):
-                    d[str(f)] = f.stat().st_mtime
-        except OSError:
-            continue
-    return d
-
-
-def scan_index_dir(index_dir: str) -> Dict[str, float]:
-    """Scan a flat directory of .json index files. Returns {path: mtime}."""
-    d: Dict[str, float] = {}
-    idx_dir = Path(index_dir)
-    if not idx_dir.exists():
-        return d
-    for f in idx_dir.iterdir():
-        if f.is_file() and f.name.endswith(".json"):
-            d[str(f)] = f.stat().st_mtime
-    return d
+    """Scan all local .jsonl history files, one folder per project slug. Returns {path: mtime}."""
+    # "?*.jsonl": a name with something before the ".jsonl" (f.suffix == ".jsonl");
+    # agent-*.jsonl are subagent transcripts, not resumable sessions
+    return mtimes(f for f in Path(PROJECTS_DIR).glob("*/?*.jsonl") if not f.name.startswith("agent-"))
 
 
 def is_ignored_session(jsonl_path: str) -> bool:
@@ -1162,12 +1088,6 @@ def is_ignored_session(jsonl_path: str) -> bool:
     `ignore_path_substrings` in $AGENT_RESUME_HOME/data/settings.json."""
     return any(s in jsonl_path for s in IGNORE_PATH_SUBSTRINGS)
 
-
-# -- Agent backends ----------------------------------------------------------
-# The seam between "how to find/parse/resolve/resume a session for this
-# agent" (agent-specific) and everything else - search, filtering, ranking,
-# fzf display, host coloring - which already operates purely on index-doc
-# dicts and doesn't care where they came from.
 
 class Backend(NamedTuple):
     name: str
@@ -1182,21 +1102,14 @@ def index_one(backend: Backend, jsonl_path: str, idx_path: str) -> Tuple[str, st
     source is "custom" (via /rename), "ai" (native ai-title),
     "empty" (no messages), or "untitled" (has messages but no title)."""
     uuid = backend.uuid_of(jsonl_path)
-    transcript = backend.parse(jsonl_path)
-    lifecycle_events = read_lifecycle(uuid)
-
-    doc = build_doc(uuid, transcript, lifecycle_events, jsonl_path, backend.name)
-    if doc.get("interactive") is False:
-        Path(HIDDEN_INDEX_DIR).mkdir(parents=True, exist_ok=True)
-        write_json_atomic(doc, os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json"))
-        if os.path.exists(idx_path):
-            os.remove(idx_path)   # an entry from before this split
-    else:
-        write_json_atomic(doc, idx_path)
-        hidden = os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json")
-        if os.path.exists(hidden):
-            os.remove(hidden)
-
+    doc = build_doc(uuid, backend.parse(jsonl_path), read_lifecycle(uuid), jsonl_path, backend.name)
+    # A non-interactive session's entry goes to hidden/, an interactive one's to the index; the other copy (an
+    # entry from before this split, or from before the session changed) is removed.
+    hidden = os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json")
+    keep, drop = (hidden, idx_path) if doc.get("interactive") is False else (idx_path, hidden)
+    write_json_atomic(doc, keep)
+    if os.path.exists(drop):
+        os.remove(drop)
     return doc["custom_title"], doc["title_source"]
 
 
@@ -1215,23 +1128,22 @@ def needs_reindex(uuid: str, jsonl_mtime: float, idx_mtime: Optional[float]) -> 
         return False
 
 
+# Backend(name, scan, parse, resume_cmd, uuid_of), one per agent
 BACKENDS: Dict[str, Backend] = {
-    "claude": Backend(
-        name="claude",
-        scan=scan_history_jsonl,
-        parse=read_transcript,
-        resume_cmd=_claude_resume_cmd,
-        uuid_of=_claude_uuid_of,
-    ),
+    # Claude names transcripts <uuid>.jsonl directly - the stem is the uuid
+    "claude": Backend("claude", scan_history_jsonl, read_transcript, _claude_resume_cmd, lambda p: Path(p).stem),
 }
 
 if CODEX_ENABLED:
     BACKENDS["codex"] = Backend(
-        name="codex",
-        scan=scan_codex_sessions,
-        parse=read_codex_transcript,
-        resume_cmd=_codex_resume_cmd,
-        uuid_of=_codex_uuid_of,
+        "codex",
+        # Codex shards sessions by date (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl)
+        # rather than Claude's per-project-slug layout, hence the recursive walk.
+        lambda: mtimes(Path(CODEX_SESSIONS_DIR).rglob("*.jsonl")),
+        read_codex_transcript,
+        # the `codex resume`/`codex fork` command (the folder is resume_shell_cmd's)
+        lambda doc, transcript, uuid, fork: f"codex {'fork' if fork else 'resume'} {shlex.quote(uuid)}",
+        _codex_uuid_of,
     )
 
 
@@ -1250,7 +1162,7 @@ def plan_reindex(force: bool = False, single_uuid: str = "",
             d_history[p] = (m, backend)
     if single_uuid:
         d_history = {p: v for p, v in d_history.items() if v[1].uuid_of(p) == single_uuid}
-    d_index = {**scan_index_dir(HIDDEN_INDEX_DIR), **scan_index_dir(LOCAL_INDEX_DIR)}
+    d_index = {**mtimes(Path(HIDDEN_INDEX_DIR).glob("*.json")), **mtimes(Path(LOCAL_INDEX_DIR).glob("*.json"))}
     idx_mtime_by_uuid = {Path(p).stem: mtime for p, mtime in d_index.items()}
 
     l_todo: List[Tuple[str, str, Backend]] = []
