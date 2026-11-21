@@ -72,13 +72,9 @@ def _load_settings() -> Dict[str, Any]:
         with open(SETTINGS_PATH) as f:
             user = json.load(f)
         for k, v in user.items():
-            if isinstance(v, bool):
-                defaults[k] = v
-            elif isinstance(v, str) and v != "":
-                defaults[k] = v
-            elif isinstance(v, list):
+            if isinstance(v, list):
                 defaults[k] = [s for s in v if isinstance(s, str) and s]
-            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            elif isinstance(v, (int, float)) or (isinstance(v, str) and v != ""):   # a bool is an int too
                 defaults[k] = v
     except (OSError, json.JSONDecodeError):
         pass
@@ -91,8 +87,8 @@ LOCAL_INDEX_DIR = os.path.expanduser(_SETTINGS["local_index_dir"])
 # Entries of sessions nobody typed in (`claude -p`, SDK, Codex sub-agents; ~87% of the files) live apart, so a
 # search reads only the interactive ones. The pull of another machine's index leaves this folder out.
 HIDDEN_INDEX_DIR = os.path.join(LOCAL_INDEX_DIR, "hidden")
-IGNORE_PATH_SUBSTRINGS: List[str] = _SETTINGS.get("ignore_path_substrings", [])
-REMOTE_HOSTS: List[str] = _SETTINGS.get("remote_hosts", [])
+IGNORE_PATH_SUBSTRINGS: List[str] = _SETTINGS["ignore_path_substrings"]
+REMOTE_HOSTS: List[str] = _SETTINGS["remote_hosts"]
 # remote/<ssh host>/<uuid>.json: read-only copies of each remote host's index, refreshed by _pull_one
 REMOTE_INDEX_DIR = os.path.join(ARES_DATA_DIR, "remote")
 SSH_OPTS = ["-o", "ConnectTimeout=3", "-o", "BatchMode=yes"]
@@ -104,8 +100,7 @@ PULL_REMOTE_CMD = ("~/opt/agent-resume/bin/ares reindex >/dev/null 2>&1; "
 
 CODEX_SESSIONS_DIR = os.path.expanduser(_SETTINGS["codex_sessions_dir"])
 CODEX_SESSION_INDEX_FILE = os.path.expanduser(_SETTINGS["codex_session_index_file"])
-_codex_enabled_setting = _SETTINGS.get("codex_enabled")
-CODEX_ENABLED = (_codex_enabled_setting if isinstance(_codex_enabled_setting, bool)
+CODEX_ENABLED = (_SETTINGS["codex_enabled"] if isinstance(_SETTINGS["codex_enabled"], bool)
                  else os.path.isdir(CODEX_SESSIONS_DIR))
 
 # -- ANSI Colors ------------------------------------------------------------
@@ -214,9 +209,8 @@ def _make_portable_jsonl_path(abs_path: str) -> str:
     idx = abs_path.find(marker)
     if idx != -1:
         return "~/.claude/projects/" + abs_path[idx + len(marker):]
-    home = os.path.expanduser("~")
-    if abs_path.startswith(home + "/"):
-        return "~/" + abs_path[len(home) + 1:]
+    if abs_path.startswith(HOME + "/"):
+        return "~/" + abs_path[len(HOME) + 1:]
     return abs_path
 
 
@@ -886,15 +880,6 @@ def status_block(doc: Dict[str, Any]) -> str:
     return f"{color}[ {label:<7} {time_ago(last_active)} ]{RESET}"
 
 
-def agent_block(doc: Dict[str, Any]) -> str:
-    """Agent-type tag ('[claude]'/'[codex]'), always shown and color-coded so
-    the two backends are visually distinguishable at a glance in a mixed
-    picker."""
-    agent = doc.get("agent_type") or "claude"
-    color = C_AGENT_CLAUDE if agent == "claude" else C_AGENT_CODEX
-    return f"{color}[{agent}]{RESET}"
-
-
 def host_block(doc: Dict[str, Any]) -> str:
     """The hostname segment: 'mac' in blue if local, another host in dark red."""
     latest = short_host(clean_field(doc.get("latest_hostname")))
@@ -928,7 +913,12 @@ def format_session_for_fzf(doc: Dict[str, Any], idx_path: str,
     title_str = f"\033[97m{marker + ' ' if marker else ''}{title}{RESET}"
     source_label = f"Title: {TITLE_SOURCE_LABELS[source]}" if source in TITLE_SOURCE_LABELS else ""
 
-    columns = [status_block(doc), title_str, agent_block(doc), host_block(doc)]
+    # The agent-type tag ('[claude]'/'[codex]'), always shown and color-coded so
+    # the two backends are visually distinguishable at a glance in a mixed picker.
+    agent = doc.get("agent_type") or "claude"
+    agent_color = C_AGENT_CLAUDE if agent == "claude" else C_AGENT_CODEX
+
+    columns = [status_block(doc), title_str, f"{agent_color}[{agent}]{RESET}", host_block(doc)]
     if working_dir:
         columns.append(f"{C_DIR}{working_dir}{RESET}")
     columns.append(f"{C_UUID}{uuid[:8]}...{RESET}")
