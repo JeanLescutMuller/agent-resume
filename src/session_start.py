@@ -70,21 +70,17 @@ def main() -> None:
     elif not boot:
         boot = next((l.split()[1] for l in open("/proc/stat") if l.startswith("btime ")), None)
 
-    s_ended = set()   # pids that logged an end (after /clear the process lives on and logs a new start)
+    l_ev = []   # (lifecycle line, its pid or 0); a line that is not a JSON object, or has a pid that is no number: left out
     for raw in l_raw:
         try:
             ev = json.loads(raw)
-            if ev.get("event") == "end" and ev.get("pid"):
-                s_ended.add(int(ev["pid"]))
+            l_ev.append((ev, int(ev.get("pid") or 0)))
         except (ValueError, TypeError, AttributeError):
             continue
+    # pids that logged an end (after /clear the process lives on and logs a new start)
+    s_ended = {pid for ev, pid in l_ev if ev.get("event") == "end" and pid}
     l_warn, s_seen = [], set()
-    for raw in l_raw:
-        try:
-            ev = json.loads(raw)
-            pid = int(ev.get("pid") or 0)
-        except (ValueError, TypeError, AttributeError):
-            continue
+    for ev, pid in l_ev:
         if ev.get("event") != "start" or not pid or pid in s_mine or pid in s_seen or pid in s_ended or pid not in d_proc:
             continue
         if ev.get("machine") and machine and ev["machine"] != machine:
