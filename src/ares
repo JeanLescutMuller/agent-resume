@@ -33,6 +33,7 @@ import shlex
 import shutil
 import tarfile
 import tempfile
+import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -174,11 +175,21 @@ TITLE_SOURCE_LABELS = {
 
 # -- Utilities --------------------------------------------------------------
 
-def log_verbose(msg: str, verbose: bool = False) -> None:
+def eprint(*args, **kwargs) -> None:
+    """print() to stderr: every error, warning and log line of ares."""
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def run_text(l_cmd: List[str]) -> subprocess.CompletedProcess:
+    """Run a command and wait: its stdout and stderr captured as text; a failing exit is in .returncode, not raised."""
+    return subprocess.run(l_cmd, capture_output=True, text=True)
+
+
+def log_verbose(msg: str, verbose: bool) -> None:
     """Print message to stderr with timestamp if verbose."""
     if verbose:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{ts}] {msg}", file=sys.stderr)
+        eprint(f"[{ts}] {msg}")
 
 
 def parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
@@ -213,10 +224,10 @@ def _make_portable_jsonl_path(abs_path: str) -> str:
 
 
 def _resolve_jsonl_path(stored_path: str) -> str:
-    """Resolve a stored jsonl_path (possibly with ~) to an absolute path."""
-    if stored_path.startswith("~/"):
-        return os.path.expanduser(stored_path)
-    return stored_path
+    """Resolve a stored jsonl_path (possibly with ~) to an absolute path.
+
+    A stored path is "~/..." or absolute (_make_portable_jsonl_path): expanduser leaves an absolute one as is."""
+    return os.path.expanduser(stored_path)
 
 
 def read_json(path: str) -> Optional[Dict[str, Any]]:
@@ -281,7 +292,7 @@ def iter_entries(jsonl_path: Any, warn: bool = False) -> Iterator[Dict[str, Any]
                     continue
     except OSError as e:
         if warn:
-            print(f"  WARNING: could not read {jsonl_path}: {e}", file=sys.stderr)
+            eprint(f"  WARNING: could not read {jsonl_path}: {e}")
 
 
 def extract_text(content: Any, block_types: Tuple[str, ...] = ("text",)) -> str:
@@ -313,7 +324,6 @@ class Transcript(NamedTuple):
     the whole file with their own near-identical loop - and the title-priority
     rule had already drifted between the two copies.
     """
-    session_id: str
     cwd: Optional[str]
     messages: List[Dict[str, Any]]           # the real conversation turns: {role, timestamp, text}
     ai_title: Optional[str]                  # Claude Code's own auto-generated title
@@ -341,33 +351,26 @@ class Transcript(NamedTuple):
 
 def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
     """Parse a session .jsonl into a Transcript (single pass over the file)."""
-    session_id = custom_title = ai_title = permission_mode = cwd = entrypoint = None
+    custom_title = ai_title = permission_mode = cwd = entrypoint = None
     messages: List[Dict[str, Any]] = []
 
     for entry in iter_entries(jsonl_path, warn=warn):
         etype = entry.get("type", "")
         # "cli" = an interactive session; "sdk-cli" = `claude -p`, "sdk-py" /
         # "sdk-ts" = the Agent SDK. Older transcripts have no entrypoint at all.
-        if not entrypoint:
-            entrypoint = entry.get("entrypoint")
+        entrypoint = entrypoint or entry.get("entrypoint")
 
         if etype == "custom-title":
             custom_title = entry.get("customTitle") or custom_title
-            session_id = entry.get("sessionId") or session_id
             continue
 
         if etype == "ai-title":
             ai_title = entry.get("aiTitle") or ai_title
-            session_id = entry.get("sessionId") or session_id
             continue
 
-        if not session_id:
-            session_id = entry.get("sessionId")
-        if not cwd:
-            cwd = entry.get("cwd")
-
-        if etype == "user" and entry.get("permissionMode"):
-            permission_mode = entry["permissionMode"]
+        cwd = cwd or entry.get("cwd")
+        if etype == "user":
+            permission_mode = entry.get("permissionMode") or permission_mode
 
         # Only real conversation turns count as activity: a tool result is
         # bookkeeping, and an entry whose text is entirely noise tags is too.
@@ -377,7 +380,6 @@ def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
                 messages.append({"role": etype, "timestamp": entry.get("timestamp"), "text": text})
 
     return Transcript(
-        session_id=session_id or Path(jsonl_path).stem,
         custom_title=custom_title,
         ai_title=ai_title,
         permission_mode=permission_mode,
@@ -449,7 +451,6 @@ def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
             messages.append({"role": role, "timestamp": entry.get("timestamp"), "text": text})
 
     return Transcript(
-        session_id=session_id or Path(jsonl_path).stem,
         ai_title=_codex_session_titles().get(session_id or ""),
         cwd=cwd,
         messages=messages,
@@ -512,14 +513,14 @@ def open_start(lifecycle_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     """
     d_open: Dict[Any, Dict[str, Any]] = {}   # pid -> its start line, in file order
     for ev in lifecycle_events:
+        pid = ev.get("pid")
         if ev.get("event") == "start":
-            d_open.pop(ev.get("pid"), None)
-            d_open[ev.get("pid")] = ev
+            d_open.pop(pid, None)   # re-inserted last: the newest start
+            d_open[pid] = ev
+        elif ev.get("event") == "end" and pid is None:
+            d_open.clear()
         elif ev.get("event") == "end":
-            if ev.get("pid") is None:
-                d_open.clear()
-            else:
-                d_open.pop(ev["pid"], None)
+            d_open.pop(pid, None)
     return list(d_open.values())[-1] if d_open else None
 
 
@@ -651,7 +652,7 @@ INDEX_DIRS = [(LOCAL_INDEX_DIR, None)] + [(os.path.join(REMOTE_INDEX_DIR, h), h)
                                           for h in REMOTE_HOSTS]
 
 
-def load_index_doc(path: str, host: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def load_index_doc(path: str, host: Optional[str]) -> Optional[Dict[str, Any]]:
     """Read one index file and tag it: _host, the machine it lives on (None: this one), and _source_missing,
     whether its .jsonl is gone (checked on this machine only)."""
     doc = read_json(path)
@@ -681,6 +682,11 @@ def searchable_text(doc: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+# An index entry's host fields, the best first: where it last ran, where it was born (agent-tracker's start lines),
+# which machine indexed it.
+HOST_FIELDS = ("latest_hostname", "initial_hostname", "index_hostname")
+
+
 def passes_filters(doc: Dict[str, Any], opts: SearchOpts,
                    cutoff_from: Optional[datetime], cutoff_until: Optional[datetime]) -> bool:
     """Apply the --state / --host / --agent / --tmux / --from / --until filters to one session."""
@@ -690,38 +696,27 @@ def passes_filters(doc: Dict[str, Any], opts: SearchOpts,
     if doc.get("interactive") is False:
         return False
 
-    missing = doc.get("_source_missing", False)
-    if opts.state:
-        # 'deleted' is not a session_state in the index - it means the source
-        # .jsonl is gone - so it is matched against _source_missing instead.
-        if opts.state.lower() == "deleted":
-            if not missing:
-                return False
-        elif missing or (doc.get("session_state") or "").lower() != opts.state.lower():
-            return False
+    # 'deleted' is not a session_state in the index - it means the source
+    # .jsonl is gone - so a session whose .jsonl is gone has that state, and no other.
+    state = "deleted" if doc.get("_source_missing") else (doc.get("session_state") or "").lower()
+    if opts.state and state != opts.state.lower():
+        return False
 
-    if opts.host:
-        hosts = [str(doc.get(k) or "") for k in
-                 ("initial_hostname", "latest_hostname", "index_hostname")]
-        if not any(opts.host.lower() in h.lower() for h in hosts):
-            return False
+    if opts.host and not any(opts.host.lower() in str(doc.get(k) or "").lower() for k in HOST_FIELDS):
+        return False
 
     if opts.agent and (doc.get("agent_type") or "claude").lower() != opts.agent.lower():
         return False
 
-    if opts.tmux:
-        if opts.tmux.lower() not in (doc.get("tmux_session") or "").lower():
-            return False
+    if opts.tmux and opts.tmux.lower() not in (doc.get("tmux_session") or "").lower():
+        return False
 
-    ts = parse_ts(doc.get("last_active", ""))
-    if ts:
-        if cutoff_from and ts < cutoff_from:
-            return False
-        if cutoff_until and ts > cutoff_until:
-            return False
-    elif cutoff_from or cutoff_until:
-        return False   # no date: it cannot be inside a date range (only `-f 0` without --until shows these)
-    return True
+    ts = parse_ts(doc.get("last_active"))
+    if not ts:   # no date: it cannot be inside a date range (only `-f 0` without --until shows these)
+        return not (cutoff_from or cutoff_until)
+    if cutoff_from and ts < cutoff_from:
+        return False
+    return not (cutoff_until and ts > cutoff_until)
 
 
 def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], bool]:
@@ -801,17 +796,18 @@ def find_by_uuid(uuid: str) -> Optional[Dict[str, Any]]:
     candidates = [(p, host) for d, host in l_dirs for p in glob.glob(os.path.join(d, "*.json"))
                   if Path(p).stem.startswith(uuid)]
     if len(candidates) > 1:
-        print(f"ERROR: multiple indexed sessions match uuid prefix '{uuid}':", file=sys.stderr)
+        eprint(f"ERROR: multiple indexed sessions match uuid prefix '{uuid}':")
         for p, _ in candidates:
-            print(f"  {Path(p).stem}", file=sys.stderr)
+            eprint(f"  {Path(p).stem}")
         sys.exit(1)
     return load_index_doc(*candidates[0]) if candidates else None
 
 
 # -- Session Display & Selection --------------------------------------------
 
-def clean_field(v: Any) -> Optional[str]:
-    """Normalize an index field to a real string, or None if it is a placeholder."""
+def clean_field(doc: Dict[str, Any], key: str) -> Optional[str]:
+    """One index field as a real string, or None if it is missing or a placeholder."""
+    v = doc.get(key)
     return None if (v is None or (s := str(v).strip()) in ("", "null", "?")) else s
 
 
@@ -832,7 +828,7 @@ def time_ago(ts_str: Optional[str]) -> str:
     return ts.strftime("%Y-%m-%d")
 
 
-def extract_snippet(conversation: List[Dict[str, Any]], keywords: Optional[List[str]] = None,
+def extract_snippet(conversation: List[Dict[str, Any]], keywords: Optional[List[str]],
                     max_chars: int = 120) -> str:
     """One line of context for the picker's preview pane.
 
@@ -862,17 +858,14 @@ def extract_snippet(conversation: List[Dict[str, Any]], keywords: Optional[List[
 
 def status_block(doc: Dict[str, Any]) -> str:
     """The '[ Pending  5 min ago ]' prefix, colored by state and freshness."""
-    state = clean_field(doc.get("session_state")) or "?"
     last_active = doc.get("last_active") or ""
-    # A session with no lifecycle line has no start/end events at all, so
-    # its state was never observed - say "Unknown" rather than assert "Exited".
-    has_lifecycle = bool(clean_field(doc.get("initial_hostname")))
-
-    if doc.get("_source_missing", False):
+    if doc.get("_source_missing"):
         label, color = "Deleted", C_DELETED
-    elif not has_lifecycle:
+    elif not clean_field(doc, "initial_hostname"):
+        # A session with no lifecycle line has no start/end events at all, so
+        # its state was never observed - say "Unknown" rather than assert "Exited".
         label, color = "Unknown", C_INACTIVE
-    elif state == "exited":
+    elif clean_field(doc, "session_state") == "exited":
         label, color = "Exited", C_INACTIVE
     else:
         label = "Pending"
@@ -897,14 +890,15 @@ def agent_block(doc: Dict[str, Any]) -> str:
 
 def host_block(doc: Dict[str, Any]) -> str:
     """The hostname segment: 'mac' in blue if local, another host in dark red."""
-    latest = short_host(clean_field(doc.get("latest_hostname")))
-    initial = short_host(clean_field(doc.get("initial_hostname")))
+    for k in HOST_FIELDS:   # the first one set
+        host = short_host(clean_field(doc, k))
+        if host:
+            break
 
     # Sessions predating the lifecycle hook have no lifecycle and, until they get
     # reindexed, no index_hostname either - but if their .jsonl is still on this
     # disk they are ours, since .jsonl files are never synced between machines.
-    host = latest or initial or short_host(clean_field(doc.get("index_hostname")))
-    if not host and not doc.get("_source_missing", False):
+    if not host and not doc.get("_source_missing"):
         host = doc.get("_host") or LOCAL_HOSTNAME
     if not host:
         return ""
@@ -920,19 +914,17 @@ def format_session_for_fzf(doc: Dict[str, Any], idx_path: str,
     field 1 (--with-nth=1) and the preview command reads fields 2 and 3.
     """
     uuid = doc.get("session_id", os.path.basename(idx_path).replace(".json", ""))
-    title = clean_field(doc.get("custom_title")) or uuid
-    working_dir = clean_field(doc.get("latest_working_dir")) or clean_field(doc.get("initial_working_dir"))
+    title = clean_field(doc, "custom_title") or uuid
+    working_dir = clean_field(doc, "latest_working_dir") or clean_field(doc, "initial_working_dir")
 
     source = doc.get("title_source")
     marker = TITLE_SOURCE_MARKERS.get(source, "")
     title_str = f"\033[97m{marker + ' ' if marker else ''}{title}{RESET}"
     source_label = f"Title: {TITLE_SOURCE_LABELS[source]}" if source in TITLE_SOURCE_LABELS else ""
 
-    columns = [status_block(doc), title_str, agent_block(doc), host_block(doc)]
-    if working_dir:
-        columns.append(f"{C_DIR}{working_dir}{RESET}")
-    columns.append(f"{C_UUID}{uuid[:8]}...{RESET}")
-    display = "  ".join(c for c in columns if c)
+    columns = [status_block(doc), title_str, agent_block(doc), host_block(doc),
+               f"{C_DIR}{working_dir}{RESET}" if working_dir else "", f"{C_UUID}{uuid[:8]}...{RESET}"]
+    display = "  ".join(c for c in columns if c)   # an empty column takes no room
 
     snippet = extract_snippet(doc.get("conversation", []), keywords)
     return f"{display}\t{snippet}\t{source_label}\t{uuid}"
@@ -944,15 +936,15 @@ def pick_session(opts: SearchOpts) -> Tuple[str, Dict[str, Any]]:
     Exits the process on an empty result or a cancelled picker; never returns None.
     """
     if not os.path.isdir(LOCAL_INDEX_DIR):
-        print(f"ERROR: local index cache not found at {LOCAL_INDEX_DIR}", file=sys.stderr)
-        print("  Run 'ares reindex' first to build the local cache.", file=sys.stderr)
+        eprint(f"ERROR: local index cache not found at {LOCAL_INDEX_DIR}")
+        eprint("  Run 'ares reindex' first to build the local cache.")
         sys.exit(1)
 
     sessions, fuzzy = find_sessions(opts)
     if fuzzy:
-        print("  (no exact matches - showing fuzzy results)", file=sys.stderr)
+        eprint("  (no exact matches - showing fuzzy results)")
     if not sessions:
-        print("No sessions found.", file=sys.stderr)
+        eprint("No sessions found.")
         sys.exit(0)
 
     keywords = opts.keywords
@@ -987,16 +979,16 @@ def pick_session(opts: SearchOpts) -> Tuple[str, Dict[str, Any]]:
             text=True,
         )
     except FileNotFoundError:
-        print("ERROR: fzf not found. Install it with: brew install fzf", file=sys.stderr)
+        eprint("ERROR: fzf not found. Install it with: brew install fzf")
         sys.exit(0)
 
     if result.returncode != 0:
-        print("Cancelled.", file=sys.stderr)
+        eprint("Cancelled.")
         sys.exit(0)
 
     selected = result.stdout.strip()
     if not selected:
-        print("No session selected.", file=sys.stderr)
+        eprint("No session selected.")
         sys.exit(0)
 
     uuid = selected.split("\t")[-1]
@@ -1015,8 +1007,11 @@ def pick_session(opts: SearchOpts) -> Tuple[str, Dict[str, Any]]:
 
 def resume_dir(doc: Dict[str, Any]) -> str:
     """The folder a session resumes in: the last one it ran in (agent-tracker's newest start, else the transcript's
-    first cwd) when it still exists, else the current folder."""
+    first cwd) when it still exists, else the current folder. A session of another machine: that folder as is, else
+    ~ (it is tested there: resume_shell_cmd)."""
     wd = doc.get("latest_working_dir") or doc.get("initial_working_dir")
+    if doc.get("_host"):
+        return wd or "~"
     return wd if wd and os.path.isdir(wd) else os.getcwd()
 
 
@@ -1025,10 +1020,10 @@ def resume_shell_cmd(doc: Dict[str, Any], agent_cmd: str) -> str:
     one of another machine, the same there over `ssh -t` (its own folder test: a gone folder falls back to ~).
     `claude` is my-setup's account selector on every machine (~/.local/bin/claude, 2026-11-20)."""
     host = doc.get("_host")
+    wd = shlex.quote(resume_dir(doc))
     if not host:
-        return f"cd {shlex.quote(resume_dir(doc))} && {agent_cmd}"
-    wd = doc.get("latest_working_dir") or doc.get("initial_working_dir") or "~"
-    remote = f'PATH="$HOME/.local/bin:$PATH"; cd {shlex.quote(wd)} 2>/dev/null || cd; {agent_cmd}'
+        return f"cd {wd} && {agent_cmd}"
+    remote = f'PATH="$HOME/.local/bin:$PATH"; cd {wd} 2>/dev/null || cd; {agent_cmd}'
     return f"ssh -t {shlex.quote(host)} {shlex.quote(remote)}"
 
 
@@ -1050,11 +1045,6 @@ def _claude_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], 
 
 
 # -- Codex backend adapters ---------------------------------------------------
-
-def _codex_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], uuid: str, fork: bool) -> str:
-    """The `codex resume`/`codex fork` command (the folder is resume_shell_cmd's)."""
-    return f"codex {'fork' if fork else 'resume'} {shlex.quote(uuid)}"
-
 
 # Codex names transcripts rollout-<timestamp>-<uuid>.jsonl - the uuid is
 # always the last 36 characters before the extension.
@@ -1129,23 +1119,20 @@ def needs_reindex(uuid: str, jsonl_mtime: float, idx_mtime: Optional[float]) -> 
         return False
 
 
+# Backend(name, scan, parse, resume_cmd, uuid_of), one per agent
 BACKENDS: Dict[str, Backend] = {
-    "claude": Backend(
-        name="claude",
-        scan=scan_history_jsonl,
-        parse=read_transcript,
-        resume_cmd=_claude_resume_cmd,
-        uuid_of=lambda p: Path(p).stem,   # Claude names transcripts <uuid>.jsonl directly - the stem is the uuid
-    ),
+    # Claude names transcripts <uuid>.jsonl directly - the stem is the uuid
+    "claude": Backend("claude", scan_history_jsonl, read_transcript, _claude_resume_cmd, lambda p: Path(p).stem),
 }
 
 if CODEX_ENABLED:
     BACKENDS["codex"] = Backend(
-        name="codex",
-        scan=lambda: scan_files(CODEX_SESSIONS_DIR, "**/*.jsonl"),
-        parse=read_codex_transcript,
-        resume_cmd=_codex_resume_cmd,
-        uuid_of=_codex_uuid_of,
+        "codex",
+        lambda: scan_files(CODEX_SESSIONS_DIR, "**/*.jsonl"),
+        read_codex_transcript,
+        # the `codex resume`/`codex fork` command (the folder is resume_shell_cmd's)
+        lambda doc, transcript, uuid, fork: f"codex {'fork' if fork else 'resume'} {shlex.quote(uuid)}",
+        _codex_uuid_of,
     )
 
 
@@ -1200,7 +1187,7 @@ def run_reindex(l_todo: List[Tuple[str, str, Backend]], progress: bool = False) 
     """
     if not l_todo:
         return 0, 0
-    Path(LOCAL_INDEX_DIR).mkdir(parents=True, exist_ok=True)
+    os.makedirs(LOCAL_INDEX_DIR, exist_ok=True)
     indexed = errors = 0
     with ThreadPoolExecutor(max_workers=min(10, len(l_todo))) as executor:
         d_uuid = {executor.submit(index_one, *t): t[0] for t in l_todo}   # future -> its uuid
@@ -1211,12 +1198,11 @@ def run_reindex(l_todo: List[Tuple[str, str, Backend]], progress: bool = False) 
             except Exception as e:
                 errors += 1
                 if progress:
-                    print(f"    [{indexed + errors}/{len(l_todo)}] {uuid[:8]}  ERROR: {e}",
-                          file=sys.stderr, flush=True)
+                    eprint(f"    [{indexed + errors}/{len(l_todo)}] {uuid[:8]}  ERROR: {e}", flush=True)
                 continue
             indexed += 1
             if progress:
-                marker = TITLE_SOURCE_MARKERS.get(source, "⚠️")
+                marker = TITLE_SOURCE_MARKERS[source]   # resolve_title gives one of its 4 keys
                 print(f"    [{indexed + errors}/{len(l_todo)}] {uuid[:8]}  indexed {marker} {title[:60]}",
                       flush=True)
     return indexed, errors
@@ -1230,7 +1216,7 @@ def migrate_hidden_entries() -> None:
     marker = os.path.join(HIDDEN_INDEX_DIR, ".migrated")
     if os.path.exists(marker) or not os.path.isdir(LOCAL_INDEX_DIR):
         return
-    Path(HIDDEN_INDEX_DIR).mkdir(parents=True, exist_ok=True)
+    os.makedirs(HIDDEN_INDEX_DIR, exist_ok=True)
     for path in glob.glob(os.path.join(LOCAL_INDEX_DIR, "*.json")):
         doc = read_json(path)
         if doc is not None and doc.get("interactive") is False:
@@ -1248,7 +1234,7 @@ def cmd_reindex(max_sessions: int, force: bool, single_uuid: str) -> None:
     if single_uuid:
         mode = f"reindex --uuid {single_uuid[:8]}"
     print(f"ares {VERSION} - {mode}" + (f" (max {max_sessions})" if max_sessions else ""), flush=True)
-    Path(LOCAL_INDEX_DIR).mkdir(parents=True, exist_ok=True)
+    os.makedirs(LOCAL_INDEX_DIR, exist_ok=True)
 
     l_todo, d_counts = plan_reindex(force, single_uuid, max_sessions)
     print(f"  Step 1: {d_counts['history']} .jsonl history files found", flush=True)
@@ -1312,7 +1298,7 @@ def refresh_all(verbose: bool) -> None:
             log_verbose(f"refresh skipped: {e}", verbose)
     for host, fut in d_pull.items():
         if not fut.result():
-            print(f"\033[38;5;208m⚠ {host} unreachable: its sessions as of the last search\033[0m", file=sys.stderr)
+            eprint(f"\033[38;5;208m⚠ {host} unreachable: its sessions as of the last search\033[0m")
 
 
 # -- Resume -----------------------------------------------------------------
@@ -1329,7 +1315,7 @@ def cmd_resume(opts: SearchOpts, fork: bool, print_cmd: bool) -> None:
     if opts.uuid:
         doc = find_by_uuid(opts.uuid)
         if not doc:
-            print(f"ERROR: no indexed session matches uuid '{opts.uuid}'.", file=sys.stderr)
+            eprint(f"ERROR: no indexed session matches uuid '{opts.uuid}'.")
             sys.exit(1)
         uuid = doc.get("session_id", opts.uuid)
     else:
@@ -1338,9 +1324,8 @@ def cmd_resume(opts: SearchOpts, fork: bool, print_cmd: bool) -> None:
     if doc.get("_source_missing", False):
         # Its transcript is gone from this machine (deleted by hand, or by Claude Code after cleanupPeriodDays):
         # nothing to resume. The index entry still holds the whole conversation.
-        print(f"ERROR: the transcript of session {uuid} is gone from this machine: it cannot be resumed.\n"
-              f"  Its conversation is still in the index: {os.path.join(LOCAL_INDEX_DIR, uuid + '.json')}",
-              file=sys.stderr)
+        eprint(f"ERROR: the transcript of session {uuid} is gone from this machine: it cannot be resumed.\n"
+               f"  Its conversation is still in the index: {os.path.join(LOCAL_INDEX_DIR, uuid + '.json')}")
         sys.exit(1)
 
     backend = BACKENDS.get(doc.get("agent_type") or "claude", BACKENDS["claude"])
@@ -1354,7 +1339,7 @@ def cmd_resume(opts: SearchOpts, fork: bool, print_cmd: bool) -> None:
     transcript = backend.parse(jsonl_path, warn=False) if jsonl_path else None
     perm_mode = transcript.permission_mode if transcript else doc.get("permission_mode")
     title = (transcript.title if transcript else None) or doc.get("custom_title", "")
-    working_dir = (latest_wd or initial_wd or "~") if host else resume_dir(doc)
+    working_dir = resume_dir(doc)
     cmd = resume_shell_cmd(doc, backend.resume_cmd(doc, transcript, uuid, fork))
 
     if print_cmd:
@@ -1410,8 +1395,7 @@ def current_boot_ts() -> int:
     if os.environ.get("AGENT_TRACKER_BOOT_TS"):
         return int(os.environ["AGENT_TRACKER_BOOT_TS"])
     if sys.platform == "darwin":
-        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
-        m = re.search(r"sec = (\d+)", out)
+        m = re.search(r"sec = (\d+)", run_text(["sysctl", "-n", "kern.boottime"]).stdout)
         return int(m.group(1)) if m else 0
     for line in Path("/proc/stat").read_text().splitlines():
         if line.startswith("btime "):
@@ -1421,9 +1405,8 @@ def current_boot_ts() -> int:
 
 def layout_cells(layout: Optional[str]) -> Tuple[Optional[Tuple[int, int]], List[int]]:
     """'b25f,208x52,0,0{104x52,0,0,1,103x52,105,0,2}' -> ((208, 52), [1, 2]): window size, pane numbers in pane order."""
-    if not layout or "," not in layout:
-        return None, []
-    l_cells = LAYOUT_CELL_RE.findall(layout.split(",", 1)[1])
+    # The cells come after the checksum and its comma; no comma (or no layout): no cell
+    l_cells = LAYOUT_CELL_RE.findall((layout or "").partition(",")[2])
     if not l_cells:
         return None, []
     size = (int(l_cells[0][0]), int(l_cells[0][1]))
@@ -1460,7 +1443,7 @@ def tmux_plan(include_stale: bool, this_boot: bool) -> Dict[str, Any]:
         uuid = os.path.basename(folder.rstrip("/"))
         seen = read_json(os.path.join(folder, "last_seen.json")) or {}
         l_events = read_lifecycle(uuid)
-        l_rows.append({"uuid": uuid, "seen": seen, "start": open_start(l_events), "events": l_events,
+        l_rows.append({"uuid": uuid, "seen": seen, "events": l_events,
                        "boots": [seen.get("boot_ts")] + [e.get("boot_ts") for e in l_events]})
 
     if this_boot:
@@ -1598,17 +1581,16 @@ def snapshot_plan(prev: int, snap: Dict[str, Any], l_cand: List[Dict[str, Any]])
     d_sessions: Dict[str, Dict[int, Dict[str, Any]]] = {}
     set_used = set()
     for p in sorted(snap["panes"], key=lambda p: (p["window_index"], p["pane_index"])):
-        w = d_sessions.setdefault(p["session"], {}).setdefault(
-            p["window_index"], {"name": p["window_name"] or None, "layout": p["layout"] or None, "panes": []})
+        # the window's first pane (in pane order) gives its name, layout and size
+        w = d_sessions.setdefault(p["session"], {}).setdefault(p["window_index"], {
+            "name": p["window_name"] or None, "layout": p["layout"] or None, "size": layout_cells(p["layout"])[0],
+            "panes": []})
         r = d_cand.get(p["pane_id"])
         if r and p["command"] not in SHELLS:
             set_used.add(r["uuid"])
             w["panes"].append(dict(r, cwd=p["cwd"]))
         else:
             w["panes"].append({"cmd": None, "cwd": p["cwd"]})
-    for d_windows in d_sessions.values():
-        for w in d_windows.values():
-            w["size"], _ = layout_cells(w["layout"])
     l_outside += [r for r in d_cand.values() if r["uuid"] not in set_used and r["ts"] > snap["ts"]]
 
     d_iterm: Dict[int, Dict[str, Any]] = {}
@@ -1694,9 +1676,9 @@ def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -
 
     def tmux(*l_args: str) -> str:
         """Run one tmux command; its output, stripped. Raises on failure."""
-        out = subprocess.run(["tmux", *l_args], capture_output=True, text=True)
+        out = run_text(["tmux", *l_args])
         if out.returncode != 0:
-            raise RuntimeError(f"tmux {' '.join(shlex.quote(a) for a in l_args)}: {out.stderr.strip()}")
+            raise RuntimeError(f"tmux {shlex.join(l_args)}: {out.stderr.strip()}")
         return out.stdout.strip()
 
     n_claude = sum(len(claude_panes(ws)) for ws in plan["sessions"].values())
@@ -1762,7 +1744,7 @@ def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -
                         tmux("respawn-pane", "-k", "-t", pane_id, "-c", _pane_dir(r))
             except (RuntimeError, OSError) as e:
                 errors += 1
-                print(f"  ERROR    tmux session {name!r}, window {widx}: {e}", file=sys.stderr)
+                eprint(f"  ERROR    tmux session {name!r}, window {widx}: {e}")
                 if sid is None:   # the session itself could not be created: nothing more to do for it
                     break
         if sid is not None:
@@ -1777,8 +1759,8 @@ def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -
                 continue
             if cmd in SHELLS:
                 errors += 1
-                print(f"  ERROR    tmux session {name!r}, pane {pane_id}: no Claude session running (claude not found"
-                      f" on the PATH of that pane, or it exited at once); the pane shows why", file=sys.stderr)
+                eprint(f"  ERROR    tmux session {name!r}, pane {pane_id}: no Claude session running (claude not found"
+                       f" on the PATH of that pane, or it exited at once); the pane shows why")
                 l_failed.append(name)
 
     for r in plan["stale"]:
@@ -1796,16 +1778,18 @@ def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -
         l_windows = iterm_windows(plan, l_restored)
         script = iterm_script(l_windows)
         if dry_run:
-            print(f"  iTerm2   {len(l_windows)} window(s): " + " | ".join(", ".join(t) for _, t in l_windows) + "\n" + "\n".join("    " + l for l in script.splitlines()))
+            # the windows' tabs, then the script, each of its lines indented by 4
+            print(f"  iTerm2   {len(l_windows)} window(s): " + " | ".join(", ".join(t) for _, t in l_windows))
+            print(textwrap.indent(script, "    "))
         elif sys.platform != "darwin":
             print("  iTerm2   skipped (not macOS)")
         else:
-            out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+            out = run_text(["osascript", "-e", script])
             if out.returncode == 0:
                 print(f"  iTerm2   {len(l_windows)} window(s), {len(l_restored)} tab(s) opened")
             else:
                 errors += 1
-                print(f"  ERROR    iTerm2: {out.stderr.strip()}", file=sys.stderr)
+                eprint(f"  ERROR    iTerm2: {out.stderr.strip()}")
     if not dry_run and l_started:
         n_ok = len(l_started) - len(l_failed)
         print(f"  summary  {n_ok} of {len(l_started)} Claude pane(s) running" + (f", {len(l_failed)} without claude" if l_failed else ""))
@@ -1849,18 +1833,35 @@ TOP_DESCRIPTION = f"""ares {VERSION} - agent-resume (was asm): find and resume a
 `asm` is an alias of `ares`. Closing a running session: claude-close-keep-screen."""
 
 
-def _add_search_args(p: argparse.ArgumentParser) -> None:
-    """Search/filter flags of 'resume'."""
-    p.add_argument("-f", "--from-days-ago", type=int, default=90, help="Only sessions active in last N days (default: 90)")
-    p.add_argument("-u", "--until-days-ago", type=int, help="Only sessions active more than N days ago")
-    p.add_argument("--host", default="", help="Filter by hostname")
-    p.add_argument("--state", default="", help="Filter by session state (pending, exited, deleted)")
-    p.add_argument("--agent", default="", help=f"Filter by agent type ({', '.join(sorted(BACKENDS))})")
-    p.add_argument("--tmux", default="", help="Filter by tmux session name")
-    p.add_argument("--max-scan", type=int, default=50, help="Max recent files to scan without keywords (default: 50)")
-    p.add_argument("--uuid", default="", help="Skip the search, directly act on this session UUID")
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
-    p.add_argument("keywords", nargs="*", help="Keywords to search for")
+# Each command: its help line, then its flags in --help order, (names..., default, help). The default tells the kind
+# of flag: False an on/off switch, "" a text, a number or None (no default) a whole number.
+COMMANDS: Dict[str, Tuple[str, List[Tuple[Any, ...]]]] = {
+    "resume": ("Find and resume a past session", [
+        ("-f", "--from-days-ago", 90, "Only sessions active in last N days (default: 90)"),
+        ("-u", "--until-days-ago", None, "Only sessions active more than N days ago"),
+        ("--host", "", "Filter by hostname"),
+        ("--state", "", "Filter by session state (pending, exited, deleted)"),
+        ("--agent", "", f"Filter by agent type ({', '.join(sorted(BACKENDS))})"),
+        ("--tmux", "", "Filter by tmux session name"),
+        ("--max-scan", 50, "Max recent files to scan without keywords (default: 50)"),
+        ("--uuid", "", "Skip the search, directly act on this session UUID"),
+        ("-v", "--verbose", False, "Enable verbose logging"),
+        ("--fork", False, "Fork the session instead of resuming it"),
+        ("--print-cmd", False, "Print the resume/fork command instead of running it (scripting/testing)"),
+    ]),
+    "tmux": ("After a crash: restore the previous boot's tmux sessions and Claude sessions", [
+        ("--dry-run", False, "Print the plan, change nothing"),
+        ("--this-boot", False, "The tmux server died without a reboot: restore this boot's Claude sessions whose "
+                               "process is gone without a clean exit"),
+        ("--all", False, "No snapshot of that boot only: also restore stale Claude sessions (stopped ticking > 2 min before the others)"),
+        ("--no-iterm", False, "Do not open iTerm2 tabs"),
+    ]),
+    "reindex": ("Re-index all sessions now", [
+        ("-n", "--max", 0, "Max sessions to process (0 = unlimited, default: 0)"),
+        ("--force", False, "Force reindex all sessions, ignoring mtime-based skip"),
+        ("--uuid", "", "Reindex a single session by UUID"),
+    ]),
+}
 
 
 def main() -> None:
@@ -1874,35 +1875,24 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=f"ares {VERSION}")
     subparsers = parser.add_subparsers(dest="command")
 
-    def add_command(command: str, help_text: str) -> argparse.ArgumentParser:
-        """The subcommand's parser, with its slice of EXAMPLES as the --help epilog."""
+    for command, (help_text, l_flags) in COMMANDS.items():
+        # the --help epilog: the command's slice of EXAMPLES
         rows = [(ex, note) for cmd, ex, note in EXAMPLES if cmd == command]
         width = max(len(ex) for ex, _ in rows)
         lines = ["Examples:"]
         for ex, note in rows:
             lines.append(f"  {ex.ljust(width)}   # {note}" if note else f"  {ex}")
-        return subparsers.add_parser(command, help=help_text, epilog="\n".join(lines),
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-
-    resume_parser = add_command("resume", "Find and resume a past session")
-    _add_search_args(resume_parser)
-    resume_parser.add_argument("--fork", action="store_true", help="Fork the session instead of resuming it")
-    resume_parser.add_argument("--print-cmd", action="store_true",
-                               help="Print the resume/fork command instead of running it (scripting/testing)")
-
-    tmux_parser = add_command("tmux", "After a crash: restore the previous boot's tmux sessions and Claude sessions")
-    tmux_parser.add_argument("--dry-run", action="store_true", help="Print the plan, change nothing")
-    tmux_parser.add_argument("--this-boot", action="store_true",
-                             help="The tmux server died without a reboot: restore this boot's Claude sessions whose "
-                                  "process is gone without a clean exit")
-    tmux_parser.add_argument("--all", action="store_true",
-                             help="No snapshot of that boot only: also restore stale Claude sessions (stopped ticking > 2 min before the others)")
-    tmux_parser.add_argument("--no-iterm", action="store_true", help="Do not open iTerm2 tabs")
-
-    reindex_parser = add_command("reindex", "Re-index all sessions now")
-    reindex_parser.add_argument("-n", "--max", type=int, default=0, help="Max sessions to process (0 = unlimited, default: 0)")
-    reindex_parser.add_argument("--force", action="store_true", help="Force reindex all sessions, ignoring mtime-based skip")
-    reindex_parser.add_argument("--uuid", default="", help="Reindex a single session by UUID")
+        p = subparsers.add_parser(command, help=help_text, epilog="\n".join(lines),
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+        for *names, default, flag_help in l_flags:
+            if default is False:
+                p.add_argument(*names, action="store_true", help=flag_help)
+            elif default == "":
+                p.add_argument(*names, default=default, help=flag_help)
+            else:
+                p.add_argument(*names, type=int, default=default, help=flag_help)
+        if command == "resume":   # --help lists it apart, under "positional arguments"
+            p.add_argument("keywords", nargs="*", help="Keywords to search for")
 
     args = parser.parse_args()
 
