@@ -39,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 VERSION = "v5.0"
 HOME = os.path.expanduser("~")
@@ -56,7 +56,7 @@ TRACKER_SNAPSHOTS_DIR = os.path.join(AGENT_TRACKER_HOME, "data", "snapshots")   
 SETTINGS_PATH = os.path.join(ARES_DATA_DIR, "settings.json")
 
 # The settings from $AGENT_RESUME_HOME/data/settings.json, over these defaults.
-_SETTINGS: Dict[str, Any] = {
+_SETTINGS = {
     "local_projects_dir": "~/.claude/projects",
     "local_index_dir": os.path.join(ARES_DATA_DIR, "indexes"),
     "ignore_path_substrings": [],
@@ -134,7 +134,7 @@ FRESHNESS_RAMP = ((15, C_FRESH), (60, C_RECENT), (240, C_HOURS), (720, C_HALFDAY
 
 # -- Host identity ----------------------------------------------------------
 
-def short_host(host: Optional[str]) -> Optional[str]:
+def short_host(host):
     """Strip the DNS domain: 'mac.home' -> 'mac'. None/empty stays falsy.
 
     Hostnames reach the index from several places (agent-tracker's lifecycle
@@ -144,7 +144,7 @@ def short_host(host: Optional[str]) -> Optional[str]:
     return host.split(".")[0] if host else None
 
 
-def machine_name() -> str:
+def machine_name():
     """This machine's name: skill "machine-name" (copy it identically)."""
     name = (os.environ.get("JR_MACHINE_NAME") or (
         subprocess.run(["scutil", "--get", "HostName"], capture_output=True, text=True).stdout
@@ -175,24 +175,24 @@ TITLE_SOURCE_LABELS = {
 
 # -- Utilities --------------------------------------------------------------
 
-def eprint(*args, **kwargs) -> None:
+def eprint(*args, **kwargs):
     """print() to stderr: every error, warning and log line of ares."""
     print(*args, file=sys.stderr, **kwargs)
 
 
-def run_text(l_cmd: List[str]) -> subprocess.CompletedProcess:
+def run_text(l_cmd):
     """Run a command and wait: its stdout and stderr captured as text; a failing exit is in .returncode, not raised."""
     return subprocess.run(l_cmd, capture_output=True, text=True)
 
 
-def log_verbose(msg: str, verbose: bool) -> None:
+def log_verbose(msg, verbose):
     """Print message to stderr with timestamp if verbose."""
     if verbose:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         eprint(f"[{ts}] {msg}")
 
 
-def parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
+def parse_ts(ts_str):
     """Parse an ISO 8601 '...Z' timestamp, or None if absent/unparseable.
 
     Every timestamp in the index is written in this one
@@ -207,7 +207,7 @@ def parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _make_portable_jsonl_path(abs_path: str) -> str:
+def _make_portable_jsonl_path(abs_path):
     """Convert absolute jsonl_path to portable ~/.claude/projects/... format.
 
     $HOME differs across machines (e.g. /Users/alice on a laptop vs
@@ -223,14 +223,14 @@ def _make_portable_jsonl_path(abs_path: str) -> str:
     return abs_path
 
 
-def _resolve_jsonl_path(stored_path: str) -> str:
+def _resolve_jsonl_path(stored_path):
     """Resolve a stored jsonl_path (possibly with ~) to an absolute path.
 
     A stored path is "~/..." or absolute (_make_portable_jsonl_path): expanduser leaves an absolute one as is."""
     return os.path.expanduser(stored_path)
 
 
-def read_json(path: str) -> Optional[Dict[str, Any]]:
+def read_json(path):
     """Load one JSON file, or None if it is missing or malformed."""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -241,7 +241,7 @@ def read_json(path: str) -> Optional[Dict[str, Any]]:
 
 # -- JSON Index Writer -----------------------------------------------------
 
-def write_json_atomic(doc: Dict[str, Any], json_path: str) -> None:
+def write_json_atomic(doc, json_path):
     """Write JSON to temp file then rename (atomic on POSIX)."""
     Path(json_path).parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(Path(json_path).parent), suffix=".tmp")
@@ -272,7 +272,7 @@ NOISE_TAGS = (
 NOISE_RE = re.compile(r"<(" + "|".join(NOISE_TAGS) + r")\b[^>]*>.*?</\1>", re.DOTALL)
 
 
-def iter_entries(jsonl_path: Any, warn: bool = False) -> Iterator[Dict[str, Any]]:
+def iter_entries(jsonl_path, warn=False):
     """Yield one dict per line of a .jsonl file, skipping blank/malformed ones.
 
     Every transcript reader in ares used to
@@ -295,7 +295,7 @@ def iter_entries(jsonl_path: Any, warn: bool = False) -> Iterator[Dict[str, Any]
             eprint(f"  WARNING: could not read {jsonl_path}: {e}")
 
 
-def extract_text(content: Any, block_types: Tuple[str, ...] = ("text",)) -> str:
+def extract_text(content, block_types=("text",)):
     """Flatten a message's content (str, or list of blocks of these types) to clean text."""
     if isinstance(content, str):
         text = content
@@ -308,7 +308,7 @@ def extract_text(content: Any, block_types: Tuple[str, ...] = ("text",)) -> str:
     return NOISE_RE.sub("", text).strip()
 
 
-def is_tool_result(entry: Dict[str, Any]) -> bool:
+def is_tool_result(entry):
     """True for a user entry that is really a tool result, not a human turn."""
     content = entry.get("message", {}).get("content", "")
     if isinstance(content, list):
@@ -334,25 +334,25 @@ class Transcript(NamedTuple):
     interactive: bool = True
 
     @property
-    def title(self) -> Optional[str]:
+    def title(self):
         """Best available title: an explicit /rename beats Claude's ai-title."""
         return self.custom_title or self.ai_title
 
     @property
-    def created_at(self) -> Optional[str]:
+    def created_at(self):
         """The first turn's timestamp (the first turn that has one)."""
         return next((m["timestamp"] for m in self.messages if m["timestamp"] is not None), None)
 
     @property
-    def last_active(self) -> Optional[str]:
+    def last_active(self):
         """The last turn's timestamp."""
         return self.messages[-1]["timestamp"] if self.messages else None
 
 
-def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
+def read_transcript(jsonl_path, warn=True):
     """Parse a session .jsonl into a Transcript (single pass over the file)."""
     custom_title = ai_title = permission_mode = cwd = entrypoint = None
-    messages: List[Dict[str, Any]] = []
+    messages = []
 
     for entry in iter_entries(jsonl_path, warn=warn):
         etype = entry.get("type", "")
@@ -400,13 +400,13 @@ def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
 # title source, so custom_title is always None for this backend).
 
 @lru_cache(maxsize=None)
-def _codex_session_titles() -> Dict[str, str]:
+def _codex_session_titles():
     """uuid -> latest thread_name from ~/.codex/session_index.jsonl.
 
     Cached for the lifetime of the process: the file only grows during a
     reindex run, and re-reading it once per session would be O(sessions^2).
     """
-    titles: Dict[str, str] = {}
+    titles = {}
     for entry in iter_entries(CODEX_SESSION_INDEX_FILE):
         sid, name = entry.get("id"), entry.get("thread_name")
         if sid and name:
@@ -414,11 +414,11 @@ def _codex_session_titles() -> Dict[str, str]:
     return titles
 
 
-def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
+def read_codex_transcript(jsonl_path, warn=True):
     """Parse a Codex rollout .jsonl into a Transcript (single pass over the file)."""
     session_id = cwd = None
     interactive = True
-    messages: List[Dict[str, Any]] = []
+    messages = []
 
     for entry in iter_entries(jsonl_path, warn=warn):
         etype = entry.get("type")
@@ -460,7 +460,7 @@ def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
 
 # -- Session Index Building -------------------------------------------------
 
-def resolve_title(t: Transcript) -> Tuple[str, str]:
+def resolve_title(t):
     """Pick the session's display title and record where it came from."""
     if t.custom_title:
         return t.custom_title, "custom"
@@ -477,11 +477,11 @@ def resolve_title(t: Transcript) -> Tuple[str, str]:
 # `agent-tracker tick` (the formats: agent-tracker's IMPLEMENTATION.md §4). They replace asm's own
 # lifecycle hook and its data/lifecycles/ sidecars (2026-11-07).
 
-def lifecycle_path(uuid: str) -> str:
+def lifecycle_path(uuid):
     return os.path.join(TRACKER_SESSIONS_DIR, uuid, "lifecycle.jsonl")
 
 
-def read_lifecycle(uuid: str) -> List[Dict[str, Any]]:
+def read_lifecycle(uuid):
     """The lifecycle lines of one session, oldest first ([] if agent-tracker has none).
 
     A line without its final newline is still being appended: it is ignored
@@ -503,7 +503,7 @@ def read_lifecycle(uuid: str) -> List[Dict[str, Any]]:
     return l_events
 
 
-def open_start(lifecycle_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def open_start(lifecycle_events):
     """The newest start line not followed by an end of the same pid, or None.
 
     The pid makes it right when a resume starts while the old process is still
@@ -511,7 +511,7 @@ def open_start(lifecycle_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     that end closes the old start, not the new one. An end line without a pid
     closes every start before it.
     """
-    d_open: Dict[Any, Dict[str, Any]] = {}   # pid -> its start line, in file order
+    d_open = {}   # pid -> its start line, in file order
     for ev in lifecycle_events:
         pid = ev.get("pid")
         if ev.get("event") == "start":
@@ -524,7 +524,7 @@ def open_start(lifecycle_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     return list(d_open.values())[-1] if d_open else None
 
 
-def killed_start(lifecycle_events: List[Dict[str, Any]], boot_ts: int) -> Optional[Dict[str, Any]]:
+def killed_start(lifecycle_events, boot_ts):
     """The Claude session's NEWEST start line, when it is of that boot (same_boot) and its process ended
     without a clean exit: no end line of its pid after it (a power cut), or one with reason "other" (what
     Claude Code logs when the tmux server or the terminal dies under it: 2026-11-07 15:30). None otherwise:
@@ -543,7 +543,7 @@ def killed_start(lifecycle_events: List[Dict[str, Any]], boot_ts: int) -> Option
     return st
 
 
-def pid_alive(pid: Any) -> bool:
+def pid_alive(pid):
     """Whether a process with this pid runs now (signal 0)."""
     try:
         os.kill(int(pid), 0)
@@ -554,12 +554,12 @@ def pid_alive(pid: Any) -> bool:
     return True
 
 
-def determine_state(lifecycle_events: List[Dict[str, Any]]) -> str:
+def determine_state(lifecycle_events):
     """'pending' if the session has a start with no end yet (running, or killed by a crash), 'exited' otherwise."""
     return "pending" if open_start(lifecycle_events) else "exited"
 
 
-def split_pane(pane: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def split_pane(pane):
     """'work:2.1' -> ('work', '2', '1'); None or a malformed value -> (None, None, None)."""
     if not pane or ":" not in pane:
         return None, None, None
@@ -568,7 +568,7 @@ def split_pane(pane: Optional[str]) -> Tuple[Optional[str], Optional[str], Optio
     return session or None, window or None, pane_index or None
 
 
-def index_one(uuid: str, jsonl_path: str, backend: "Backend") -> Tuple[str, str]:
+def index_one(uuid, jsonl_path, backend):
     """Build the index document of one session and write it: indexes/<uuid>.json, or indexes/hidden/<uuid>.json
     for a session nobody typed in. Returns (title, source): source is "custom" (via /rename), "ai" (native
     ai-title), "empty" (no messages), or "untitled" (has messages but no title)."""
@@ -653,7 +653,7 @@ INDEX_DIRS = [(LOCAL_INDEX_DIR, None)] + [(os.path.join(REMOTE_INDEX_DIR, h), h)
                                           for h in REMOTE_HOSTS]
 
 
-def load_index_doc(path: str, host: Optional[str]) -> Optional[Dict[str, Any]]:
+def load_index_doc(path, host):
     """Read one index file and tag it: _host, the machine it lives on (None: this one), and _source_missing,
     whether its .jsonl is gone (checked on this machine only)."""
     doc = read_json(path)
@@ -666,12 +666,12 @@ def load_index_doc(path: str, host: Optional[str]) -> Optional[Dict[str, Any]]:
     return doc
 
 
-def fold(s: str) -> str:
+def fold(s):
     """Lower-case and without accents ('Zürich' -> 'zurich'), for matching keywords."""
     return "".join(c for c in unicodedata.normalize("NFKD", s.casefold()) if not unicodedata.combining(c))
 
 
-def searchable_text(doc: Dict[str, Any]) -> str:
+def searchable_text(doc):
     """Text keywords are matched against: title, dirs, and the conversation.
 
     Deliberately excludes metadata (asm_version, hostnames, session_id), which
@@ -688,8 +688,7 @@ def searchable_text(doc: Dict[str, Any]) -> str:
 HOST_FIELDS = ("latest_hostname", "initial_hostname", "index_hostname")
 
 
-def passes_filters(doc: Dict[str, Any], opts: SearchOpts,
-                   cutoff_from: Optional[datetime], cutoff_until: Optional[datetime]) -> bool:
+def passes_filters(doc, opts, cutoff_from, cutoff_until):
     """Apply the --state / --host / --agent / --tmux / --from / --until filters to one session."""
     # Sessions nobody typed in (`claude -p`, Agent SDK, Codex sub-agents) are
     # never shown; `--uuid` still finds them. Docs indexed before v4.7 have no
@@ -720,7 +719,7 @@ def passes_filters(doc: Dict[str, Any], opts: SearchOpts,
     return not (cutoff_until and ts > cutoff_until)
 
 
-def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], bool]:
+def find_sessions(opts):
     """Find matching sessions in the index.
 
     Returns ([(doc, idx_path), ...], fuzzy_flag). Exact substring matching is
@@ -739,7 +738,7 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
     log_verbose(f"PHASE 2: Found {len(idx_files)} index files", verbose)
 
     # (doc, idx_path, searchable text) for everything surviving the filters
-    candidates: List[Tuple[Dict[str, Any], str, str]] = []
+    candidates = []
     for idx_path, host in idx_files:
         doc = load_index_doc(idx_path, host)
         if doc is None:
@@ -783,7 +782,7 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
     return [(doc, path) for doc, path, _ in matched], fuzzy
 
 
-def find_by_uuid(uuid: str) -> Optional[Dict[str, Any]]:
+def find_by_uuid(uuid):
     """Load one index doc by exact UUID, or by UUID prefix if no exact file
     exists. Used by --uuid to skip search/fzf entirely. None if 0 matches;
     exits with an error message (not just None) if the prefix is ambiguous,
@@ -806,14 +805,14 @@ def find_by_uuid(uuid: str) -> Optional[Dict[str, Any]]:
 
 # -- Session Display & Selection --------------------------------------------
 
-def clean_field(doc: Dict[str, Any], key: str) -> Optional[str]:
+def clean_field(doc, key):
     """One index field as a real string, or None if it is missing or a placeholder."""
     v = doc.get(key)
     s = "" if v is None else str(v).strip()
     return None if s in ("", "null", "?") else s
 
 
-def time_ago(ts_str: Optional[str]) -> str:
+def time_ago(ts_str):
     """Compact fixed-width age: ' 5 min ago', ' 3 hou ago', or a date if older."""
     ts = parse_ts(ts_str)
     if ts is None:
@@ -830,8 +829,7 @@ def time_ago(ts_str: Optional[str]) -> str:
     return ts.strftime("%Y-%m-%d")
 
 
-def extract_snippet(conversation: List[Dict[str, Any]], keywords: Optional[List[str]],
-                    max_chars: int = 120) -> str:
+def extract_snippet(conversation, keywords, max_chars=120):
     """One line of context for the picker's preview pane.
 
     With keywords, show the first message containing one, windowed around the
@@ -858,7 +856,7 @@ def extract_snippet(conversation: List[Dict[str, Any]], keywords: Optional[List[
     return ""
 
 
-def status_block(doc: Dict[str, Any]) -> str:
+def status_block(doc):
     """The '[ Pending  5 min ago ]' prefix, colored by state and freshness."""
     last_active = doc.get("last_active") or ""
     if doc.get("_source_missing"):
@@ -881,7 +879,7 @@ def status_block(doc: Dict[str, Any]) -> str:
     return f"{color}[ {label:<7} {time_ago(last_active)} ]{RESET}"
 
 
-def agent_block(doc: Dict[str, Any]) -> str:
+def agent_block(doc):
     """Agent-type tag ('[claude]'/'[codex]'), always shown and color-coded so
     the two backends are visually distinguishable at a glance in a mixed
     picker."""
@@ -890,7 +888,7 @@ def agent_block(doc: Dict[str, Any]) -> str:
     return f"{color}[{agent}]{RESET}"
 
 
-def host_block(doc: Dict[str, Any]) -> str:
+def host_block(doc):
     """The hostname segment: 'mac' in blue if local, another host in dark red."""
     for k in HOST_FIELDS:   # the first one set
         host = short_host(clean_field(doc, k))
@@ -908,8 +906,7 @@ def host_block(doc: Dict[str, Any]) -> str:
     return f"{color}{host}{RESET}"
 
 
-def format_session_for_fzf(doc: Dict[str, Any], idx_path: str,
-                           keywords: Optional[List[str]]) -> str:
+def format_session_for_fzf(doc, idx_path, keywords):
     """One fzf row: visible columns, then tab-separated fields for the preview.
 
     Layout is 'display \t snippet \t title-source \t uuid'; fzf shows only
@@ -932,7 +929,7 @@ def format_session_for_fzf(doc: Dict[str, Any], idx_path: str,
     return f"{display}\t{snippet}\t{source_label}\t{uuid}"
 
 
-def pick_session(opts: SearchOpts) -> Tuple[str, Dict[str, Any]]:
+def pick_session(opts):
     """Search the index and let the user pick one session in fzf: (uuid, doc).
 
     Exits the process on an empty result or a cancelled picker; never returns None.
@@ -1007,7 +1004,7 @@ def pick_session(opts: SearchOpts) -> Tuple[str, Dict[str, Any]]:
 # So a session no longer has to resume in the folder of its transcript's project slug (decoded from the slug until
 # 2026-11-20): it resumes in the last folder it ran in (the user, 2026-11-20).
 
-def resume_dir(doc: Dict[str, Any]) -> str:
+def resume_dir(doc):
     """The folder a session resumes in: the last one it ran in (agent-tracker's newest start, else the transcript's
     first cwd) when it still exists, else the current folder. A session of another machine: that folder as is, else
     ~ (it is tested there: resume_shell_cmd)."""
@@ -1017,7 +1014,7 @@ def resume_dir(doc: Dict[str, Any]) -> str:
     return wd if wd and os.path.isdir(wd) else os.getcwd()
 
 
-def resume_shell_cmd(doc: Dict[str, Any], agent_cmd: str) -> str:
+def resume_shell_cmd(doc, agent_cmd):
     """The shell command that resumes a session: `cd <resume_dir> && <agent command>` for one of this machine; for
     one of another machine, the same there over `ssh -t` (its own folder test: a gone folder falls back to ~).
     `claude` is my-setup's account selector on every machine (~/.local/bin/claude, 2026-11-20)."""
@@ -1031,7 +1028,7 @@ def resume_shell_cmd(doc: Dict[str, Any], agent_cmd: str) -> str:
 
 # -- Claude backend adapters --------------------------------------------------
 
-def _claude_resume_cmd(doc: Dict[str, Any], transcript: Optional["Transcript"], uuid: str, fork: bool) -> str:
+def _claude_resume_cmd(doc, transcript, uuid, fork):
     """The `claude --resume` command (the folder is resume_shell_cmd's). The transcript, when readable here, gives
     the newest permission mode and title; else the index's."""
     perm_mode = transcript.permission_mode if transcript else doc.get("permission_mode")
@@ -1054,14 +1051,14 @@ _CODEX_UUID_RE = re.compile(
     r'-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$')
 
 
-def _codex_uuid_of(jsonl_path: str) -> str:
+def _codex_uuid_of(jsonl_path):
     m = _CODEX_UUID_RE.search(jsonl_path)
     return m.group(1) if m else Path(jsonl_path).stem
 
 
 # -- Indexing Operations ----------------------------------------------------
 
-def scan_files(root: str, pattern: str) -> Dict[str, float]:
+def scan_files(root, pattern):
     """{path: mtime} of the files under root matching pattern ("**/" for any depth); {} if root does not exist.
 
     Index entries: a flat folder of <uuid>.json. Codex shards its sessions by date
@@ -1073,9 +1070,9 @@ def scan_files(root: str, pattern: str) -> Dict[str, float]:
     return {str(f): f.stat().st_mtime for f in d.glob(pattern) if f.is_file()}
 
 
-def scan_history_jsonl() -> Dict[str, float]:
+def scan_history_jsonl():
     """Scan all local .jsonl history files. Returns {path: mtime}."""
-    d: Dict[str, float] = {}
+    d = {}
     projects_dir = Path(PROJECTS_DIR)
     if not projects_dir.exists():
         return d
@@ -1106,7 +1103,7 @@ class Backend(NamedTuple):
     uuid_of: Callable      # jsonl_path -> uuid
 
 
-def needs_reindex(uuid: str, jsonl_mtime: float, idx_mtime: Optional[float]) -> bool:
+def needs_reindex(uuid, jsonl_mtime, idx_mtime):
     """True unless both the transcript and agent-tracker's lifecycle.jsonl predate the index file.
 
     The lifecycle has to be checked separately: a session that only started or
@@ -1122,7 +1119,7 @@ def needs_reindex(uuid: str, jsonl_mtime: float, idx_mtime: Optional[float]) -> 
 
 
 # Backend(name, scan, parse, resume_cmd, uuid_of), one per agent
-BACKENDS: Dict[str, Backend] = {
+BACKENDS = {
     # Claude names transcripts <uuid>.jsonl directly - the stem is the uuid
     "claude": Backend("claude", scan_history_jsonl, read_transcript, _claude_resume_cmd, lambda p: Path(p).stem),
 }
@@ -1141,8 +1138,7 @@ if CODEX_ENABLED:
 
 # -- Commands ---------------------------------------------------------------
 
-def plan_reindex(force: bool = False, single_uuid: str = "",
-                 max_sessions: int = 0) -> Tuple[List[Tuple[str, str, Backend]], Dict[str, int]]:
+def plan_reindex(force=False, single_uuid="", max_sessions=0):
     """First moves the hidden entries (migrate_hidden_entries), then: which transcripts to (re)index,
     [(uuid, jsonl_path, backend)], plus counts.
 
@@ -1150,7 +1146,7 @@ def plan_reindex(force: bool = False, single_uuid: str = "",
     ~4 ms for 3,014 transcripts (agent-tracker DESIGN §3, verified 2026-11-07).
     """
     migrate_hidden_entries()
-    d_history: Dict[str, Tuple[float, Backend]] = {}
+    d_history = {}   # jsonl_path -> (mtime, backend)
     for backend in BACKENDS.values():
         for p, m in backend.scan().items():
             d_history[p] = (m, backend)
@@ -1160,9 +1156,9 @@ def plan_reindex(force: bool = False, single_uuid: str = "",
                **scan_files(LOCAL_INDEX_DIR, "*.json")}   # by path: an entry in both counts twice
     idx_mtime_by_uuid = {Path(p).stem: mtime for p, mtime in d_index.items()}
 
-    l_todo: List[Tuple[str, str, Backend]] = []
+    l_todo = []   # (uuid, jsonl_path, backend)
     d_counts = {"history": len(d_history), "index": len(d_index), "skipped": 0, "ignored": 0, "duplicates": 0}
-    s_seen: set = set()
+    s_seen = set()
     for jsonl_path, (jsonl_mtime, backend) in d_history.items():
         if max_sessions and len(s_seen) >= max_sessions:
             break
@@ -1183,7 +1179,7 @@ def plan_reindex(force: bool = False, single_uuid: str = "",
     return l_todo, d_counts
 
 
-def run_reindex(l_todo: List[Tuple[str, str, Backend]], progress: bool = False) -> Tuple[int, int]:
+def run_reindex(l_todo, progress=False):
     """Index the given transcripts (index_one), 10 at a time. Returns (indexed, errors).
 
     progress: one [i/N] line per transcript, from the main thread.
@@ -1211,7 +1207,7 @@ def run_reindex(l_todo: List[Tuple[str, str, Backend]], progress: bool = False) 
     return indexed, errors
 
 
-def migrate_hidden_entries() -> None:
+def migrate_hidden_entries():
     """Move the entries of non-interactive sessions from indexes/ to indexes/hidden/ (once per machine).
 
     A marker file ends it; entries synced in later by an older ares are moved by the next `ares reindex --force`.
@@ -1227,7 +1223,7 @@ def migrate_hidden_entries() -> None:
     Path(marker).touch()
 
 
-def cmd_reindex(max_sessions: int, force: bool, single_uuid: str) -> None:
+def cmd_reindex(max_sessions, force, single_uuid):
     """Build/refresh index JSON files from local JSONL files, with a progress log.
 
     Step 1: scan local .jsonl history files; Step 2: scan the .json index files;
@@ -1255,7 +1251,7 @@ def cmd_reindex(max_sessions: int, force: bool, single_uuid: str) -> None:
 # one way (remote/<host>/), over one ssh call; a session of another machine resumes there, over ssh (resume_shell_cmd). Transcripts
 # never move: a project is worked on in its home machine only.
 
-def _pull_one(host: str) -> bool:
+def _pull_one(host):
     """Refresh the index on host and copy it into remote/<host>/ (replaced whole: a session gone there goes here
     too). True if the copy worked; on any failure the last copy stays."""
     try:
@@ -1283,7 +1279,7 @@ def _pull_one(host: str) -> bool:
         return False
 
 
-def refresh_all(verbose: bool) -> None:
+def refresh_all(verbose):
     """Refresh this machine's index and pull every remote host's, all at once; an unreachable host keeps its
     last copy, and says so.
 
@@ -1306,7 +1302,7 @@ def refresh_all(verbose: bool) -> None:
 
 # -- Resume -----------------------------------------------------------------
 
-def cmd_resume(opts: SearchOpts, fork: bool, print_cmd: bool) -> None:
+def cmd_resume(opts, fork, print_cmd):
     """Find and resume a session.
 
     print_cmd builds the exact command and prints it to stdout (nothing else)
@@ -1393,7 +1389,7 @@ SAME_BOOT_S = 60       # macOS shifts kern.boottime by a few seconds when the cl
 LAYOUT_CELL_RE = re.compile(r"(\d+)x(\d+),\d+,\d+(?:,(\d+))?")   # WxH,X,Y[,pane number]
 
 
-def current_boot_ts() -> int:
+def current_boot_ts():
     """This boot's start (epoch s): $AGENT_TRACKER_BOOT_TS (tests), sysctl kern.boottime, or /proc/stat btime."""
     if os.environ.get("AGENT_TRACKER_BOOT_TS"):
         return int(os.environ["AGENT_TRACKER_BOOT_TS"])
@@ -1406,7 +1402,7 @@ def current_boot_ts() -> int:
     return 0
 
 
-def layout_cells(layout: Optional[str]) -> Tuple[Optional[Tuple[int, int]], List[int]]:
+def layout_cells(layout):
     """'b25f,208x52,0,0{104x52,0,0,1,103x52,105,0,2}' -> ((208, 52), [1, 2]): window size, pane numbers in pane order."""
     # The cells come after the checksum and its comma; no comma (or no layout): no cell
     l_cells = LAYOUT_CELL_RE.findall((layout or "").partition(",")[2])
@@ -1416,19 +1412,19 @@ def layout_cells(layout: Optional[str]) -> Tuple[Optional[Tuple[int, int]], List
     return size, [int(n) for _, _, n in l_cells if n]
 
 
-def same_boot(a: Any, b: Any) -> bool:
+def same_boot(a, b):
     """Whether two boot_ts are of one boot (SAME_BOOT_S apart at most); never when one is missing."""
     return a is not None and b is not None and abs(int(a) - int(b)) <= SAME_BOOT_S
 
 
-def _fmt_ts(ts: Any) -> str:
+def _fmt_ts(ts):
     try:
         return datetime.fromtimestamp(int(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except (TypeError, ValueError, OverflowError, OSError):
         return "?"
 
 
-def tmux_plan(include_stale: bool, this_boot: bool) -> Dict[str, Any]:
+def tmux_plan(include_stale, this_boot):
     """Read agent-tracker's files and decide what to restore (no tmux call).
 
     this_boot: the tmux server died without a reboot: candidates are this boot's Claude sessions
@@ -1486,8 +1482,8 @@ def tmux_plan(include_stale: bool, this_boot: bool) -> Dict[str, Any]:
     # The moment of the crash, roughly: the newest tick among the candidates (this boot also holds live ones).
     newest_ts = max((int(r["seen"]["ts"]) for r in l_cand if r["seen"].get("ts")), default=0)
 
-    d_by_pane: Dict[str, Dict[str, Any]] = {}
-    l_outside: List[Dict[str, Any]] = []
+    d_by_pane = {}   # pane_id -> its newest row
+    l_outside = []
     for r in l_cand:
         r["stale"] = not r["seen"].get("ts") or r["ts"] < newest_ts - STALE_AFTER_S
         pane_id = r["pane_id"]
@@ -1496,7 +1492,7 @@ def tmux_plan(include_stale: bool, this_boot: bool) -> Dict[str, Any]:
         elif pane_id not in d_by_pane or r["ts"] > d_by_pane[pane_id]["ts"]:
             d_by_pane[pane_id] = r
 
-    d_sessions: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    d_sessions = {}   # tmux session -> {window_index: window}
     l_stale = []
     for pane_id, r in sorted(d_by_pane.items(), key=lambda kv: -kv[1]["ts"]):   # newest first
         if r["stale"] and not include_stale:
@@ -1533,7 +1529,7 @@ def tmux_plan(include_stale: bool, this_boot: bool) -> Dict[str, Any]:
             "outside": l_outside}
 
 
-def read_snapshot(boot_ts: int) -> Optional[Dict[str, Any]]:
+def read_snapshot(boot_ts):
     """agent-tracker's terminal snapshot of that boot (its FOR_READERS.md §4, rule 18), or None.
 
     The newest data/snapshots/<boot_ts>.tsv whose name is that boot (macOS may shift boot_ts by a few seconds).
@@ -1569,14 +1565,14 @@ def read_snapshot(boot_ts: int) -> Optional[Dict[str, Any]]:
     return d if d["panes"] else None
 
 
-def snapshot_plan(prev: int, snap: Dict[str, Any], l_cand: List[Dict[str, Any]]) -> Dict[str, Any]:
+def snapshot_plan(prev, snap, l_cand):
     """tmux_plan from the previous boot's snapshot: every tmux session, window and pane it lists. A pane gets
     `claude --resume` when a candidate (killed_start in that boot) has its pane_id and the pane's command was not
     a shell (Claude was still running there); else a shell in its folder. No stale rule. Candidates newer than the
     snapshot (started after it) are listed as "outside", to resume by hand. Same shape as tmux_plan, plus
     "iterm": [{"bounds", "tabs": [tmux session]}] front window first, and "snapshot": its path."""
-    d_cand: Dict[str, Dict[str, Any]] = {}
-    l_outside: List[Dict[str, Any]] = []
+    d_cand = {}   # pane_id -> its newest candidate
+    l_outside = []
     for r in l_cand:
         r["stale"] = False
         pane_id = r["pane_id"]
@@ -1585,7 +1581,7 @@ def snapshot_plan(prev: int, snap: Dict[str, Any], l_cand: List[Dict[str, Any]])
         elif not pane_id and r["ts"] > snap["ts"]:
             l_outside.append(r)
 
-    d_sessions: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    d_sessions = {}   # tmux session -> {window_index: window}
     set_used = set()
     for p in sorted(snap["panes"], key=lambda p: (p["window_index"], p["pane_index"])):
         # the window's first pane (in pane order) gives its name, layout and size
@@ -1600,7 +1596,7 @@ def snapshot_plan(prev: int, snap: Dict[str, Any], l_cand: List[Dict[str, Any]])
             w["panes"].append({"cmd": None, "cwd": p["cwd"]})
     l_outside += [r for r in d_cand.values() if r["uuid"] not in set_used and r["ts"] > snap["ts"]]
 
-    d_iterm: Dict[int, Dict[str, Any]] = {}
+    d_iterm = {}   # iTerm2 window number -> {"bounds", "tabs": [tmux session]}
     for row in sorted(snap["iterm"], key=lambda x: (x["window"], x["tab"])):
         w = d_iterm.setdefault(row["window"], {"bounds": row["bounds"], "tabs": []})
         name = snap["clients"].get(row["tty"])
@@ -1610,25 +1606,25 @@ def snapshot_plan(prev: int, snap: Dict[str, Any], l_cand: List[Dict[str, Any]])
             "iterm": [w for _, w in sorted(d_iterm.items()) if w["tabs"]], "snapshot": snap["path"]}
 
 
-def _is_claude(p: Optional[Dict[str, Any]]) -> bool:
+def _is_claude(p):
     """A planned pane that gets `claude --resume` (else a plain shell: None, or {"cmd": None, "cwd"})."""
     return bool(p and p.get("cmd"))
 
 
-def _pane_dir(p: Optional[Dict[str, Any]]) -> str:
+def _pane_dir(p):
     """The folder a planned pane's shell starts in: its saved folder when it still exists, else ~."""
     wd = (p or {}).get("cwd")
     return wd if wd and os.path.isdir(wd) else HOME
 
 
-def _applescript_str(s: str) -> str:
+def _applescript_str(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 BOUNDS_RE = re.compile(r"-?\d+(,-?\d+){3}")
 
 
-def iterm_windows(plan: Dict[str, Any], l_restored: List[str]) -> List[Tuple[Optional[str], List[str]]]:
+def iterm_windows(plan, l_restored):
     """[(bounds or None, [tmux session, in tab order])], front window first: the snapshot's iTerm2 windows with
     only the restored tmux sessions; a restored one in no tab becomes a tab of the first window. No snapshot:
     one window, one tab per restored tmux session."""
@@ -1644,7 +1640,7 @@ def iterm_windows(plan: Dict[str, Any], l_restored: List[str]) -> List[Tuple[Opt
     return l_out
 
 
-def iterm_script(l_windows: List[Tuple[Optional[str], List[str]]]) -> str:
+def iterm_script(l_windows):
     """AppleScript: per (bounds, tmux sessions), one new iTerm2 window (at those bounds), one tab per tmux session,
     each attaching to it. Created back to front, so the first window ends in front."""
     l_osa = ['tell application "iTerm2"']
@@ -1663,12 +1659,12 @@ def iterm_script(l_windows: List[Tuple[Optional[str], List[str]]]) -> str:
     return "\n".join(l_osa + ["end tell"])
 
 
-def claude_panes(d_windows: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+def claude_panes(d_windows):
     """The planned panes of one tmux session's windows that get `claude --resume`."""
     return [p for w in d_windows.values() for p in w["panes"] if _is_claude(p)]
 
 
-def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -> int:
+def cmd_tmux(dry_run, include_stale, iterm, this_boot):
     """Print the plan; unless dry_run, carry it out. Returns the exit status."""
     plan = tmux_plan(include_stale, this_boot)
     if not this_boot:   # a tmux server killed without a reboot leaves this boot's sessions to restore too
@@ -1681,7 +1677,7 @@ def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -
               f" If the tmux server died without a reboot: ares tmux --this-boot --dry-run")
         return 0
 
-    def tmux(*l_args: str) -> str:
+    def tmux(*l_args):
         """Run one tmux command; its output, stripped. Raises on failure."""
         out = run_text(["tmux", *l_args])
         if out.returncode != 0:
@@ -1699,9 +1695,9 @@ def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -
         print(head + f"no snapshot, {guess}; {n_claude} Claude session(s)"
               f" in tmux then{'' if include_stale else ' (stale ones need --all)'}")
 
-    l_restored: List[str] = []
-    l_started: List[Tuple[str, str]] = []   # (tmux session, pane id) of every pane that was sent a claude command
-    l_failed: List[str] = []
+    l_restored = []
+    l_started = []   # (tmux session, pane id) of every pane that was sent a claude command
+    l_failed = []
     errors = 0
     for name, d_windows in plan["sessions"].items():
         if subprocess.run(["tmux", "has-session", "-t", f"={name}"],
@@ -1812,7 +1808,8 @@ def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -
 # Examples are written once here and filtered per-subcommand into that
 # subparser's --help epilog, instead of a hand-maintained HELP blob that
 # duplicates flag descriptions already given to argparse via add_argument().
-EXAMPLES: List[Tuple[str, str, Optional[str]]] = [
+# (command, example, its note or None)
+EXAMPLES = [
     ("resume", "ares resume", None),
     ("resume", "ares resume profiling hallucination", None),
     ("resume", "ares resume -f 30 cai benchmarking", None),
@@ -1846,7 +1843,7 @@ TOP_DESCRIPTION = f"""ares {VERSION} - agent-resume (was asm): find and resume a
 
 # Each command: its help line, then its flags in --help order, (names..., default, help). The default tells the kind
 # of flag: False an on/off switch, "" a text, a number or None (no default) a whole number.
-COMMANDS: Dict[str, Tuple[str, List[Tuple[Any, ...]]]] = {
+COMMANDS = {
     "resume": ("Find and resume a past session", [
         ("-f", "--from-days-ago", 90, "Only sessions active in last N days (default: 90)"),
         ("-u", "--until-days-ago", None, "Only sessions active more than N days ago"),
@@ -1875,7 +1872,7 @@ COMMANDS: Dict[str, Tuple[str, List[Tuple[Any, ...]]]] = {
 }
 
 
-def main() -> None:
+def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
         prog="ares",
