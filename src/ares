@@ -582,8 +582,9 @@ def index_one(uuid: str, jsonl_path: str, backend: "Backend") -> Tuple[str, str]
     initial_working_dir = transcript.cwd or next((ev["cwd"] for ev in l_starts if ev.get("cwd")), None)
 
     # First start: where the session was born (host, tmux place); latest start: where it last ran.
-    initial_hostname = l_starts[0].get("machine") or None if l_starts else None
-    tmux_session, tmux_window, tmux_pane = split_pane(l_starts[0].get("pane") if l_starts else None)
+    first = l_starts[0] if l_starts else {}
+    initial_hostname = first.get("machine") or None
+    tmux_session, tmux_window, tmux_pane = split_pane(first.get("pane"))
     latest_hostname = next((ev["machine"] for ev in reversed(l_starts) if ev.get("machine")), None)
     latest_working_dir = next((ev["cwd"] for ev in reversed(l_starts) if ev.get("cwd")), None)
 
@@ -808,7 +809,8 @@ def find_by_uuid(uuid: str) -> Optional[Dict[str, Any]]:
 def clean_field(doc: Dict[str, Any], key: str) -> Optional[str]:
     """One index field as a real string, or None if it is missing or a placeholder."""
     v = doc.get(key)
-    return None if (v is None or (s := str(v).strip()) in ("", "null", "?")) else s
+    s = "" if v is None else str(v).strip()
+    return None if s in ("", "null", "?") else s
 
 
 def time_ago(ts_str: Optional[str]) -> str:
@@ -1128,6 +1130,7 @@ BACKENDS: Dict[str, Backend] = {
 if CODEX_ENABLED:
     BACKENDS["codex"] = Backend(
         "codex",
+        # every .jsonl under ~/.codex/sessions/YYYY/MM/DD/ (scan_files)
         lambda: scan_files(CODEX_SESSIONS_DIR, "**/*.jsonl"),
         read_codex_transcript,
         # the `codex resume`/`codex fork` command (the folder is resume_shell_cmd's)
@@ -1152,7 +1155,7 @@ def plan_reindex(force: bool = False, single_uuid: str = "",
         for p, m in backend.scan().items():
             d_history[p] = (m, backend)
     if single_uuid:
-        d_history = {p: v for p, v in d_history.items() if v[1].uuid_of(p) == single_uuid}
+        d_history = {p: (m, b) for p, (m, b) in d_history.items() if b.uuid_of(p) == single_uuid}
     d_index = {**scan_files(HIDDEN_INDEX_DIR, "*.json"),
                **scan_files(LOCAL_INDEX_DIR, "*.json")}   # by path: an entry in both counts twice
     idx_mtime_by_uuid = {Path(p).stem: mtime for p, mtime in d_index.items()}
@@ -1449,11 +1452,12 @@ def tmux_plan(include_stale: bool, this_boot: bool) -> Dict[str, Any]:
     if this_boot:
         prev = boot_now
     else:
-        l_boots = sorted({int(b) for r in l_rows for b in r["boots"] if isinstance(b, (int, float))
-                          and not same_boot(b, boot_now)}, reverse=True)
+        # every boot named in agent-tracker's files, but this one: the newest is the previous boot
+        l_boots = [int(b) for r in l_rows for b in r["boots"]
+                   if isinstance(b, (int, float)) and not same_boot(b, boot_now)]
         if not l_boots:
             return {"boot_ts": None}
-        prev = l_boots[0]
+        prev = max(l_boots)
 
     l_cand = []
     for r in l_rows:
@@ -1536,8 +1540,11 @@ def read_snapshot(boot_ts: int) -> Optional[Dict[str, Any]]:
     Returns {"path", "ts" (newest pane row), "panes": [{"session", "window_index", "pane_index", "pane_id",
     "command", "cwd", "layout", "window_name"}], "clients": {tty: tmux session}, "iterm": [{"window", "tab",
     "tty", "bounds"}]}. A line without its final newline is ignored."""
-    l_files = [f for f in glob.glob(os.path.join(TRACKER_SNAPSHOTS_DIR, "*.tsv"))
-               if os.path.basename(f)[:-4].isdigit() and same_boot(int(os.path.basename(f)[:-4]), boot_ts)]
+    l_files = []
+    for f in glob.glob(os.path.join(TRACKER_SNAPSHOTS_DIR, "*.tsv")):
+        name = os.path.basename(f)[:-4]   # <boot_ts>
+        if name.isdigit() and same_boot(int(name), boot_ts):
+            l_files.append(f)
     if not l_files:
         return None
     path = max(l_files, key=os.path.getmtime)
@@ -1708,7 +1715,11 @@ def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -
             size = f"{w['size'][0]}x{w['size'][1]}" if w["size"] else "default size"
             print(f"    window {widx} {w['name']!r}, {size}, {len(w['panes'])} pane(s), layout {w['layout']}")
             for i, r in enumerate(w["panes"]):
-                print(f"      pane {i}  {r['cmd'] + ('   (stale)' if r['stale'] else '') if _is_claude(r) else 'shell in ' + _pane_dir(r)}")
+                if _is_claude(r):
+                    what = r["cmd"] + ("   (stale)" if r["stale"] else "")
+                else:
+                    what = "shell in " + _pane_dir(r)
+                print(f"      pane {i}  {what}")
         if dry_run:
             l_restored.append(name)
             continue
