@@ -569,8 +569,9 @@ def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str
     initial_working_dir = transcript.cwd or next((ev["cwd"] for ev in l_starts if ev.get("cwd")), None)
 
     # First start: where the session was born (host, tmux place); latest start: where it last ran.
-    initial_hostname = l_starts[0].get("machine") or None if l_starts else None
-    tmux_session, tmux_window, tmux_pane = split_pane(l_starts[0].get("pane") if l_starts else None)
+    first_start = l_starts[0] if l_starts else {}
+    initial_hostname = first_start.get("machine") or None
+    tmux_session, tmux_window, tmux_pane = split_pane(first_start.get("pane"))
     latest_hostname = next((ev["machine"] for ev in reversed(l_starts) if ev.get("machine")), None)
     latest_working_dir = next((ev["cwd"] for ev in reversed(l_starts) if ev.get("cwd")), None)
 
@@ -695,9 +696,8 @@ def passes_filters(doc: Dict[str, Any], opts: SearchOpts,
     if opts.agent and (doc.get("agent_type") or "claude").lower() != opts.agent.lower():
         return False
 
-    if opts.tmux:
-        if opts.tmux.lower() not in (doc.get("tmux_session") or "").lower():
-            return False
+    if opts.tmux and opts.tmux.lower() not in (doc.get("tmux_session") or "").lower():
+        return False
 
     ts = parse_ts(doc.get("last_active", ""))
     if ts:
@@ -1451,17 +1451,16 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
         uuid = os.path.basename(folder.rstrip("/"))
         seen = read_json(os.path.join(folder, "last_seen.json")) or {}
         l_events = read_lifecycle(uuid)
-        l_rows.append({"uuid": uuid, "seen": seen, "start": open_start(l_events), "events": l_events,
+        l_rows.append({"uuid": uuid, "seen": seen, "events": l_events,
                        "boots": [seen.get("boot_ts")] + [e.get("boot_ts") for e in l_events]})
 
     if this_boot:
         prev = boot_now
-    else:
-        l_boots = sorted({int(b) for r in l_rows for b in r["boots"] if isinstance(b, (int, float))
-                          and not same_boot(b, boot_now)}, reverse=True)
-        if not l_boots:
+    else:   # the newest boot that is not this one
+        prev = max((int(b) for r in l_rows for b in r["boots"] if isinstance(b, (int, float))
+                    and not same_boot(b, boot_now)), default=None)
+        if prev is None:
             return {"boot_ts": None}
-        prev = l_boots[0]
 
     l_cand = []
     for r in l_rows:
