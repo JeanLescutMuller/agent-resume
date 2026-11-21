@@ -2,17 +2,13 @@
   "name": "agent-resume",
   "version": "3.0.0",
   "description": "agent-resume's SessionStart hook for Codex: the duplicate-session warning.",
-  "author": {
-    "name": "Jean Lescut-Muller"
-  },
+  "author": {"name": "Jean Lescut-Muller"},
   "interface": {
     "displayName": "agent-resume",
     "shortDescription": "Duplicate-session warning for ares",
     "longDescription": "SessionStart: warns when the session is already running in another process (read from agent-tracker's lifecycle).",
     "developerName": "Jean Lescut-Muller",
     "category": "Productivity",
-    "capabilities": [
-      "Hooks"
-    ]
+    "capabilities": ["Hooks"]
   }
 }

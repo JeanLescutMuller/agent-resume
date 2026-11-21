@@ -1,16 +1,7 @@
 {
   "hooks": {
     "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"$HOME/opt/agent-resume/session_start.py\"",
-            "async": false,
-            "timeout": 10
-          }
-        ]
-      }
+      {"hooks": [{"type": "command", "command": "python3 \"$HOME/opt/agent-resume/session_start.py\"", "async": false, "timeout": 10}]}
     ]
   }
 }
