@@ -381,8 +381,15 @@ def read_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
             if text:   # etype is the role: "user" or "assistant"
                 messages.append({"role": etype, "timestamp": entry.get("timestamp"), "text": text})
 
-    return Transcript(session_id or Path(jsonl_path).stem, cwd, messages,
-                      not (entrypoint or "").startswith("sdk-"), custom_title, ai_title, permission_mode)
+    return Transcript(
+        session_id or Path(jsonl_path).stem,
+        cwd,
+        messages,
+        not (entrypoint or "").startswith("sdk-"),   # interactive
+        custom_title,
+        ai_title,
+        permission_mode,
+    )
 
 
 # -- Codex backend: transcript parsing ---------------------------------------
@@ -444,8 +451,13 @@ def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
         if text:
             messages.append({"role": role, "timestamp": entry.get("timestamp"), "text": text})
 
-    return Transcript(session_id or Path(jsonl_path).stem, cwd, messages, interactive,
-                      ai_title=_codex_session_titles().get(session_id or ""))
+    return Transcript(
+        session_id or Path(jsonl_path).stem,
+        cwd,
+        messages,
+        interactive,
+        ai_title=_codex_session_titles().get(session_id or ""),
+    )
 
 
 # -- Session Index Building -------------------------------------------------
@@ -1144,7 +1156,13 @@ def plan_reindex(force: bool = False, single_uuid: str = "",
     idx_mtime_by_uuid = {Path(p).stem: mtime for p, mtime in d_index.items()}
 
     l_todo: List[Tuple[str, str, Backend]] = []
-    d_counts = {"history": len(d_history), "index": len(d_index), "skipped": 0, "ignored": 0, "duplicates": 0}
+    d_counts = {
+        "history": len(d_history),
+        "index": len(d_index),
+        "skipped": 0,
+        "ignored": 0,
+        "duplicates": 0,
+    }
     s_seen: set = set()
     for jsonl_path, (jsonl_mtime, backend) in d_history.items():
         if max_sessions and len(s_seen) >= max_sessions:
@@ -1529,8 +1547,13 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
             if not w["panes"]:
                 w["panes"], w["layout"] = [None], None
 
-    return {"boot_ts": prev, "newest_ts": newest_ts, "sessions": d_sessions, "stale": l_stale,
-            "outside": l_outside}
+    return {
+        "boot_ts": prev,
+        "newest_ts": newest_ts,
+        "sessions": d_sessions,
+        "stale": l_stale,
+        "outside": l_outside,
+    }
 
 
 def read_snapshot(boot_ts: int, same_boot) -> Optional[Dict[str, Any]]:
@@ -1540,8 +1563,11 @@ def read_snapshot(boot_ts: int, same_boot) -> Optional[Dict[str, Any]]:
     Returns {"path", "ts" (newest pane row), "panes": [{"session", "window_index", "pane_index", "pane_id",
     "command", "cwd", "layout", "window_name"}], "clients": {tty: tmux session}, "iterm": [{"window", "tab",
     "tty", "bounds"}]}. A line without its final newline is ignored."""
-    l_files = [f for f in glob.glob(os.path.join(TRACKER_SNAPSHOTS_DIR, "*.tsv"))
-               if os.path.basename(f)[:-4].isdigit() and same_boot(int(os.path.basename(f)[:-4]), boot_ts)]
+    l_files = []
+    for f in glob.glob(os.path.join(TRACKER_SNAPSHOTS_DIR, "*.tsv")):
+        name = os.path.basename(f)[:-4]   # <boot_ts>
+        if name.isdigit() and same_boot(int(name), boot_ts):
+            l_files.append(f)
     if not l_files:
         return None
     path = max(l_files, key=os.path.getmtime)
@@ -1556,13 +1582,21 @@ def read_snapshot(boot_ts: int, same_boot) -> Optional[Dict[str, Any]]:
             continue
         if f[2] == "pane" and len(f) >= 11 and f[4].isdigit() and f[5].isdigit():
             d["ts"] = max(d["ts"], int(f[0]))
-            d["panes"].append({"session": f[3], "window_index": int(f[4]), "pane_index": int(f[5]), "pane_id": f[6],
-                               "command": f[7].lstrip("-"), "cwd": f[8], "layout": f[9],
-                               "window_name": "\t".join(f[10:])})
+            d["panes"].append({
+                "session": f[3],
+                "window_index": int(f[4]),
+                "pane_index": int(f[5]),
+                "pane_id": f[6],
+                "command": f[7].lstrip("-"),
+                "cwd": f[8],
+                "layout": f[9],
+                "window_name": "\t".join(f[10:]),
+            })
         elif f[2] == "client" and len(f) >= 5:
             d["clients"][f[3]] = f[4]
         elif f[2] == "iterm" and len(f) >= 8 and f[3].isdigit() and f[5].isdigit():
-            d["iterm"].append({"window": int(f[3]), "tab": int(f[5]), "tty": f[6], "bounds": f[7]})
+            d["iterm"].append({"window": int(f[3]), "tab": int(f[5]),
+                               "tty": f[6], "bounds": f[7]})
     return d if d["panes"] else None
 
 
@@ -1596,8 +1630,15 @@ def snapshot_plan(prev: int, snap: Dict[str, Any], d_cand: Dict[str, Dict[str, A
         name = snap["clients"].get(row["tty"])
         if name and name not in w["tabs"]:
             w["tabs"].append(name)
-    return {"boot_ts": prev, "newest_ts": snap["ts"], "sessions": d_sessions, "stale": [], "outside": l_outside,
-            "iterm": [w for _, w in sorted(d_iterm.items()) if w["tabs"]], "snapshot": snap["path"]}
+    return {
+        "boot_ts": prev,
+        "newest_ts": snap["ts"],
+        "sessions": d_sessions,
+        "stale": [],
+        "outside": l_outside,
+        "iterm": [w for _, w in sorted(d_iterm.items()) if w["tabs"]],
+        "snapshot": snap["path"],
+    }
 
 
 def _is_claude(p: Optional[Dict[str, Any]]) -> bool:
@@ -1788,7 +1829,8 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
         l_windows = iterm_windows(plan, l_restored)
         script = iterm_script(l_windows)
         if dry_run:
-            print(f"  iTerm2   {len(l_windows)} window(s): " + " | ".join(", ".join(t) for _, t in l_windows) + "\n" + "\n".join("    " + l for l in script.splitlines()))
+            print(f"  iTerm2   {len(l_windows)} window(s): " + " | ".join(", ".join(t) for _, t in l_windows))
+            print("\n".join("    " + l for l in script.splitlines()))
         elif sys.platform != "darwin":
             print("  iTerm2   skipped (not macOS)")
         else:
