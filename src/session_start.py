@@ -51,7 +51,8 @@ def main() -> None:
     for line in ps.splitlines():
         f = line.split(None, 2)
         try:
-            d_proc[int(f[0])] = (int(f[1]), time.mktime(time.strptime(f[2].strip(), "%a %b %d %H:%M:%S %Y")))
+            d_proc[int(f[0])] = (int(f[1]),
+                                 time.mktime(time.strptime(f[2].strip(), "%a %b %d %H:%M:%S %Y")))
         except (IndexError, ValueError):
             continue
     s_mine, pid = set(), os.getpid()   # this hook and its ancestors: Claude Code's own process among them
@@ -68,24 +69,23 @@ def main() -> None:
                                                      text=True).stdout)
         boot = m.group(1) if m else None
     elif not boot:
-        boot = next((l.split()[1] for l in open("/proc/stat") if l.startswith("btime ")), None)
+        boot = next((l.split()[1] for l in open("/proc/stat")
+                     if l.startswith("btime ")), None)
 
-    s_ended = set()   # pids that logged an end (after /clear the process lives on and logs a new start)
+    l_ev = []   # (lifecycle line, its pid or 0); a line that is not an object with an integer pid is left out
     for raw in l_raw:
         try:
             ev = json.loads(raw)
-            if ev.get("event") == "end" and ev.get("pid"):
-                s_ended.add(int(ev["pid"]))
+            l_ev.append((ev, int(ev.get("pid") or 0)))
         except (ValueError, TypeError, AttributeError):
             continue
+    # pids that logged an end (after /clear the process lives on and logs a new start)
+    s_ended = {pid for ev, pid in l_ev
+               if ev.get("event") == "end" and pid}
     l_warn, s_seen = [], set()
-    for raw in l_raw:
-        try:
-            ev = json.loads(raw)
-            pid = int(ev.get("pid") or 0)
-        except (ValueError, TypeError, AttributeError):
-            continue
-        if ev.get("event") != "start" or not pid or pid in s_mine or pid in s_seen or pid in s_ended or pid not in d_proc:
+    for ev, pid in l_ev:
+        if (ev.get("event") != "start" or not pid or pid in s_mine or pid in s_seen or pid in s_ended
+                or pid not in d_proc):
             continue
         if ev.get("machine") and machine and ev["machine"] != machine:
             continue
@@ -102,19 +102,18 @@ def main() -> None:
     title = "DUPLICATE SESSION DETECTED"
 
     orange, yellow, bold, rst = "\033[48;5;208m\033[1;97m", "\033[38;5;214m", "\033[1m", "\033[0m"
-    try:
-        if os.environ.get("ARES_NO_TTY"):   # tests: no banner, no 3 s wait
-            raise OSError
-        with open("/dev/tty", "w") as tty:
-            tty.write(f"\n{orange}{' ' * 72}{rst}\n{orange}  ⚠️  agent-resume: {title:<51} {rst}\n"
-                      f"{orange}{' ' * 72}{rst}\n\n")
-            for w in l_warn:
-                tty.write(f"  {yellow}⚠️{bold}{w}{rst}\n")
-            tty.write(f"\n  {yellow}Press Ctrl+C to abort, or continue at your own risk.{rst}\n\n")
-            tty.flush()
-            time.sleep(3)
-    except OSError:
-        pass
+    if not os.environ.get("ARES_NO_TTY"):   # tests: no banner, no 3 s wait
+        try:
+            with open("/dev/tty", "w") as tty:
+                tty.write(f"\n{orange}{' ' * 72}{rst}\n{orange}  ⚠️  agent-resume: {title:<51} {rst}\n"
+                          f"{orange}{' ' * 72}{rst}\n\n")
+                for w in l_warn:
+                    tty.write(f"  {yellow}⚠️{bold}{w}{rst}\n")
+                tty.write(f"\n  {yellow}Press Ctrl+C to abort, or continue at your own risk.{rst}\n\n")
+                tty.flush()
+                time.sleep(3)
+        except OSError:   # no terminal (a pipe, a test): the warning still goes in additionalContext
+            pass
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                              "additionalContext": " | ".join(l_warn)}}))
 
