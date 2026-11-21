@@ -442,8 +442,9 @@ def read_codex_transcript(jsonl_path: str, warn: bool = True) -> Transcript:
             continue
 
         content = payload.get("content")
-        # a plain-string content is not a Codex message: it counts as no text
-        text = extract_text(content, ("input_text", "output_text")) if isinstance(content, list) else ""
+        text = ""   # a plain-string content is not a Codex message: it counts as no text
+        if isinstance(content, list):
+            text = extract_text(content, ("input_text", "output_text"))
         if text:
             messages.append({"role": role, "timestamp": entry.get("timestamp"), "text": text})
 
@@ -613,7 +614,8 @@ def index_one(uuid: str, jsonl_path: str, backend: "Backend") -> Tuple[str, str]
         "conversation": transcript.messages,   # [{role, timestamp, text}]
     }
 
-    idx_path, other_path = os.path.join(LOCAL_INDEX_DIR, f"{uuid}.json"), os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json")
+    idx_path = os.path.join(LOCAL_INDEX_DIR, f"{uuid}.json")
+    other_path = os.path.join(HIDDEN_INDEX_DIR, f"{uuid}.json")
     if not transcript.interactive:
         idx_path, other_path = other_path, idx_path
     write_json_atomic(doc, idx_path)   # it makes the folder
@@ -645,7 +647,8 @@ class SearchOpts(NamedTuple):
 # -- Session Search ---------------------------------------------------------
 
 # [(folder of index entries, its ssh host or None for this machine)]: this machine's, then each remote copy.
-INDEX_DIRS = [(LOCAL_INDEX_DIR, None)] + [(os.path.join(REMOTE_INDEX_DIR, h), h) for h in REMOTE_HOSTS]
+INDEX_DIRS = [(LOCAL_INDEX_DIR, None)] + [(os.path.join(REMOTE_INDEX_DIR, h), h)
+                                          for h in REMOTE_HOSTS]
 
 
 def load_index_doc(path: str, host: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -656,7 +659,8 @@ def load_index_doc(path: str, host: Optional[str] = None) -> Optional[Dict[str, 
         return None
     doc["_host"] = host
     jsonl_path = doc.get("jsonl_path")
-    doc["_source_missing"] = not host and (not jsonl_path or not os.path.exists(_resolve_jsonl_path(jsonl_path)))
+    doc["_source_missing"] = not host and (not jsonl_path
+                                           or not os.path.exists(_resolve_jsonl_path(jsonl_path)))
     return doc
 
 
@@ -1126,13 +1130,23 @@ def needs_reindex(uuid: str, jsonl_mtime: float, idx_mtime: Optional[float]) -> 
 
 
 BACKENDS: Dict[str, Backend] = {
-    # Claude names transcripts <uuid>.jsonl directly - the stem is the uuid.
-    "claude": Backend("claude", scan_history_jsonl, read_transcript, _claude_resume_cmd, lambda p: Path(p).stem),
+    "claude": Backend(
+        name="claude",
+        scan=scan_history_jsonl,
+        parse=read_transcript,
+        resume_cmd=_claude_resume_cmd,
+        uuid_of=lambda p: Path(p).stem,   # Claude names transcripts <uuid>.jsonl directly - the stem is the uuid
+    ),
 }
 
 if CODEX_ENABLED:
-    BACKENDS["codex"] = Backend("codex", lambda: scan_files(CODEX_SESSIONS_DIR, "**/*.jsonl"),
-                                read_codex_transcript, _codex_resume_cmd, _codex_uuid_of)
+    BACKENDS["codex"] = Backend(
+        name="codex",
+        scan=lambda: scan_files(CODEX_SESSIONS_DIR, "**/*.jsonl"),
+        parse=read_codex_transcript,
+        resume_cmd=_codex_resume_cmd,
+        uuid_of=_codex_uuid_of,
+    )
 
 
 # -- Commands ---------------------------------------------------------------
@@ -1152,7 +1166,8 @@ def plan_reindex(force: bool = False, single_uuid: str = "",
             d_history[p] = (m, backend)
     if single_uuid:
         d_history = {p: v for p, v in d_history.items() if v[1].uuid_of(p) == single_uuid}
-    d_index = {**scan_files(HIDDEN_INDEX_DIR, "*.json"), **scan_files(LOCAL_INDEX_DIR, "*.json")}
+    d_index = {**scan_files(HIDDEN_INDEX_DIR, "*.json"),
+               **scan_files(LOCAL_INDEX_DIR, "*.json")}   # by path: an entry in both counts twice
     idx_mtime_by_uuid = {Path(p).stem: mtime for p, mtime in d_index.items()}
 
     l_todo: List[Tuple[str, str, Backend]] = []
@@ -1196,12 +1211,14 @@ def run_reindex(l_todo: List[Tuple[str, str, Backend]], progress: bool = False) 
             except Exception as e:
                 errors += 1
                 if progress:
-                    print(f"    [{indexed + errors}/{len(l_todo)}] {uuid[:8]}  ERROR: {e}", file=sys.stderr, flush=True)
+                    print(f"    [{indexed + errors}/{len(l_todo)}] {uuid[:8]}  ERROR: {e}",
+                          file=sys.stderr, flush=True)
                 continue
             indexed += 1
             if progress:
                 marker = TITLE_SOURCE_MARKERS.get(source, "⚠️")
-                print(f"    [{indexed + errors}/{len(l_todo)}] {uuid[:8]}  indexed {marker} {title[:60]}", flush=True)
+                print(f"    [{indexed + errors}/{len(l_todo)}] {uuid[:8]}  indexed {marker} {title[:60]}",
+                      flush=True)
     return indexed, errors
 
 
@@ -1289,7 +1306,8 @@ def refresh_all(verbose: bool) -> None:
         try:
             l_todo, d_counts = plan_reindex()
             indexed, errors = run_reindex(l_todo)
-            log_verbose(f"refresh: {d_counts['scanned']} transcripts dated, {indexed} re-indexed, {errors} errors", verbose)
+            log_verbose(f"refresh: {d_counts['scanned']} transcripts dated, {indexed} re-indexed, {errors} errors",
+                        verbose)
         except Exception as e:   # the index stays as it was; the search still runs
             log_verbose(f"refresh skipped: {e}", verbose)
     for host, fut in d_pull.items():
@@ -1419,7 +1437,7 @@ def _fmt_ts(ts: Any) -> str:
         return "?"
 
 
-def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
+def tmux_plan(include_stale: bool, this_boot: bool) -> Dict[str, Any]:
     """Read agent-tracker's files and decide what to restore (no tmux call).
 
     this_boot: the tmux server died without a reboot: candidates are this boot's Claude sessions
@@ -1427,7 +1445,7 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
 
     Returns {"boot_ts", "newest_ts", "sessions": {name: {window_index: window}}, "stale": [row],
     "outside": [row]} or {"boot_ts": None} when there is no previous boot. A row is one Claude
-    session: {"uuid", "seen", "start", "ts", "cmd"}; a window: {"name", "layout", "size",
+    session: {"uuid", "seen", "start", "ts", "pane_id", "cmd"}; a window: {"name", "layout", "size",
     "panes": [row or None]} (None = a plain shell).
     """
     boot_now = current_boot_ts()
@@ -1457,8 +1475,16 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
             continue
         if this_boot and pid_alive(start.get("pid")):
             continue   # still running: nothing to restore (after a reboot, a pid is a new process: not checked)
-        r["start"] = start
-        r["seen"] = r["seen"] if same_boot(r["seen"].get("boot_ts"), prev) else {}
+        seen = r["seen"] if same_boot(r["seen"].get("boot_ts"), prev) else {}
+        r["start"], r["seen"] = start, seen
+        r["ts"] = int(seen.get("ts") or start.get("ts") or 0)
+        r["pane_id"] = seen.get("pane_id") or start.get("pane_id")
+        # `cd <dir> && claude --resume <uuid>`, in the last folder the session ran in (as `ares resume`):
+        # agent-tracker's start cwd of that run, else its last seen cwd, else ~ (any folder works: resume_dir).
+        wd = start.get("cwd") or seen.get("cwd")
+        if not (wd and os.path.isdir(wd)):
+            wd = HOME
+        r["cmd"] = f"cd {shlex.quote(wd)} && claude --resume {shlex.quote(r['uuid'])}"
         l_cand.append(r)
 
     if not this_boot:   # --this-boot: the snapshot may already show the tmux server started after the death
@@ -1472,11 +1498,8 @@ def tmux_plan(include_stale: bool, this_boot: bool = False) -> Dict[str, Any]:
     d_by_pane: Dict[str, Dict[str, Any]] = {}
     l_outside: List[Dict[str, Any]] = []
     for r in l_cand:
-        start, seen = r["start"], r["seen"]
-        r["ts"] = int(seen.get("ts") or start.get("ts") or 0)
-        r["stale"] = not seen.get("ts") or r["ts"] < newest_ts - STALE_AFTER_S
-        r["cmd"] = _tmux_resume_cmd(r["uuid"], seen, start)
-        pane_id = seen.get("pane_id") or start.get("pane_id")
+        r["stale"] = not r["seen"].get("ts") or r["ts"] < newest_ts - STALE_AFTER_S
+        pane_id = r["pane_id"]
         if not pane_id:
             l_outside.append(r)
         elif pane_id not in d_by_pane or r["ts"] > d_by_pane[pane_id]["ts"]:
@@ -1561,11 +1584,8 @@ def snapshot_plan(prev: int, snap: Dict[str, Any], l_cand: List[Dict[str, Any]])
     d_cand: Dict[str, Dict[str, Any]] = {}
     l_outside: List[Dict[str, Any]] = []
     for r in l_cand:
-        start, seen = r["start"], r["seen"]
-        r["ts"] = int(seen.get("ts") or start.get("ts") or 0)
         r["stale"] = False
-        r["cmd"] = _tmux_resume_cmd(r["uuid"], seen, start)
-        pane_id = seen.get("pane_id") or start.get("pane_id")
+        pane_id = r["pane_id"]
         if pane_id and (pane_id not in d_cand or r["ts"] > d_cand[pane_id]["ts"]):
             d_cand[pane_id] = r
         elif not pane_id and r["ts"] > snap["ts"]:
@@ -1608,15 +1628,6 @@ def _pane_dir(p: Optional[Dict[str, Any]]) -> str:
     return wd if wd and os.path.isdir(wd) else HOME
 
 
-def _tmux_resume_cmd(uuid: str, seen: Dict[str, Any], start: Dict[str, Any]) -> str:
-    """`cd <dir> && claude --resume <uuid>`, in the last folder the session ran in (as `ares resume`):
-    agent-tracker's start cwd of that run, else its last seen cwd, else ~ (any folder works: resume_dir)."""
-    wd = start.get("cwd") or seen.get("cwd")
-    if not (wd and os.path.isdir(wd)):
-        wd = HOME
-    return f"cd {shlex.quote(wd)} && claude --resume {shlex.quote(uuid)}"
-
-
 def _applescript_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -1648,26 +1659,27 @@ def iterm_script(l_windows: List[Tuple[Optional[str], List[str]]]) -> str:
         l_osa.append("  set w to (create window with default profile)")
         if bounds and BOUNDS_RE.fullmatch(bounds):
             l_osa.append(f"  set bounds of w to {{{bounds}}}")
-        _iterm_tabs(l_osa, l_sessions)
+        for i, name in enumerate(l_sessions):
+            if i:
+                l_osa.append("  tell w to create tab with default profile")
+            # Always quoted: in zsh an unquoted word starting with '=' is "the path of that command" (=name -> "zsh:
+            # name not found"), and shlex.quote leaves '=name' bare (2026-11-07, the first real ares tmux).
+            target = "=" + name
+            cmd = "tmux attach -t '" + target.replace("'", "'\\''") + "'"
+            l_osa.append(f"  tell current session of w to write text {_applescript_str(cmd)}")
     return "\n".join(l_osa + ["end tell"])
 
 
-def _iterm_tabs(l_osa: List[str], l_sessions: List[str]) -> None:
-    for i, name in enumerate(l_sessions):
-        if i:
-            l_osa.append("  tell w to create tab with default profile")
-        # Always quoted: in zsh an unquoted word starting with '=' is "the path of that command" (=name -> "zsh: name
-        # not found"), and shlex.quote leaves '=name' bare (2026-11-07, the first real ares tmux).
-        target = "=" + name
-        cmd = "tmux attach -t '" + target.replace("'", "'\\''") + "'"
-        l_osa.append(f"  tell current session of w to write text {_applescript_str(cmd)}")
+def claude_panes(d_windows: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The planned panes of one tmux session's windows that get `claude --resume`."""
+    return [p for w in d_windows.values() for p in w["panes"] if _is_claude(p)]
 
 
-def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = True, this_boot: bool = False) -> int:
+def cmd_tmux(dry_run: bool, include_stale: bool, iterm: bool, this_boot: bool) -> int:
     """Print the plan; unless dry_run, carry it out. Returns the exit status."""
     plan = tmux_plan(include_stale, this_boot)
     if not this_boot:   # a tmux server killed without a reboot leaves this boot's sessions to restore too
-        n_now = sum(1 for d in tmux_plan(True, True)["sessions"].values() for w in d.values() for p in w["panes"] if _is_claude(p))
+        n_now = sum(len(claude_panes(d)) for d in tmux_plan(True, True)["sessions"].values())
         if n_now:
             print(f"ares tmux: {n_now} Claude session(s) of THIS boot ended without a clean exit (tmux server killed?):"
                   f" ares tmux --this-boot --dry-run")
@@ -1683,11 +1695,7 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
             raise RuntimeError(f"tmux {' '.join(shlex.quote(a) for a in l_args)}: {out.stderr.strip()}")
         return out.stdout.strip()
 
-    def exists(name: str) -> bool:
-        return subprocess.run(["tmux", "has-session", "-t", f"={name}"],
-                              capture_output=True).returncode == 0
-
-    n_claude = sum(1 for ws in plan["sessions"].values() for w in ws.values() for p in w["panes"] if _is_claude(p))
+    n_claude = sum(len(claude_panes(ws)) for ws in plan["sessions"].values())
     which = "this boot (tmux died without a reboot)" if this_boot else "previous boot"
     head = f"ares tmux{' --this-boot' if this_boot else ''}{' --dry-run' if dry_run else ''}: {which} {_fmt_ts(plan['boot_ts'])}, "
     if plan.get("snapshot"):
@@ -1703,10 +1711,10 @@ def cmd_tmux(dry_run: bool = False, include_stale: bool = False, iterm: bool = T
     l_failed: List[str] = []
     errors = 0
     for name, d_windows in plan["sessions"].items():
-        l_claude = [p for w in d_windows.values() for p in w["panes"] if _is_claude(p)]
-        if exists(name):
+        if subprocess.run(["tmux", "has-session", "-t", f"={name}"],
+                          capture_output=True).returncode == 0:   # it already exists
             print(f"  skip     tmux session {name!r}: already exists, left as is. Its Claude session(s), by hand:")
-            for r in l_claude:
+            for r in claude_panes(d_windows):
                 print(f"             {r['cmd']}")
             continue
         print(f"  restore  tmux session {name!r}: {len(d_windows)} window(s)")
