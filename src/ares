@@ -614,7 +614,7 @@ def build_doc(uuid: str, transcript: Transcript, lifecycle_events: List[Dict[str
 class SearchOpts(NamedTuple):
     """The filter/search flags of 'resume'.
 
-    These travel together through find_sessions and pick_session, so they move
+    These travel together through find_sessions and cmd_resume, so they move
     as one value rather than as ten positional arguments.
     """
     keywords: List[str]
@@ -756,34 +756,32 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
     l_kw = [fold(kw) for kw in opts.keywords]
 
     def matches(text: str, fuzzy: bool = False) -> bool:
+        # no keywords: everything matches
         return all((kw[:3] if fuzzy else kw) in text for kw in l_kw)
 
     fuzzy = False
-    sessions = [(doc, path) for doc, path, text in candidates
-                if not opts.keywords or matches(text)]
+    l_hits = [c for c in candidates if matches(c[2])]
 
-    if not sessions and opts.keywords:
+    if not l_hits and opts.keywords:
         fuzzy = True
         log_verbose("PHASE 4: Trying fuzzy match...", verbose)
-        sessions = [(doc, path) for doc, path, text in candidates if matches(text, fuzzy=True)]
+        l_hits = [c for c in candidates if matches(c[2], fuzzy=True)]
 
     # Rank matched sessions. Title match is the strongest signal.
     # Within title-matching sessions, prefer most recent (stable sort preserves recency).
     # Within non-title-matching sessions, prefer higher TF density.
-    if opts.keywords and sessions:
-        text_by_path = {path: text for _, path, text in candidates}
+    def rank_key(item: Tuple[Dict[str, Any], str, str]) -> Tuple[int, float]:
+        doc, _, text = item
+        title = fold(doc.get("custom_title") or "")
+        if all(kw in title for kw in l_kw):
+            return (0, 0.0)  # title match: stable sort keeps recency order
+        n_tokens = len(text.split()) or 1
+        hits = sum(text.count(kw) for kw in l_kw)
+        return (1, -hits / n_tokens)
 
-        def rank_key(item: Tuple[Dict[str, Any], str]) -> Tuple[int, float]:
-            doc, idx_path = item
-            title = fold(doc.get("custom_title") or "")
-            if all(kw in title for kw in l_kw):
-                return (0, 0.0)  # title match: stable sort keeps recency order
-            text = text_by_path.get(idx_path, "")
-            n_tokens = len(text.split()) or 1
-            hits = sum(text.count(kw) for kw in l_kw)
-            return (1, -hits / n_tokens)
-
-        sessions.sort(key=rank_key)
+    if opts.keywords:
+        l_hits.sort(key=rank_key)
+    sessions = [(doc, path) for doc, path, _ in l_hits]
 
     log_verbose(f"PHASE 5: {len(sessions)} sessions matched (fuzzy={fuzzy})", verbose)
     return sessions, fuzzy
@@ -941,12 +939,11 @@ def format_session_for_fzf(doc: Dict[str, Any], idx_path: str,
 
 
 def run_fzf(sessions: List[Tuple[Dict[str, Any], str]], keywords: Optional[List[str]],
-            verbose: bool = False,
-            action_verb: str = "Resume") -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """Run fzf picker and return (UUID, doc) tuple. Returns (None, None) if cancelled."""
+            verbose: bool = False) -> Optional[Dict[str, Any]]:
+    """Run fzf picker and return the picked session's doc. Returns None if cancelled."""
     if not sessions:
         print("No sessions found.", file=sys.stderr)
-        return None, None
+        return None
 
     docs_by_uuid = {doc["session_id"]: doc for doc, _ in sessions if doc.get("session_id")}
     fzf_input = "".join(format_session_for_fzf(doc, path, keywords) + "\n"
@@ -969,7 +966,7 @@ def run_fzf(sessions: List[Tuple[Dict[str, Any], str]], keywords: Optional[List[
                 "--with-nth=1",
                 "--preview", preview_cmd,
                 "--preview-window=down:3:wrap",
-                f"--prompt=[{VERSION}] {action_verb} session: ",
+                f"--prompt=[{VERSION}] Resume session: ",
                 "--height=80%",
                 "--layout=reverse",
                 "--no-multi",
@@ -981,20 +978,20 @@ def run_fzf(sessions: List[Tuple[Dict[str, Any], str]], keywords: Optional[List[
 
         if result.returncode != 0:
             print("Cancelled.", file=sys.stderr)
-            return None, None
+            return None
 
         selected = result.stdout.strip()
         if not selected:
             print("No session selected.", file=sys.stderr)
-            return None, None
+            return None
 
         uuid = selected.split("\t")[-1]
         log_verbose(f"UUID selected: {uuid}", verbose)
-        return uuid, docs_by_uuid.get(uuid)
+        return docs_by_uuid.get(uuid)
 
     except FileNotFoundError:
         print("ERROR: fzf not found. Install it with: brew install fzf", file=sys.stderr)
-        return None, None
+        return None
 
 
 # -- Resume folder -------------------------------------------------------------
@@ -1318,48 +1315,35 @@ def refresh_all(verbose: bool = False) -> None:
             print(f"\033[38;5;208m⚠ {host} unreachable: its sessions as of the last search\033[0m", file=sys.stderr)
 
 
-# -- Picking a session -------------------------------------------------------
-
-def pick_session(opts: SearchOpts, action_verb: str) -> Tuple[str, Dict[str, Any]]:
-    """Refresh the index, search it and let the user pick one session in fzf.
-
-    Exits the process on an empty result or a cancelled picker; never returns None.
-    """
-    refresh_all(opts.verbose)
-    if not os.path.isdir(LOCAL_INDEX_DIR):
-        print(f"ERROR: local index cache not found at {LOCAL_INDEX_DIR}", file=sys.stderr)
-        print("  Run 'ares reindex' first to build the local cache.", file=sys.stderr)
-        sys.exit(1)
-
-    sessions, fuzzy = find_sessions(opts)
-    if fuzzy:
-        print("  (no exact matches - showing fuzzy results)", file=sys.stderr)
-
-    uuid, doc = run_fzf(sessions, opts.keywords, opts.verbose, action_verb)
-    if not uuid or not doc:
-        sys.exit(0)
-    return uuid, doc
-
-
 # -- Resume -----------------------------------------------------------------
 
 def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) -> None:
-    """Find and resume a session.
+    """Find and resume a session: refresh the index, then take the one of --uuid, or search the index and let the
+    user pick one session in fzf (an empty result or a cancelled picker exits the process).
 
     print_cmd builds the exact command and prints it to stdout (nothing else)
     instead of exec'ing it - a scriptable, non-interactive seam for tests that
     need to assert on resume/fork command construction without ever launching
     either agent's TUI.
     """
+    refresh_all(opts.verbose)
     if opts.uuid:
-        refresh_all(opts.verbose)
         doc = find_by_uuid(opts.uuid)
         if not doc:
             print(f"ERROR: no indexed session matches uuid '{opts.uuid}'.", file=sys.stderr)
             sys.exit(1)
-        uuid = doc.get("session_id", opts.uuid)
     else:
-        uuid, doc = pick_session(opts, action_verb="Resume")
+        if not os.path.isdir(LOCAL_INDEX_DIR):
+            print(f"ERROR: local index cache not found at {LOCAL_INDEX_DIR}", file=sys.stderr)
+            print("  Run 'ares reindex' first to build the local cache.", file=sys.stderr)
+            sys.exit(1)
+        sessions, fuzzy = find_sessions(opts)
+        if fuzzy:
+            print("  (no exact matches - showing fuzzy results)", file=sys.stderr)
+        doc = run_fzf(sessions, opts.keywords, opts.verbose)
+        if not doc:
+            sys.exit(0)
+    uuid = doc.get("session_id", opts.uuid)
 
     if doc.get("_source_missing", False):
         # Its transcript is gone from this machine (deleted by hand, or by Claude Code after cleanupPeriodDays):
@@ -1387,7 +1371,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
         print(cmd)
         return
 
-    print("")
+    print()
     print(f"Title:              {title or '(not set)'}")
     print(f"UUID:               {uuid}")
     print(f"Machine:            {host or 'this one'}")
@@ -1399,7 +1383,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
     if not host and working_dir != (latest_wd or initial_wd or working_dir):
         print("\033[33mThe folder it last ran in no longer exists here: resuming in the current folder.\033[0m")
     print(f"Command:            {cmd}")
-    print("")
+    print()
     print(f"{'Forking' if fork else 'Resuming'} {'on ' + host if host else ''} in {working_dir} ...")
     os.execv("/bin/bash", ["/bin/bash", "-c", cmd])
 
