@@ -730,7 +730,7 @@ def passes_filters(doc: Dict[str, Any], opts: SearchOpts,
     if doc.get("interactive") is False:
         return False
 
-    missing = doc.get("_source_missing", False)
+    missing = doc.get("_source_missing")
     if opts.state:
         # 'deleted' is not a session_state in the index - it means the source
         # .jsonl is gone - so it is matched against _source_missing instead.
@@ -793,7 +793,7 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
             candidates.append((doc, idx_path, fold(text) if opts.keywords else text))
 
     # Sort by last_active (most recent first)
-    candidates.sort(key=lambda item: item[0].get("last_active", "") or "", reverse=True)
+    candidates.sort(key=lambda item: item[0].get("last_active") or "", reverse=True)
     log_verbose(f"PHASE 3: {len(candidates)} sessions after filtering", verbose)
 
     # Apply max_scan limit (only when no keywords)
@@ -803,35 +803,34 @@ def find_sessions(opts: SearchOpts) -> Tuple[List[Tuple[Dict[str, Any], str]], b
     l_kw = [fold(kw) for kw in opts.keywords]
 
     def matches(text: str, fuzzy: bool = False) -> bool:
+        """Every keyword is in the text (fuzzy: its first 3 characters); no keyword: always."""
         return all((kw[:3] if fuzzy else kw) in text for kw in l_kw)
 
     fuzzy = False
-    sessions = [(doc, path) for doc, path, text in candidates
-                if not opts.keywords or matches(text)]
+    l_matched = [c for c in candidates if matches(c[2])]
 
-    if not sessions and opts.keywords:
+    if not l_matched and opts.keywords:
         fuzzy = True
         log_verbose("PHASE 4: Trying fuzzy match...", verbose)
-        sessions = [(doc, path) for doc, path, text in candidates if matches(text, fuzzy=True)]
+        l_matched = [c for c in candidates if matches(c[2], fuzzy=True)]
 
     # Rank matched sessions. Title match is the strongest signal.
     # Within title-matching sessions, prefer most recent (stable sort preserves recency).
     # Within non-title-matching sessions, prefer higher TF density.
-    if opts.keywords and sessions:
-        text_by_path = {path: text for _, path, text in candidates}
+    if opts.keywords and l_matched:
 
-        def rank_key(item: Tuple[Dict[str, Any], str]) -> Tuple[int, float]:
-            doc, idx_path = item
+        def rank_key(item: Tuple[Dict[str, Any], str, str]) -> Tuple[int, float]:
+            doc, _, text = item
             title = fold(doc.get("custom_title") or "")
             if all(kw in title for kw in l_kw):
                 return (0, 0.0)  # title match: stable sort keeps recency order
-            text = text_by_path.get(idx_path, "")
             n_tokens = len(text.split()) or 1
             hits = sum(text.count(kw) for kw in l_kw)
             return (1, -hits / n_tokens)
 
-        sessions.sort(key=rank_key)
+        l_matched.sort(key=rank_key)
 
+    sessions = [(doc, path) for doc, path, _ in l_matched]
     log_verbose(f"PHASE 5: {len(sessions)} sessions matched (fuzzy={fuzzy})", verbose)
     return sessions, fuzzy
 
@@ -859,8 +858,9 @@ def find_by_uuid(uuid: str) -> Optional[Dict[str, Any]]:
 
 # -- Session Display & Selection --------------------------------------------
 
-def clean_field(v: Any) -> Optional[str]:
-    """Normalize an index field to a real string, or None if it is a placeholder."""
+def clean_field(doc: Dict[str, Any], key: str) -> Optional[str]:
+    """One index field as a real string, or None if it is missing or a placeholder."""
+    v = doc.get(key)
     return None if (v is None or (s := str(v).strip()) in ("", "null", "?")) else s
 
 
@@ -911,13 +911,13 @@ def extract_snippet(conversation: List[Dict[str, Any]], keywords: Optional[List[
 
 def status_block(doc: Dict[str, Any]) -> str:
     """The '[ Pending  5 min ago ]' prefix, colored by state and freshness."""
-    state = clean_field(doc.get("session_state")) or "?"
+    state = clean_field(doc, "session_state") or "?"
     last_active = doc.get("last_active") or ""
     # A session with no lifecycle line has no start/end events at all, so
     # its state was never observed - say "Unknown" rather than assert "Exited".
-    has_lifecycle = bool(clean_field(doc.get("initial_hostname")))
+    has_lifecycle = bool(clean_field(doc, "initial_hostname"))
 
-    if doc.get("_source_missing", False):
+    if doc.get("_source_missing"):
         label, color = "Deleted", C_DELETED
     elif not has_lifecycle:
         label, color = "Unknown", C_INACTIVE
@@ -946,14 +946,14 @@ def agent_block(doc: Dict[str, Any]) -> str:
 
 def host_block(doc: Dict[str, Any]) -> str:
     """The hostname segment: 'mac' in blue if local, another host in dark red."""
-    latest = short_host(clean_field(doc.get("latest_hostname")))
-    initial = short_host(clean_field(doc.get("initial_hostname")))
+    latest = short_host(clean_field(doc, "latest_hostname"))
+    initial = short_host(clean_field(doc, "initial_hostname"))
 
     # Sessions predating the lifecycle hook have no lifecycle and, until they get
     # reindexed, no index_hostname either - but if their .jsonl is still on this
     # disk they are ours, since .jsonl files are never synced between machines.
-    host = latest or initial or short_host(clean_field(doc.get("index_hostname")))
-    if not host and not doc.get("_source_missing", False):
+    host = latest or initial or short_host(clean_field(doc, "index_hostname"))
+    if not host and not doc.get("_source_missing"):
         host = doc.get("_host") or LOCAL_HOSTNAME
     if not host:
         return ""
@@ -969,8 +969,8 @@ def format_session_for_fzf(doc: Dict[str, Any], idx_path: str,
     field 1 (--with-nth=1) and the preview command reads fields 2 and 3.
     """
     uuid = doc.get("session_id", os.path.basename(idx_path).replace(".json", ""))
-    title = clean_field(doc.get("custom_title")) or uuid
-    working_dir = clean_field(doc.get("latest_working_dir")) or clean_field(doc.get("initial_working_dir"))
+    title = clean_field(doc, "custom_title") or uuid
+    working_dir = clean_field(doc, "latest_working_dir") or clean_field(doc, "initial_working_dir")
 
     source = doc.get("title_source")
     marker = TITLE_SOURCE_MARKERS.get(source, "")
@@ -1114,20 +1114,19 @@ def _codex_uuid_of(jsonl_path: str) -> str:
     return m.group(1) if m else Path(jsonl_path).stem
 
 
+def file_mtimes(l_paths: Iterator[Path]) -> Dict[str, float]:
+    """{path: mtime} of the regular files among these paths."""
+    return {str(f): f.stat().st_mtime for f in l_paths if f.is_file()}
+
+
 def scan_codex_sessions() -> Dict[str, float]:
     """Scan all local Codex rollout .jsonl files. Returns {path: mtime}.
 
     Codex shards sessions by date (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl)
     rather than Claude's per-project-slug layout, hence the recursive walk.
     """
-    d: Dict[str, float] = {}
     root = Path(CODEX_SESSIONS_DIR)
-    if not root.exists():
-        return d
-    for f in root.rglob("*.jsonl"):
-        if f.is_file():
-            d[str(f)] = f.stat().st_mtime
-    return d
+    return file_mtimes(root.rglob("*.jsonl")) if root.exists() else {}
 
 
 # -- Indexing Operations ----------------------------------------------------
@@ -1153,14 +1152,10 @@ def scan_history_jsonl() -> Dict[str, float]:
 
 def scan_index_dir(index_dir: str) -> Dict[str, float]:
     """Scan a flat directory of .json index files. Returns {path: mtime}."""
-    d: Dict[str, float] = {}
     idx_dir = Path(index_dir)
     if not idx_dir.exists():
-        return d
-    for f in idx_dir.iterdir():
-        if f.is_file() and f.name.endswith(".json"):
-            d[str(f)] = f.stat().st_mtime
-    return d
+        return {}
+    return file_mtimes(f for f in idx_dir.iterdir() if f.name.endswith(".json"))
 
 
 def is_ignored_session(jsonl_path: str) -> bool:
@@ -1465,7 +1460,7 @@ def cmd_resume(opts: SearchOpts, fork: bool = False, print_cmd: bool = False) ->
     else:
         uuid, doc = pick_session(opts, action_verb="Resume")
 
-    if doc.get("_source_missing", False):
+    if doc.get("_source_missing"):
         # Its transcript is gone from this machine (deleted by hand, or by Claude Code after cleanupPeriodDays):
         # nothing to resume. The index entry still holds the whole conversation.
         eprint(f"ERROR: the transcript of session {uuid} is gone from this machine: it cannot be resumed.\n"
