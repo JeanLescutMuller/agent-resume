@@ -63,15 +63,19 @@ trap cleanup EXIT
 section "install.sh over the version before 2026-11-20 (its job, SessionEnd hook, ares-sync, inject-session), run twice"
 NEW="$HOME/opt/agent-resume"; LABEL=com.jeanlescut.agent-resume
 mkdir -p "$NEW/bin" "$NEW/data/indexes" "$NEW/skills/inject-session" "$HOME/.local/bin" "$HOME/.claude/skills" \
-         "$HOME/.agents/skills" "$HOME/Library/LaunchAgents"
-for f in bin/ares-sync session_end.sh entrypoint.sh entrypoint.conf ares-reindex-and-rsync.sh "$LABEL.plist"; do
+         "$HOME/.agents/skills"
+# the former job's trigger, as install.sh finds it on this OS: a LaunchAgent (macOS) or a systemd timer (Linux)
+if [ "$(uname -s)" = Darwin ]; then TRIGGERS=("$LABEL.plist"); TRIGGER_DIR=$HOME/Library/LaunchAgents
+else TRIGGERS=("$LABEL.service" "$LABEL.timer"); TRIGGER_DIR=$HOME/.config/systemd/user; fi
+mkdir -p "$TRIGGER_DIR"
+for f in bin/ares-sync session_end.sh entrypoint.sh entrypoint.conf ares-reindex-and-rsync.sh "${TRIGGERS[@]}"; do
     echo old > "$NEW/$f"
 done
 echo old > "$NEW/skills/inject-session/SKILL.md"; chmod -R a-w "$NEW/skills"
 ln -s "$NEW/bin/ares-sync" "$HOME/.local/bin/ares-sync"; ln -s "$NEW/bin/ares-sync" "$HOME/.local/bin/asm-sync"
 ln -s "$NEW/skills/inject-session" "$HOME/.claude/skills/inject-session"
 ln -s "$NEW/skills/inject-session" "$HOME/.agents/skills/inject-session"
-ln -s "$NEW/$LABEL.plist" "$HOME/Library/LaunchAgents/$LABEL.plist"
+for f in "${TRIGGERS[@]}"; do ln -s "$NEW/$f" "$TRIGGER_DIR/$f"; done
 echo '{"timestamp": "2026-11-01T00:00:00Z", "outcome": "success"}' > "$NEW/data/sync-log.jsonl"
 cat > "$NEW/data/settings.json" <<'EOF'
 {"local_index_dir": "~/opt/agent-resume/data/indexes", "remote_ssh_host": "", "remote_ssh_user": "",
@@ -90,7 +94,7 @@ check "the former job, files and links are gone; the data stays" python3 - <<EOF
 import os
 assert sorted(os.listdir("$NEW")) == ["bin", "codex-marketplace", "codex-plugin", "data", "install.sh", "session_start.py", "uninstall.sh"], sorted(os.listdir("$NEW"))
 assert [f for f in os.listdir("$NEW/bin") if f != "__pycache__"] == ["ares"], os.listdir("$NEW/bin")
-for p in ("$HOME/Library/LaunchAgents/$LABEL.plist", "$HOME/.local/bin/ares-sync", "$HOME/.local/bin/asm-sync",
+for p in (*["$TRIGGER_DIR/" + f for f in "${TRIGGERS[*]}".split()], "$HOME/.local/bin/ares-sync", "$HOME/.local/bin/asm-sync",
           "$HOME/.claude/skills/inject-session", "$HOME/.agents/skills/inject-session"):
     assert not os.path.lexists(p), p
 assert os.path.isfile("$NEW/data/sync-log.jsonl")
@@ -191,15 +195,16 @@ ares reindex >>"$LOG" 2>&1
 check "end of the old pid after a resume's start -> still pending; a partial line is ignored" test "$(field "$UI" session_state)" = pending
 
 section "search-time refresh: ares resume re-indexes only what changed"
+mtime() { if [ "$(uname -s)" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi; }; export -f mtime
 TA=$(python3 -c "import json; d=json.load(open('$IDX/$UA.json')); print(d['jsonl_path'])"); TA=${TA/#\~/$HOME}
-before_h=$(stat -f %m "$IDX/$UH.json")
+before_h=$(mtime "$IDX/$UH.json")
 sleep 1
 echo "{\"type\": \"user\", \"sessionId\": \"$UA\", \"timestamp\": \"2026-11-07T12:00:00Z\", \"message\": {\"content\": \"zebracorn keyword\"}}" >> "$TA"
 echo '}' >> "$AGENT_TRACKER_HOME/data/sessions/$UI/lifecycle.jsonl"   # completes the partial line: pid 2 ends
 ares resume --uuid "$UA" --print-cmd > "$S/printcmd.out" 2>>"$LOG"; check "ares resume --print-cmd exits 0" test $? -eq 0
 check "the changed transcript is re-indexed before the search" grep -q zebracorn "$IDX/$UA.json"
 check "a lifecycle-only change is re-indexed too (I now exited)" test "$(field "$UI" session_state)" = exited
-check "an unchanged session is not re-indexed" test "$(stat -f %m "$IDX/$UH.json")" = "$before_h"
+check "an unchanged session is not re-indexed" test "$(mtime "$IDX/$UH.json")" = "$before_h"
 check "--print-cmd builds cd <project> && claude --resume" grep -q "claude --resume $UA" "$S/printcmd.out"
 # the resume folder (2026-11-20): the last folder the session ran in; gone -> the current folder (claude --resume
 # finds the transcript from any folder)
@@ -330,10 +335,10 @@ out=$(ares reindex --force 2>&1); echo "$out" >>"$LOG"
 check "reindex --force: every session re-indexed ($n_all), 0 up to date, 0 errors" \
     bash -c "grep -q 'Step 3a: $n_all sessions scanned, $n_all to reindex, 0 up to date' <<<\"\$1\" && grep -q 'errors=0' <<<\"\$1\"" _ "$out"
 check "reindex -n 1 --force: 1 session" bash -c "ares reindex -n 1 --force 2>&1 | grep -q 'Step 3a: 1 sessions scanned, 1 to reindex'"
-before_h=$(stat -f %m "$IDX/$UH.json"); sleep 1
+before_h=$(mtime "$IDX/$UH.json"); sleep 1
 out=$(ares reindex --uuid "$UA" --force 2>&1); echo "$out" >>"$LOG"
 check "reindex --uuid: that session only (others untouched)" \
-    bash -c "grep -q 'Step 3a: 1 sessions scanned, 1 to reindex' <<<\"\$1\" && [ \$(stat -f %m '$IDX/$UH.json') = $before_h ]" _ "$out"
+    bash -c "grep -q 'Step 3a: 1 sessions scanned, 1 to reindex' <<<\"\$1\" && [ \$(mtime '$IDX/$UH.json') = $before_h ]" _ "$out"
 CU=$(python3 -c "import json; print(json.load(open('$S/expected.json'))['codex_uuid'])")
 check "reindex --uuid of a Codex rollout: indexed as agent codex" \
     bash -c "ares reindex --uuid $CU --force >>'$LOG' 2>&1 && [ \"\$(python3 -c \"import json; print(json.load(open('$IDX/$CU.json'))['agent_type'])\")\" = codex ]"
