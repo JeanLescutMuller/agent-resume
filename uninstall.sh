@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # uninstall.sh - agent-resume
 #
-# Removes what install.sh made: the links, the hook group, the Codex plugin and ~/opt/agent-resume/ except data/
+# Removes what install.sh made: the links, the job agent-resume.sync, the hook group, the Codex plugin and
+# ~/opt/agent-resume/ except data/
 # (index, settings, the copies of other machines' indexes). Does NOT touch this source folder, the session
 # transcripts (~/.claude/projects/, ~/.codex/sessions/) or agent-tracker's files.
 # Sandbox: when $HOME is not the user's real home (tests), no launchctl / systemctl call; codex gets CODEX_HOME=$HOME/.codex.
@@ -18,6 +19,9 @@ echo "Uninstalling agent-resume..."
 
 # -- Links into ~/opt/agent-resume ------------------------------------------------
 remove_links "$HOME/.local/bin/ares" "$HOME/.local/bin/asm"
+
+# -- The job agent-resume.sync (its statuses and logs stay in ~/opt/job-runner) -------------
+remove_sync_job
 
 # -- The hook group in ~/.claude/settings.json ---------------------------------------
 [ -f "$SETTINGS_JSON" ] && edit_hooks remove

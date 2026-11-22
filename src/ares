@@ -25,6 +25,8 @@ import os
 import re
 import json
 import glob
+import fcntl
+import hashlib
 import io
 import unicodedata
 import argparse
@@ -34,6 +36,7 @@ import shutil
 import tarfile
 import tempfile
 import textwrap
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -67,6 +70,15 @@ _SETTINGS = {
     # None = auto-detect (enabled iff codex_sessions_dir exists); an explicit
     # true/false in settings.json overrides the auto-detect.
     "codex_enabled": None,
+    # ares sync (DEV_DOC R6.7, D5): the hosts whose transcripts are copied both ways with this machine
+    "sync_hosts": [],
+    # the scope of ares sync: interactive sessions modified in the last N days (Mac 2026-11-22: 203 files, 1.09 GB)
+    "sync_since_days": 30,
+    # a bigger transcript is left out unless named (--uuid): the biggest interactive one was 180.6 MB (2026-11-22)
+    "sync_max_size_mb": 200,
+    # a transcript modified less than N s ago is being written (live); agent-tracker's open start with its pid
+    # alive covers the long tool calls (1 % of the gaps between lines exceed 290 s, 2026-11-22)
+    "sync_live_seconds": 60,
 }
 try:
     with open(SETTINGS_PATH) as f:
@@ -94,6 +106,12 @@ PULL_TIMEOUT_S = 15   # per host; a reindex there takes ~0.4 s (VM and NAS, 2026
 # Not rsync: the Mac's /usr/bin/rsync (openrsync) gets "invalid path" from the NAS's rsync 3.4.1 (2026-11-20).
 PULL_REMOTE_CMD = ("~/opt/agent-resume/bin/ares reindex >/dev/null 2>&1; "
                    "cd ~/opt/agent-resume/data/indexes && tar czf - --exclude=./hidden --exclude='*.tmp' .")
+
+SYNC_HOSTS = _SETTINGS["sync_hosts"]
+SYNC_LIVE_S = _SETTINGS["sync_live_seconds"]
+CONFLICTS_DIR = os.path.join(ARES_DATA_DIR, "conflicts")   # conflicts/<host>/<tree>/<path>: the other side's fork
+SYNC_LOCK = os.path.join(ARES_DATA_DIR, "sync.lock")
+SYNC_SERVE_CMD = "~/opt/agent-resume/bin/ares sync-serve"
 
 CODEX_SESSIONS_DIR = os.path.expanduser(_SETTINGS["codex_sessions_dir"])
 CODEX_SESSION_INDEX_FILE = os.path.expanduser(_SETTINGS["codex_session_index_file"])
@@ -748,6 +766,16 @@ def find_sessions(opts):
             text = searchable_text(doc)
             candidates.append((doc, idx_path, fold(text) if opts.keywords else text))
 
+    # One row per session: a session copied here by ares sync is also in the copy of the other machine's index;
+    # the newer copy wins, this machine's on a tie (R6.7: resume the local copy unless the other one is longer).
+    d_best = {}
+    for cand in candidates:
+        sid = cand[0].get("session_id")
+        prev = d_best.get(sid)
+        if prev is None or (cand[0].get("last_active") or "") > (prev[0].get("last_active") or ""):
+            d_best[sid] = cand
+    candidates = list(d_best.values())
+
     # Sort by last_active (most recent first)
     candidates.sort(key=lambda item: item[0].get("last_active", "") or "", reverse=True)
     log_verbose(f"PHASE 3: {len(candidates)} sessions after filtering", verbose)
@@ -787,11 +815,10 @@ def find_by_uuid(uuid):
     exists. Used by --uuid to skip search/fzf entirely. None if 0 matches;
     exits with an error message (not just None) if the prefix is ambiguous,
     since silently picking one would be the wrong failure mode here."""
-    l_dirs = INDEX_DIRS + [(HIDDEN_INDEX_DIR, None)]
-    for d, host in l_dirs:
-        exact = os.path.join(d, f"{uuid}.json")
-        if os.path.isfile(exact):
-            return load_index_doc(exact, host)
+    l_dirs = [(LOCAL_INDEX_DIR, None), (HIDDEN_INDEX_DIR, None)] + INDEX_DIRS[1:]
+    l_exact = [doc for d, host in l_dirs for doc in [load_index_doc(os.path.join(d, f"{uuid}.json"), host)] if doc]
+    if l_exact:   # the newest copy, this machine's on a tie (as find_sessions)
+        return max(l_exact, key=lambda doc: doc.get("last_active") or "")   # max keeps the first of equals
 
     candidates = [(p, host) for d, host in l_dirs for p in glob.glob(os.path.join(d, "*.json"))
                   if Path(p).stem.startswith(uuid)]
@@ -1300,7 +1327,534 @@ def refresh_all(verbose):
             eprint(f"\033[38;5;208m⚠ {host} unreachable: its sessions as of the last search\033[0m")
 
 
+# -- Sync of transcripts between machines (DEV_DOC R6.7, D5) -----------------
+# Since 2026-11-22 (the user): transcripts are copied both ways between this machine (the hub: the Mac, which can
+# reach the others) and each of sync_hosts, so a session continues on either with a local `claude --resume <uuid>`.
+# One ssh per host runs `ares sync-serve` there; both sides speak JSON lines, each optionally followed by raw bytes.
+# A transcript is only ever created or extended (a temp file in its folder, then a rename): never shortened,
+# replaced or deleted. Two copies of one uuid where neither is a prefix of the other (a fork) both stay as they are;
+# the other side's is kept aside in conflicts/<host>/. A copy being written on its own side (live) is never written.
+#
+#   hub                                      host (ares sync-serve)
+#   its scope (sync_manifest) ── manifest ─► its scope + the hub's uuids ──► {uuid: size, mtime, tail hash, live}
+#   the plan (sync_decide)    ── hashes ──►  the hash of its file just before the hub's size (prefix check)
+#   pulls                     ── get ─────►  the missing bytes
+#   pushes                    ── put ─────►  written as the hub's are (write_grown)
+#   reindex the copies        ── done ────►  reindex its copies, exit
+
+SYNC_TAIL_W = 65536        # bytes hashed just before a size: equal on both sides = one file is a prefix of the other
+SYNC_CHUNK = 1 << 20
+SYNC_HELLO_TIMEOUT_S = 60  # the host's scope: a reindex there first (~0.4 s on the NAS, 2026-11-20)
+SYNC_MIN_RATE = 1e6        # bytes/s assumed for the transfer deadline (LAN to the NAS: 44 MB/s, 2026-11-22)
+
+
+class SyncError(Exception):
+    pass
+
+
+def sync_trees():
+    """{tree: (its root, its backend)}: Claude's projects/ (shared by every Claude account: account-*/projects is a
+    link to it) and, when Codex is enabled here, Codex's sessions/."""
+    roots = {"claude": PROJECTS_DIR, "codex": CODEX_SESSIONS_DIR}
+    return {name: (roots[name], b) for name, b in BACKENDS.items()}
+
+
+def tree_path(tree, rel):
+    """The absolute path of a transcript named by the other side; SyncError for anything outside the tree."""
+    root = sync_trees().get(tree, (None,))[0]
+    p = os.path.normpath(os.path.join(root or "/nonexistent", rel))
+    if not root or not p.startswith(os.path.normpath(root) + os.sep) or not p.endswith(".jsonl"):
+        raise SyncError(f"refused path {tree}:{rel}")
+    return p
+
+
+def tail_hash(f, size):
+    """The hash of the SYNC_TAIL_W bytes before size."""
+    f.seek(max(0, size - SYNC_TAIL_W))
+    return hashlib.sha256(f.read(size - max(0, size - SYNC_TAIL_W))).hexdigest()
+
+
+def file_entry(path):
+    """size (up to the last newline: a line being written is not copied), mtime_ns, tail (tail_hash at size)."""
+    with open(path, "rb") as f:
+        st = os.fstat(f.fileno())
+        size = pos = st.st_size
+        while pos > 0:
+            n = min(SYNC_TAIL_W, pos)
+            f.seek(pos - n)
+            i = f.read(n).rfind(b"\n")
+            if i >= 0:
+                size = pos - n + i + 1
+                break
+            pos -= n
+        else:
+            size = 0
+        return {"size": size, "mtime_ns": st.st_mtime_ns, "tail": tail_hash(f, size)}
+
+
+def proc_starts():
+    """pid -> start time (epoch s) of every process, from one ps call ({} if ps fails)."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,lstart="], capture_output=True, text=True, timeout=10,
+                             env={**os.environ, "LC_ALL": "C"}).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    d = {}
+    for line in out.splitlines():
+        pid, _, lstart = line.strip().partition(" ")
+        try:
+            d[int(pid)] = time.mktime(time.strptime(lstart.strip(), "%a %b %d %H:%M:%S %Y"))
+        except ValueError:
+            pass
+    return d
+
+
+def live_kind(uuid, mtime_ns, d_procs):
+    """"running": agent-tracker's open start of this session has its process alive (same start time, 2 s slack, as
+    session_start.py); "recent": the transcript changed in the last sync_live_seconds; None: not live."""
+    st = open_start(read_lifecycle(uuid))
+    pid = st.get("pid") if st else None
+    t = d_procs.get(pid) if isinstance(pid, int) else None
+    if t is not None and (not st.get("pid_start") or abs(t - int(st["pid_start"])) <= 2):
+        return "running"
+    return "recent" if time.time() - mtime_ns / 1e9 < SYNC_LIVE_S else None
+
+
+def sync_manifest(since_days, max_mb, s_named, s_also, l_trees, refresh=True):
+    """This machine's transcripts in the scope of a sync, {uuid: entry}, and how many were left out for their size.
+
+    In scope: an interactive session (its index entry in indexes/, not hidden/) modified in the last since_days and
+    not bigger than max_mb; a named uuid (--uuid) whatever its kind, age or size; and every uuid of s_also found here
+    (the other side's scope: both sides compare the same sessions). Entry: tree, path (relative to the tree's root),
+    file_entry's size / mtime_ns / tail, live (live_kind)."""
+    if refresh:
+        try:
+            run_reindex(plan_reindex()[0])   # the interactive flag of every session, up to date
+        except Exception:
+            pass
+    cutoff = time.time() - since_days * 86400
+    d_procs = proc_starts()
+    d, n_big = {}, 0
+    for tree, (root, backend) in sync_trees().items():
+        if tree not in l_trees:
+            continue
+        for p, mtime in backend.scan().items():
+            uuid = backend.uuid_of(p)
+            if any(s in p for s in IGNORE_PATH_SUBSTRINGS):
+                continue
+            if uuid not in s_named and uuid not in s_also:
+                if mtime < cutoff or not os.path.exists(os.path.join(LOCAL_INDEX_DIR, uuid + ".json")):
+                    continue
+                if os.path.getsize(p) > max_mb * 1e6:
+                    n_big += 1
+                    continue
+            try:
+                e = file_entry(p)
+            except OSError:
+                continue
+            d[uuid] = {"tree": tree, "path": os.path.relpath(p, root), **e,
+                       "live": live_kind(uuid, e["mtime_ns"], d_procs)}
+    return d, n_big
+
+
+def copy_n(src, dst, n):
+    """Copy exactly n bytes from src to dst (None: read and drop them); SyncError if src ends first."""
+    while n > 0:
+        b = src.read(min(SYNC_CHUNK, n))
+        if not b:
+            raise SyncError("the stream ended in a transfer")
+        if dst:
+            dst.write(b)
+        n -= len(b)
+    return b
+
+
+def write_grown(path, base, base_mtime_ns, src, n, mtime_ns):
+    """Write path as its first base bytes followed by n bytes read from src, through a temp file in its folder and a
+    rename (an interruption leaves path as it was). base -1: a new transcript (path must not exist). Reads all n bytes
+    even when it refuses (the stream stays in step). Returns None, or why it refused: path changed since the plan,
+    the new file would not be longer, or the bytes do not end with a complete line."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".ares-tmp")   # not *.jsonl
+    err = st = None
+    try:
+        with open(tmp, "wb") as out:
+            os.chmod(tmp, 0o600)   # transcripts are private
+            if base >= 0:
+                try:
+                    with open(path, "rb") as f:
+                        st = os.fstat(f.fileno())
+                        if st.st_mtime_ns != base_mtime_ns or st.st_size < base:
+                            err = "changed since the plan"
+                        else:
+                            copy_n(f, out, base)
+                except OSError as e:
+                    err = f"unreadable: {e}"
+            elif os.path.exists(path):
+                err = "exists already"
+            last = copy_n(src, None if err else out, n)
+            out.flush()
+            os.fsync(out.fileno())
+        if err:
+            return err
+        if not last.endswith(b"\n"):
+            return "the bytes received do not end a line"
+        if base >= 0:
+            st2 = os.stat(path)
+            if (st2.st_size, st2.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+                return "changed while copying"
+            if base + n <= st.st_size:
+                return "the result would not be longer"
+        elif os.path.exists(path):
+            return "exists already"
+        os.utime(tmp, ns=(mtime_ns, mtime_ns))   # the source's: last active, Claude's cleanupPeriodDays
+        os.replace(tmp, path)
+        return None
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+class Peer:
+    """One side of the sync protocol: JSON lines, each optionally followed by raw bytes."""
+    def __init__(self, rfile, wfile):
+        self.r, self.w = rfile, wfile
+
+    def send(self, d, path=None, offset=0, n=0):
+        self.w.write(json.dumps(d).encode() + b"\n")
+        if path:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                copy_n(f, self.w, n)
+        self.w.flush()
+
+    def recv(self):
+        line = self.r.readline()
+        if not line.endswith(b"\n"):
+            raise SyncError("the connection closed")
+        return json.loads(line)
+
+
+def codex_index_lines():
+    """The complete lines of Codex's session_index.jsonl ([] without one)."""
+    try:
+        data = Path(CODEX_SESSION_INDEX_FILE).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return [line for line in data.split("\n")[:-1] if line.strip()]
+
+
+def index_lines_missing(l_have, l_other):
+    """The lines of l_other to append to l_have: per id, those newer (updated_at) than the newest l_have has, in
+    updated_at order (Codex reads the latest line per id)."""
+    def parse(line):
+        try:
+            d = json.loads(line)
+            return (d.get("id"), str(d.get("updated_at") or "")) if isinstance(d, dict) and d.get("id") else None
+        except json.JSONDecodeError:
+            return None
+    newest = {}
+    for line in l_have:
+        k = parse(line)
+        if k:
+            newest[k[0]] = max(newest.get(k[0], ""), k[1])
+    l_new = [(k[1], line) for line in l_other for k in [parse(line)] if k and k[1] > newest.get(k[0], "")]
+    return [line for _, line in sorted(l_new)]
+
+
+def append_codex_index(l_lines):
+    """Append lines to Codex's session_index.jsonl (never rewritten); None, or why not."""
+    if not l_lines:
+        return None
+    try:
+        with open(CODEX_SESSION_INDEX_FILE, "ab+") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell():
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    return "its last line is being written"
+            f.write(("\n".join(l_lines) + "\n").encode())
+    except OSError as e:
+        return str(e)
+    return None
+
+
+def reindex_paths(l_items):
+    """Re-index the transcripts just written, [(tree, absolute path, uuid)] (their mtime is the source's, so the date
+    rule of plan_reindex would miss them)."""
+    run_reindex([(u, p, sync_trees()[t][1]) for t, p, u in l_items if t in sync_trees()])
+
+
+def cmd_sync_serve():
+    """The host side (ssh <host> ares sync-serve): answers the hub on stdin/stdout until "done"."""
+    peer = Peer(sys.stdin.buffer, sys.stdout.buffer)
+    sys.stdout = sys.stderr   # nothing else may write on the protocol's stream
+    l_written = []
+    while True:
+        try:
+            m = peer.recv()
+        except SyncError:
+            return 1
+        op = m.get("op")
+        try:
+            if op == "manifest":
+                d, n_big = sync_manifest(m["since_days"], m["max_mb"], set(m["named"]), set(m["also"]), m["trees"])
+                peer.send({"trees": [t for t in m["trees"] if t in sync_trees()], "files": d, "too_big": n_big,
+                           "codex_index": codex_index_lines() if "codex" in sync_trees() else []})
+            elif op == "hashes":
+                l_h = []
+                for tree, rel, size in m["items"]:
+                    with open(tree_path(tree, rel), "rb") as f:
+                        l_h.append(tail_hash(f, size))
+                peer.send({"hashes": l_h})
+            elif op == "get":
+                p = tree_path(m["tree"], m["path"])
+                n = m["b"] - m["a"]
+                if os.path.getsize(p) < m["b"]:
+                    raise SyncError(f"{m['path']} is shorter than planned")
+                peer.send({"n": n}, p, m["a"], n)
+            elif op == "put":
+                p = tree_path(m["tree"], m["path"])
+                err = write_grown(p, m["base"], m["base_mtime_ns"], peer.r, m["n"], m["mtime_ns"])
+                if not err:
+                    l_written.append((m["tree"], p, m["uuid"]))
+                peer.send({"error": err})
+            elif op == "append_index":
+                peer.send({"error": append_codex_index(m["lines"])})
+            elif op == "done":
+                reindex_paths(l_written)
+                peer.send({"ok": True})
+                return 0
+            else:
+                peer.send({"error": f"unknown op {op}"})
+        except (OSError, SyncError, KeyError, TypeError, ValueError) as e:
+            if op == "put":   # its bytes were not read: the stream is out of step
+                return 1
+            peer.send({"error": str(e)})
+
+
+def fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+
+
+def sync_decide(l, r, prefix):
+    """What to do with one uuid, l and r its entries here and there (None: absent), prefix whether the shorter is a
+    prefix of the longer. One of: pull, push (create or extend the other side), same, conflict, live (the copy to
+    write is being written on its side), duplicate (running on both machines)."""
+    if l and r and l["live"] == "running" and r["live"] == "running":
+        return "duplicate"
+    src, dst, kind = (r, l, "pull") if not l or (r and r["size"] > l["size"]) else (l, r, "push")
+    if dst and dst["size"] == src["size"]:
+        return "same" if dst["tail"] == src["tail"] else "conflict"
+    if dst and not prefix:
+        return "conflict"
+    if not src["size"]:
+        return "same"
+    return "live" if dst and dst["live"] else kind
+
+
+def sync_host(host, since_days, max_mb, s_named, l_trees, dry_run):
+    """Sync this machine with one host (R6.7): print the plan, then (unless dry_run) do it. Returns a dict: status
+    (ok, unreachable, error), the counts, the uuids running there (remote_running), the line for the summary."""
+    t0 = time.time()
+    errf = tempfile.TemporaryFile()
+    proc = subprocess.Popen(["ssh", *SSH_OPTS, host, SYNC_SERVE_CMD], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=errf)
+    killer = threading.Timer(SYNC_HELLO_TIMEOUT_S, proc.kill)
+    killer.start()
+    peer = Peer(proc.stdout, proc.stdin)
+    c = {k: 0 for k in ("pull", "push", "pull_bytes", "push_bytes", "conflict", "live", "duplicate", "failed",
+                        "compared", "too_big")}
+    res = {"status": "ok", "counts": c, "remote_running": set()}
+    l_mine = []   # (tree, path, uuid) written here
+    try:
+        d_l, n_big = sync_manifest(since_days, max_mb, s_named, set(), l_trees)
+        peer.send({"op": "manifest", "since_days": since_days, "max_mb": max_mb, "named": sorted(s_named),
+                   "also": sorted(d_l), "trees": l_trees})
+        m = peer.recv()
+        trees = m["trees"]
+        d_r = {u: e for u, e in m["files"].items() if e["tree"] in trees}
+        d_l.update(sync_manifest(since_days, max_mb, s_named, set(d_r), l_trees, refresh=False)[0])
+        d_l = {u: e for u, e in d_l.items() if e["tree"] in trees}
+        c["too_big"] = n_big + m["too_big"]
+        res["remote_running"] = {u for u, e in d_r.items() if e["live"] == "running"}
+        # prefix checks: the longer side's hash just before the shorter one's size, against the shorter's tail
+        l_ask = [u for u in d_l if u in d_r and 0 < d_l[u]["size"] < d_r[u]["size"]]
+        peer.send({"op": "hashes", "items": [[d_r[u]["tree"], d_r[u]["path"], d_l[u]["size"]] for u in l_ask]})
+        d_prefix = dict(zip(l_ask, (h == d_l[u]["tail"] for u, h in zip(l_ask, peer.recv()["hashes"]))))
+        for u in d_l:
+            if u in d_r and d_l[u]["size"] > d_r[u]["size"]:
+                with open(tree_path(d_l[u]["tree"], d_l[u]["path"]), "rb") as f:
+                    d_prefix[u] = tail_hash(f, d_r[u]["size"]) == d_r[u]["tail"]
+        l_plan = []
+        for u in sorted(set(d_l) | set(d_r)):
+            l, r = d_l.get(u), d_r.get(u)
+            c["compared"] += 1
+            kind = sync_decide(l, r, d_prefix.get(u, True))   # absent: one side only, or an empty one
+            if kind != "same":
+                l_plan.append((kind, u, l, r))
+        # the plan, printed
+        for kind, u, l, r in l_plan:
+            e = r if kind == "pull" else l if kind == "push" else (l or r)
+            where = f"{e['tree']}  {e['path']}"
+            if kind in ("pull", "push"):
+                src, dst = (r, l) if kind == "pull" else (l, r)
+                base = dst["size"] if dst else 0
+                c[kind] += 1
+                c[kind + "_bytes"] += src["size"] - base
+                arrow = "↓" if kind == "pull" else "↑"
+                print(f"{host}  {arrow} {'extend' if dst else 'new':6}  {where}  {fmt_bytes(base)} → "
+                      f"{fmt_bytes(src['size'])}" + (" (live there)" if src["live"] else ""))
+            elif kind == "conflict":
+                c["conflict"] += 1
+                print(f"\033[38;5;208m{host}  ⚠ CONFLICT  {where}: here {fmt_bytes(l['size'])}, there "
+                      f"{fmt_bytes(r['size'])}, neither is a prefix of the other (both continued); both kept, "
+                      f"theirs copied to {os.path.join(CONFLICTS_DIR, host)}/\033[0m")
+            elif kind == "duplicate":
+                c["duplicate"] += 1
+                print(f"\033[38;5;208m{host}  ⚠ DUPLICATE SESSION on two machines: {u} is running here and on "
+                      f"{host}; nothing copied\033[0m")
+            else:
+                c["live"] += 1
+                print(f"{host}  live, skipped  {where} (being written on {'this machine' if l and l['live'] else host})")
+        killer.cancel()
+        killer = threading.Timer(SYNC_HELLO_TIMEOUT_S + (c["pull_bytes"] + c["push_bytes"]) / SYNC_MIN_RATE,
+                                 proc.kill)
+        killer.start()
+        if not dry_run:
+            for kind, u, l, r in l_plan:
+                if kind == "pull" or (kind == "conflict" and r["size"]):
+                    p = (os.path.join(CONFLICTS_DIR, host, r["tree"], r["path"]) + f".{r['size']}"
+                         if kind == "conflict" else os.path.join(sync_trees()[r["tree"]][0], l["path"] if l else r["path"]))
+                    if kind == "conflict" and os.path.exists(p):
+                        continue   # kept at an earlier sync
+                    base = l["size"] if l and kind == "pull" else 0
+                    peer.send({"op": "get", "tree": r["tree"], "path": r["path"], "a": base, "b": r["size"]})
+                    h = peer.recv()
+                    if "n" not in h:   # nothing was sent: the stream is in step
+                        c["failed"] += 1
+                        print(f"{host}  ✗ {r['path']}: not sent: {h.get('error')}")
+                        continue
+                    err = write_grown(p, base if l and kind == "pull" else -1, l["mtime_ns"] if l else 0, proc.stdout,
+                                      h["n"], r["mtime_ns"])
+                    if err:
+                        c["failed"] += 1
+                        print(f"{host}  ✗ {r['path']}: not written here: {err}")
+                    elif kind == "pull":
+                        l_mine.append((r["tree"], p, u))
+                elif kind == "push":
+                    base = r["size"] if r else 0
+                    peer.send({"op": "put", "tree": l["tree"], "path": r["path"] if r else l["path"], "uuid": u,
+                               "base": base if r else -1, "base_mtime_ns": r["mtime_ns"] if r else 0,
+                               "mtime_ns": l["mtime_ns"], "n": l["size"] - base},
+                              tree_path(l["tree"], l["path"]), base, l["size"] - base)
+                    err = peer.recv().get("error")
+                    if err:
+                        c["failed"] += 1
+                        print(f"{host}  ✗ {l['path']}: not written there: {err}")
+            if "codex" in trees:   # Codex's titles: the newer lines of each side appended to the other's
+                l_here, l_there = codex_index_lines(), m["codex_index"]
+                append_codex_index(index_lines_missing(l_here, l_there))
+                peer.send({"op": "append_index", "lines": index_lines_missing(l_there, l_here)})
+                peer.recv()
+        peer.send({"op": "done"})
+        peer.recv()
+        reindex_paths(l_mine)
+    except (OSError, SyncError, KeyError, TypeError, ValueError) as e:
+        proc.kill()
+        proc.wait()
+        try:
+            proc.stdin.close()   # its unsent bytes dropped now, not as a "BrokenPipeError" at exit
+        except OSError:
+            pass
+        errf.seek(0)
+        l_err = [ln for ln in errf.read().decode(errors="replace").splitlines()
+                 if ln.strip() and not ln.startswith("**")]   # ssh's post-quantum notice
+        res["status"] = "unreachable" if proc.returncode == 255 and not c["compared"] else "error"
+        why = l_err[-1] if l_err else str(e)
+        res["line"] = f"{host} {'unreachable' if res['status'] == 'unreachable' else 'failed'}: {why}"
+        eprint(f"\033[38;5;208m⚠ {res['line']}\033[0m")
+        return res
+    finally:
+        killer.cancel()
+    proc.stdin.close()
+    proc.wait()
+    l_parts = [f"{n} {w}" for n, w in ((c["pull"], f"↓ ({fmt_bytes(c['pull_bytes'])})"),
+                                        (c["push"], f"↑ ({fmt_bytes(c['push_bytes'])})"),
+                                        (c["conflict"], "conflict(s)"), (c["duplicate"], "DUPLICATE SESSION(S)"),
+                                        (c["live"], "live, skipped"), (c["failed"], "failed"),
+                                        (c["too_big"], f"over {max_mb} MB, left out")) if n]
+    res["line"] = (f"{host} {' · '.join(l_parts) or 'up to date'} ({c['compared']} compared, "
+                   f"{time.time() - t0:.1f} s{', dry run' if dry_run else ''})")
+    if c["failed"]:
+        res["status"] = "error"
+    return res
+
+
+def sync_lock(wait_s=0):
+    """The lock of ares sync (data/sync.lock): an open file holding it, or None when another sync holds it."""
+    os.makedirs(ARES_DATA_DIR, exist_ok=True)
+    f = open(SYNC_LOCK, "a")
+    deadline = time.time() + wait_s
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except OSError:
+            if time.time() >= deadline:
+                f.close()
+                return None
+            time.sleep(0.5)
+
+
+def cmd_sync(hosts, dry_run, since_days, max_mb, s_named, agent):
+    """ares sync: each host in turn (hub and spoke: what one host sent reaches the next in the same run).
+    Exit 0; 3 a host unreachable; 1 an error; 5 another sync running. The last line starts with "sync:"."""
+    l_hosts = hosts or SYNC_HOSTS
+    if not l_hosts:
+        eprint("ERROR: no host: set sync_hosts in " + SETTINGS_PATH + " or give --host")
+        return 1
+    lock = sync_lock()
+    if not lock:
+        print("sync: another ares sync is running")
+        return 5
+    l_trees = [agent] if agent else list(sync_trees())
+    l_res = [sync_host(h, since_days, max_mb, s_named, l_trees, dry_run) for h in l_hosts]
+    print("sync: " + "; ".join(r["line"] for r in l_res))
+    l_status = [r["status"] for r in l_res]
+    return 1 if "error" in l_status else 3 if "unreachable" in l_status else 0
+
+
 # -- Resume -----------------------------------------------------------------
+
+def pull_newer_copy(uuid, doc):
+    """R6.7: a session that has a copy here but is newer on a sync host (doc is that host's) is pulled first
+    (ares sync --host <host> --uuid <uuid>), then resumed here; the pull failing, it resumes there, over ssh. Running
+    there right now: says so (resuming it here too makes two processes continue one session). Returns the doc to
+    resume."""
+    host = doc.get("_host")
+    if not host or host not in SYNC_HOSTS:
+        return doc
+    def local_doc():
+        return next((d for d in (load_index_doc(os.path.join(p, f"{uuid}.json"), None)
+                                 for p in (LOCAL_INDEX_DIR, HIDDEN_INDEX_DIR)) if d and not d["_source_missing"]), None)
+    if not local_doc():
+        return doc
+    eprint(f"The copy on {host} is newer than this machine's: ares sync --host {host} --uuid {uuid} ...")
+    lock = sync_lock(wait_s=60)
+    res = sync_host(host, 0, 0, {uuid}, list(sync_trees()), False) if lock else {"status": "busy", "line": "busy"}
+    if lock:
+        lock.close()
+    if res["status"] != "ok" or res["counts"]["failed"] or res["counts"]["conflict"]:
+        eprint(f"\033[38;5;208m⚠ not pulled ({res['line']}): resuming it on {host}\033[0m")
+        return doc
+    if uuid in res["remote_running"]:
+        eprint(f"\033[38;5;208m⚠ DUPLICATE SESSION on two machines: {uuid} is running on {host} too\033[0m")
+    return local_doc()   # re-indexed by sync_host
+
 
 def cmd_resume(opts, fork, print_cmd):
     """Find and resume a session.
@@ -1327,6 +1881,7 @@ def cmd_resume(opts, fork, print_cmd):
                f"  Its conversation is still in the index: {os.path.join(LOCAL_INDEX_DIR, uuid + '.json')}")
         sys.exit(1)
 
+    doc = pull_newer_copy(uuid, doc)
     backend = BACKENDS.get(doc.get("agent_type") or "claude", BACKENDS["claude"])
     host = doc.get("_host")
     initial_wd = doc.get("initial_working_dir", "")
@@ -1825,6 +2380,10 @@ EXAMPLES = [
     ("tmux", "ares tmux --dry-run", "after a crash: print what would be restored"),
     ("tmux", "ares tmux", "restore it, then the iTerm2 windows and tabs as they were"),
     ("tmux", "ares tmux --all --no-iterm", "also the stale Claude sessions; no iTerm2 tab"),
+    ("sync", "ares sync --dry-run", "the plan: what would be copied, both ways"),
+    ("sync", "ares sync", "copy: create or extend, never delete"),
+    ("sync", "ares sync --host babisnas --uuid <uuid>", "one session, whatever its age"),
+    ("sync-serve", "ssh <host> ~/opt/agent-resume/bin/ares sync-serve", "what ares sync runs"),
     ("reindex", "ares reindex", None),
     ("reindex", "ares reindex -n 5", "reindex at most 5 sessions"),
     ("reindex", "ares reindex --force", "force reindex, ignoring mtime-based skip"),
@@ -1864,6 +2423,15 @@ COMMANDS = {
         ("--all", False, "No snapshot of that boot only: also restore stale Claude sessions (stopped ticking > 2 min before the others)"),
         ("--no-iterm", False, "Do not open iTerm2 tabs"),
     ]),
+    "sync": ("Copy transcripts both ways with the sync_hosts (create or extend only, never delete)", [
+        ("--host", "", "Only this host (an ssh name; default: sync_hosts in settings.json)"),
+        ("--dry-run", False, "Print the plan, copy nothing"),
+        ("--since-days", None, "Interactive sessions modified in the last N days (default: sync_since_days, 30)"),
+        ("--max-size-mb", None, "Leave out transcripts bigger than this (default: sync_max_size_mb, 200)"),
+        ("--uuid", "", "Also these sessions (comma-separated), whatever their kind, age or size"),
+        ("--agent", "", f"Only this agent's transcripts ({', '.join(sorted(BACKENDS))})"),
+    ]),
+    "sync-serve": ("The other side of ares sync, run there over ssh (not by hand)", []),
     "reindex": ("Re-index all sessions now", [
         ("-n", "--max", 0, "Max sessions to process (0 = unlimited, default: 0)"),
         ("--force", False, "Force reindex all sessions, ignoring mtime-based skip"),
@@ -1915,6 +2483,13 @@ def main():
         cmd_resume(opts, args.fork, args.print_cmd)
     elif args.command == "tmux":
         sys.exit(cmd_tmux(args.dry_run, args.all, not args.no_iterm, args.this_boot))
+    elif args.command == "sync":
+        sys.exit(cmd_sync([args.host] if args.host else [], args.dry_run,
+                          _SETTINGS["sync_since_days"] if args.since_days is None else args.since_days,
+                          _SETTINGS["sync_max_size_mb"] if args.max_size_mb is None else args.max_size_mb,
+                          {u for u in args.uuid.split(",") if u}, args.agent))
+    elif args.command == "sync-serve":
+        sys.exit(cmd_sync_serve())
     elif args.command == "reindex":
         cmd_reindex(args.max, args.force, args.uuid)
 

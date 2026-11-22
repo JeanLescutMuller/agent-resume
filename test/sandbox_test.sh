@@ -92,15 +92,25 @@ EOF
 bash "$REPO/install.sh" >>"$LOG" 2>&1 && bash "$REPO/install.sh" >>"$LOG" 2>&1; check "install.sh exits 0 twice" test $? -eq 0
 check "the former job, files and links are gone; the data stays" python3 - <<EOF
 import os
-assert sorted(os.listdir("$NEW")) == ["bin", "codex-marketplace", "codex-plugin", "data", "install.sh", "session_start.py", "uninstall.sh"], sorted(os.listdir("$NEW"))
+assert sorted(os.listdir("$NEW")) == ["bin", "codex-marketplace", "codex-plugin", "data", "install.sh", "session_start.py", "sync.conf", "sync.sh", "uninstall.sh"], sorted(os.listdir("$NEW"))
 assert [f for f in os.listdir("$NEW/bin") if f != "__pycache__"] == ["ares"], os.listdir("$NEW/bin")
 for p in (*["$TRIGGER_DIR/" + f for f in "${TRIGGERS[*]}".split()], "$HOME/.local/bin/ares-sync", "$HOME/.local/bin/asm-sync",
           "$HOME/.claude/skills/inject-session", "$HOME/.agents/skills/inject-session"):
     assert not os.path.lexists(p), p
 assert os.path.isfile("$NEW/data/sync-log.jsonl")
 EOF
-check "settings.json: the sync settings removed, remote_hosts added" \
-    python3 -c "import json; d=json.load(open('$NEW/data/settings.json')); assert d['remote_hosts'] == [] and not any(k.startswith(('remote_ssh', 'remote_index', 'sync_')) for k in d), d"
+check "settings.json: the old sync settings removed, remote_hosts and sync_hosts added" \
+    python3 -c "import json; d=json.load(open('$NEW/data/settings.json')); assert d['remote_hosts'] == [] and d['sync_hosts'] == [] and not any(k.startswith(('remote_ssh', 'remote_index', 'sync_stale')) for k in d), d"
+SYNC_PLIST="$HOME/Library/LaunchAgents/com.jeanlescut.agent-resume.sync.plist"
+if [ "$(uname)" = Darwin ]; then
+    check "sync_hosts empty: no job agent-resume.sync" bash -c "[ ! -e '$SYNC_PLIST' ] && [ ! -L '$SYNC_PLIST' ]"
+    python3 -c "import json; p='$NEW/data/settings.json'; d=json.load(open(p)); d['sync_hosts']=['fakehost']; open(p,'w').write(json.dumps(d))"
+    bash "$REPO/install.sh" >>"$LOG" 2>&1
+    check "sync_hosts set: the job's LaunchAgent links to ~/opt/agent-resume, runs sync.sh every 300 s" bash -c "[ \"\$(readlink '$SYNC_PLIST')\" = '$NEW/com.jeanlescut.agent-resume.sync.plist' ] && grep -q '$NEW/sync.sh' '$SYNC_PLIST' && grep -q '<integer>300</integer>' '$SYNC_PLIST'"
+    python3 -c "import json; p='$NEW/data/settings.json'; d=json.load(open(p)); d['sync_hosts']=[]; open(p,'w').write(json.dumps(d))"
+    bash "$REPO/install.sh" >>"$LOG" 2>&1
+    check "sync_hosts emptied again: the job removed" bash -c "[ ! -L '$SYNC_PLIST' ] && [ ! -e '$NEW/com.jeanlescut.agent-resume.sync.plist' ]"
+fi
 for name in ares asm; do
     check "~/.local/bin/$name -> bin/ares" test "$(readlink "$HOME/.local/bin/$name")" = "$NEW/bin/ares"
 done
@@ -551,6 +561,13 @@ assert got == want, (got, want)
 EOF
 for _ in 1 2 3 4 5 6; do [ "$(tmux display-message -p -t =work:0.1 '#{pane_current_path}')" = "$HOME/dev/plain dir" ] && break; sleep 0.5; done
 check "snapshot: a plain pane is a shell in its saved folder" test "$(tmux display-message -p -t =work:0.1 '#{pane_current_path}')" = "$HOME/dev/plain dir"
+
+section "ares sync (test/sync_test.sh: two sandbox homes, a fake ssh)"
+bash "$REPO/test/sync_test.sh" > "$S/sync_test.out" 2>&1; rc=$?
+cat "$S/sync_test.out" >> "$LOG"
+grep -E '^  (PASS|FAIL)' "$S/sync_test.out" | sed -E 's/^  (PASS|FAIL)  /  \1  sync: /'
+PASS=$((PASS + $(grep -c '^  PASS' "$S/sync_test.out"))); FAIL=$((FAIL + $(grep -c '^  FAIL' "$S/sync_test.out")))
+[ "$rc" = 0 ] || [ "$(grep -c '^  FAIL' "$S/sync_test.out")" -gt 0 ] || fail "sync_test.sh exited $rc"
 
 echo ""
 echo "Passed: $PASS   Failed: $FAIL   (log: $LOG)"

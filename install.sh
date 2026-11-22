@@ -5,7 +5,11 @@
 #   ~/opt/agent-resume/bin/ares          - the deployed copy, linked from ~/.local/bin/ares and ~/.local/bin/asm (alias)
 #   ~/opt/agent-resume/                  - the hook session_start.py (SessionStart), codex-plugin/ + codex-marketplace/,
 #                                          install.sh, uninstall.sh
-#   ~/opt/agent-resume/data/             - settings.json, indexes/, remote/<host>/ (copies of other machines' indexes)
+#   ~/opt/agent-resume/data/             - settings.json, indexes/, remote/<host>/ (copies of other machines' indexes),
+#                                          conflicts/<host>/ (ares sync: the other side's copy of a fork)
+#   ~/opt/agent-resume/sync.sh, sync.conf - the job agent-resume.sync (ares sync), and its dashboard settings
+#   ~/Library/LaunchAgents/com.jeanlescut.agent-resume.sync.plist - its trigger, every 5 min: the Mac only, and only
+#                                          when sync_hosts is set (removed when it is empty)
 #   ~/.claude/settings.json              - one SessionStart group (session_start.py); this file owns only that group
 #   ~/.codex/config.toml                 - the same hook for Codex, as the plugin agent-resume@agent-resume-local
 #                                          (`codex plugin`), if Codex is detected; a one-time hook-trust approval in Codex
@@ -30,6 +34,7 @@ SRC_DIR="$SCRIPT_DIR/src"
 SERVICE_DIR="$HOME/opt/agent-resume"
 SETTINGS_JSON="$HOME/.claude/settings.json"
 LABEL=com.jeanlescut.agent-resume   # the former job (until 2026-11-20), removed below
+SYNC_LABEL=com.jeanlescut.agent-resume.sync   # the job agent-resume.sync (since 2026-11-22): ares sync every 5 min
 IS_MACOS=$( [[ "$(uname -s)" == "Darwin" ]] && echo true || echo false )
 REAL_HOME=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
 SANDBOX=$( [[ "$HOME" != "$REAL_HOME" ]] && echo true || echo false )
@@ -77,6 +82,14 @@ if changed:   # always, with add
 PY
 }
 
+# remove_sync_job: the trigger of agent-resume.sync (LaunchAgent), if there; its status and logs stay in job-runner
+remove_sync_job() {
+    local link="$HOME/Library/LaunchAgents/$SYNC_LABEL.plist"
+    [ -e "$link" ] || [ -L "$link" ] || [ -e "$SERVICE_DIR/$SYNC_LABEL.plist" ] || return 0
+    $SANDBOX || launchctl bootout "gui/$(id -u)/$SYNC_LABEL" 2>/dev/null || true
+    rm -f "$link" "$SERVICE_DIR/$SYNC_LABEL.plist" && echo "  removed the job agent-resume.sync ($SYNC_LABEL)"
+}
+
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0   # sourced (by uninstall.sh): nothing else runs
 
 echo "Installing agent-resume..."
@@ -114,8 +127,9 @@ fi
 
 # -- Scripts -> ~/opt/agent-resume/, bin/ -> linked from ~/.local/bin/ ---------------
 mkdir -p "$SERVICE_DIR/bin" "$SERVICE_DIR/data" "$HOME/.local/bin"
-cp "$SRC_DIR/session_start.py" "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/uninstall.sh" "$SERVICE_DIR/"
-chmod +x "$SERVICE_DIR"/{session_start.py,install.sh,uninstall.sh}
+cp "$SRC_DIR/session_start.py" "$SRC_DIR/sync.sh" "$SRC_DIR/sync.conf" "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/uninstall.sh" \
+   "$SERVICE_DIR/"
+chmod +x "$SERVICE_DIR"/{session_start.py,sync.sh,install.sh,uninstall.sh}
 cp "$SRC_DIR/ares" "$SERVICE_DIR/bin/ares" && chmod +x "$SERVICE_DIR/bin/ares"
 for name in ares asm; do   # asm: an alias kept for a while after the rename
     ln -sfn "$SERVICE_DIR/bin/ares" "$HOME/.local/bin/$name"
@@ -139,10 +153,40 @@ d_user = json.load(open(path))
 GONE = ("remote_ssh_host", "remote_ssh_user", "remote_ssh_port", "remote_index_dir", "sync_stale_warning_hours")
 d_new = {k: v for k, v in d_user.items() if k not in GONE}
 d_new.setdefault("remote_hosts", [])
+d_new.setdefault("sync_hosts", [])   # ares sync (2026-11-22); the other sync_* keys keep their defaults in ares
 if d_new != d_user:
     open(path, "w").write(json.dumps(d_new, indent=2) + "\n")
-    print(f"  {path}: sync settings removed, remote_hosts added")
+    print(f"  {path}: settings migrated (old sync keys removed; remote_hosts, sync_hosts added if missing)")
 PY
+
+# -- The job agent-resume.sync: on the Mac (the hub: it reaches the NAS, the NAS cannot reach it), when sync_hosts is
+# set. A LaunchAgent every 5 min running ~/opt/agent-resume/sync.sh (job-runner). sync_hosts empty: the job removed.
+SYNC_HOSTS=$(python3 -c "import json, sys; print(' '.join(json.load(open(sys.argv[1])).get('sync_hosts') or []))" \
+             "$SERVICE_DIR/data/settings.json")
+if $IS_MACOS && [ -n "$SYNC_HOSTS" ]; then
+    cat > "$SERVICE_DIR/$SYNC_LABEL.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$SYNC_LABEL</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$SERVICE_DIR/sync.sh</string></array>
+  <key>StartInterval</key><integer>300</integer><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/>
+</dict></plist>
+PLIST
+    mkdir -p "$HOME/Library/LaunchAgents"
+    ln -sfn "$SERVICE_DIR/$SYNC_LABEL.plist" "$HOME/Library/LaunchAgents/$SYNC_LABEL.plist"
+    if ! $SANDBOX; then
+        launchctl bootout "gui/$(id -u)/$SYNC_LABEL" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$SYNC_LABEL.plist"
+        [ -f "$HOME/opt/job-runner/put-conf.sh" ] && bash "$HOME/opt/job-runner/put-conf.sh" agent-resume.sync \
+            "$SERVICE_DIR/sync.conf" >/dev/null 2>&1 || echo "  NOTE: the dashboard settings (sync.conf) not sent"
+    fi
+    echo "  job agent-resume.sync: LaunchAgent $SYNC_LABEL, every 5 min, ares sync with: $SYNC_HOSTS"
+    [ -f "$HOME/opt/job-runner/lib.sh" ] || echo "  NOTE: job-runner is not installed (~/opt/job-runner/lib.sh missing): every check fails until it is."
+else
+    remove_sync_job
+    $IS_MACOS && echo "  no job agent-resume.sync (sync_hosts is empty in $SERVICE_DIR/data/settings.json)"
+fi
 
 # -- ~/.claude/settings.json: the SessionStart hook; the former SessionEnd one removed (edit_hooks above) ----------
 if [ -f "$SETTINGS_JSON" ]; then
