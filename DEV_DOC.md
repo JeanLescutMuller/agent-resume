@@ -325,7 +325,7 @@ Since 2026-11-20 (the user), replacing `ares-sync` (an index-only, hub-and-spoke
 | `src/ares` | R1/R3/R4/R6.2/R6.4/R6.5: index (both backends + agent-tracker's lifecycle), refresh, other machines, search, fzf, resume; `ares tmux` |
 | `src/session_start.py`, `src/codex-plugin/` | R6.3: the hook, and the Codex plugin that registers it for Codex |
 | `test/sandbox_test.sh`, `test/make_fixtures.py`, `test/smoke_test.sh` | tests: `TESTING.md` |
-| `tools/token_cost.sh`, `tools/deploy_remote.sh` | the code's cost in tokens (skill code-minimization); deploying HEAD to the VM and the NAS (a git bundle over ssh) |
+| `tools/token_cost.sh`, `tools/deploy_remote.sh` | the code's cost in tokens (skill code-minimization); deploying HEAD to the NAS (a git bundle over ssh; refuses the VM since 2026-11-22) |
 
 ### Hook registration
 

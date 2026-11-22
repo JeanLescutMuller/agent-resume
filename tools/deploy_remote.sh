@@ -3,7 +3,9 @@
 # temporary folder there (left for the OS to clear: no rm of a variable path), install.sh run from it. Pushing to GitHub stays the user's.
 # Reads: the local repo (HEAD). Writes on each host: ~/opt/agent-resume (by install.sh), a temporary clone in
 # /tmp (left for the OS); locally, the install logs in $LOG_DIR (default: ~/opt/agent-resume/logs/deploy_remote/).
-# Usage: bash tools/deploy_remote.sh [host...]   (default: H-Frank-1 babisnas)
+# Usage: bash tools/deploy_remote.sh [host...]   (default: babisnas)
+# Never the VM H-Frank-1 (refused): it is being given up, and its deploys kept switching services back on there
+# (task V7 of ~/dev/data-reorganisation, 2026-11-22).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 LOG_DIR=${LOG_DIR:-$HOME/opt/agent-resume/logs/deploy_remote}
@@ -11,8 +13,9 @@ mkdir -p "$LOG_DIR"
 bundle=/tmp/agent-resume-deploy.bundle   # a fixed path: removed by its literal name at the end
 git bundle create "$bundle" HEAD 2>/dev/null || { echo "git bundle failed" >&2; exit 1; }
 rc_all=0
-for host in "${@:-H-Frank-1 babisnas}"; do
+for host in "${@:-babisnas}"; do
   for h in $host; do
+    [ "$h" = H-Frank-1 ] && { echo "$h: refused (the VM is being given up, task V7)" >&2; rc_all=1; continue; }
     log="$LOG_DIR/$h.log"
     # the bundle goes through ssh's stdin (scp to the NAS's /tmp fails: "dest open ... No such file")
     if ssh "$h" 'set -e

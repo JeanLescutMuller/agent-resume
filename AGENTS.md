@@ -26,7 +26,7 @@ Find and resume past Claude Code and Codex sessions from any folder and any mach
 bash test/sandbox_test.sh          # everything, in a sandbox HOME + sandbox tmux server; log path printed at the end
 bash test/smoke_test.sh --offline  # health check of a real install (read-only)
 bash install.sh                    # deploy to ~/opt/agent-resume on the Mac
-bash tools/deploy_remote.sh        # deploy HEAD to the VM and the NAS (a git bundle over ssh: no push needed)
+bash tools/deploy_remote.sh        # deploy HEAD to the NAS (a git bundle over ssh: no push needed; refuses the VM, 2026-11-22)
 bash tools/token_cost.sh           # the code's cost in tokens (skill code-minimization)
 ```
 
