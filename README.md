@@ -1,6 +1,6 @@
 # agent-resume (`ares`): find and resume agent sessions
 
-**A CLI tool that extends Claude Code's (and Codex CLI's) session management with full-text search across folders and machines (a session resumes on its own machine), and a crash restore of the whole tmux setup - one unified picker across both agents.** Formerly agent-session-manager (`asm`, renamed 2026-11-07); `asm` stays as an alias of `ares` for a while.
+**A CLI tool that extends Claude Code's (and Codex CLI's) session management with full-text search across folders and machines, a two-way copy of the transcripts between the Mac and the NAS so a session continues on either (`ares sync`), and a crash restore of the whole tmux setup - one unified picker across both agents.** Formerly agent-session-manager (`asm`, renamed 2026-11-07); `asm` stays as an alias of `ares` for a while.
 
 ```mermaid
 flowchart LR
@@ -10,6 +10,8 @@ flowchart LR
   R --> RT["ares tmux<br/>(after a crash)"]
   R --> X["index<br/>~/opt/agent-resume/data/indexes/"]
   RS -->|ssh: reindex there, its index sent back| V["other machines<br/>(remote_hosts: VM, NAS)"]
+  R --> SY["ares sync<br/>(the Mac, every 5 min)"]
+  SY <-->|ssh: transcripts created or extended, both ways| N["sync_hosts<br/>(the NAS)"]
 ```
 
 ## What Claude Code / Codex Provide Natively
@@ -20,7 +22,7 @@ Since 2026 (Claude Code v2.1.1xx-2.1.3xx; no changelog line), `claude --resume <
 
 - No search by content: the pickers show titles; Claude's `/resume` shows the current folder first (`Ctrl+A` for all projects)
 - Each agent's picker only shows that agent's own sessions
-- You cannot see sessions from another machine at all
+- You cannot see sessions from another machine at all, nor continue one there
 
 ## What ares Adds
 
@@ -38,17 +40,41 @@ List the other machines in `remote_hosts` (`~/opt/agent-resume/data/settings.jso
 
 - runs `ares reindex` on each of them over ssh (~0.4 s), then sends its index back (a `.tar.gz`, in the same ssh call), one way, into `~/opt/agent-resume/data/remote/<host>/` (read-only copies; their non-interactive entries left out);
 - searches them with this machine's sessions, in one picker;
-- resumes a session of another machine **there**: `ssh -t <host> 'cd <last folder> && claude --resume <uuid>'`. Transcripts never move: a project is worked on in its home machine only.
+- resumes a session of another machine **there**: `ssh -t <host> 'cd <last folder> && claude --resume <uuid>'`, unless its transcript was copied here by `ares sync` (next section): then it resumes here.
 
-A machine out of reach (the NAS away from home) costs 3 s (`ConnectTimeout`) and a one-line warning; its sessions stay listed from the last copy. No sync, no hub, no scheduled job, no conflict to resolve (until 2026-11-20 an index-only sync, `ares-sync`, did that; it was never configured on any machine).
+A machine out of reach (the NAS away from home) costs 3 s (`ConnectTimeout`) and a one-line warning; its sessions stay listed from the last copy.
 
-### 3. One Picker Across Claude Code and Codex CLI
+### 3. Continue a Session on the Other Machine (`ares sync`, since 2026-11-22)
+
+A job on the Mac copies the transcripts both ways with the NAS every 5 min, so a session started on one continues on the other with a plain `claude --resume <uuid>` (or `ares resume`), the whole conversation included.
+
+```text
+ Mac (the hub: it runs the sync)                                 NAS (sync_hosts)
+ ~/.claude/projects/<slug>/<uuid>.jsonl  ◄── ssh: ares sync-serve ──►  ~/.claude/projects/<slug>/<uuid>.jsonl
+ ~/.codex/sessions/…/rollout-*.jsonl          one connection            (Codex: where it is installed)
+        │   only here → created there        only there → created here
+        │   longer here → its tail sent      longer there → its tail fetched
+        │   both continued (a fork) → both kept; theirs in ~/opt/agent-resume/data/conflicts/<host>/
+        └── being written on its side (live) → left alone; running on both → ⚠ DUPLICATE SESSION
+```
+
+Nothing is ever shortened, replaced or deleted: a transcript is only created or extended, through a temporary file and a rename (an interrupted copy leaves the file as it was). Its scope: the interactive sessions modified in the last 30 days (203 files, 1.1 GB on the Mac on 2026-11-22), up to 200 MB each, plus any session named with `--uuid`; the others are still found from the Mac and resumed on their machine over ssh (above). `ares resume` of a session whose copy on the NAS is newer pulls it first, then resumes it here.
+
+| Command | Does |
+|---|---|
+| `ares sync --dry-run` | the plan, per host: ↑/↓ new, extend (sizes before → after), conflicts, live ones skipped; copies nothing |
+| `ares sync` | the same, then copies; last line `sync: babisnas …` (or `up to date`) |
+| `ares sync --uuid <uuid>[,<uuid>…]` | also these sessions, whatever their kind, age or size |
+| `ares sync --host babisnas --since-days 90 --max-size-mb 500 --agent claude` | another host, scope or agent for this run |
+| job `agent-resume.sync` | the Mac, every 5 min (LaunchAgent `com.jeanlescut.agent-resume.sync`), when `sync_hosts` is set; on the phone dashboard: the `sync:` line; the NAS away: SKIP |
+
+### 4. One Picker Across Claude Code and Codex CLI
 
 If you use both agents, `ares resume` indexes and searches both into the same catalog - not two separate tools. Each row is tagged `[claude]` or `[codex]` (colored so they're distinguishable at a glance), and `--agent claude`/`--agent codex` filters to one. Resuming dispatches to the right native command under the hood (`claude --resume <uuid>` vs `codex resume <uuid>`; `/rename` on resume becomes a `claude --resume ... '/rename ...'` fork vs `codex fork <uuid>`), so this isn't a reimplementation of either agent's resume mechanics, just a unified front end over both. Codex support auto-detects (enabled automatically if `~/.codex/sessions` exists) and is fully additive - a Claude-only setup sees no behavior change.
 
 Not every feature has full parity yet - see [Feature Support by Agent](#feature-support-by-agent) below.
 
-### 4. Crash Restore of the Whole tmux Setup (`ares tmux`)
+### 5. Crash Restore of the Whole tmux Setup (`ares tmux`)
 
 After a crash (or a reboot), `ares tmux` puts back what was open at the end of the previous boot, as agent-tracker's **snapshot** recorded it (since 2026-11-17): every tmux session, window (index, name, exact pane sizes via the saved `window_layout`) and pane, `claude --resume <uuid>` in each pane where Claude was still running, a shell in its own folder in the others, then the iTerm2 windows (position and size) with their tabs in the same order. It reads only agent-tracker's files.
 
@@ -64,7 +90,7 @@ data/sessions/<uuid>/lifecycle.jsonl          ──►  Claude sessions killed 
 
 A tmux session that already exists is never touched (printed as skipped, with its `claude --resume` commands to run by hand). A previous boot without a snapshot (before 2026-11-17, or no Claude session ran) falls back to the old guess from `last_seen.json`: only windows that held a Claude session, plain shells in `~`, "stale" Claude sessions (last seen > 2 min before the others) only with `--all`, one iTerm2 window.
 
-### 5. Session Analytics
+### 6. Session Analytics
 
 The JSON index stores structured metadata for every session: conversation messages with timestamps, hostname, working directory, tmux place and session state (from agent-tracker's lifecycle), and titles, queryable with `jq`.
 
@@ -78,6 +104,7 @@ The JSON index stores structured metadata for every session: conversation messag
 | See sessions from other directories | ✅ `Ctrl+A` in `/resume` | ✅ Yes |
 | Resume from a different directory | ✅ Yes (`claude --resume <uuid>`, 2026) | ✅ Yes (in the last folder it ran in) |
 | See and resume sessions of other machines | ❌ No | ✅ Yes (`remote_hosts`, resumed there over ssh) |
+| Continue a session on the other machine, locally | ❌ No | ✅ Yes (`ares sync`: transcripts copied both ways, every 5 min) |
 | Unified picker across Claude Code + Codex CLI | ❌ No (each agent only sees its own) | ✅ Yes |
 | LLM-generated titles | ✅ Yes (native `ai-title`) | ✅ Yes (reads the same native `ai-title`, plus `/rename`) |
 | Hostname/date filtering | ❌ No | ✅ Yes |
@@ -94,6 +121,7 @@ The JSON index stores structured metadata for every session: conversation messag
 | True resume | ✅ `claude --resume` | ✅ `codex resume` |
 | Fork (`/rename` on resume) | ✅ | ✅ `codex fork` |
 | Other machines (`remote_hosts`) | ✅ | ✅ |
+| `ares sync` (transcripts both ways) | ✅ | ✅ where Codex is installed on both (titles merged) |
 | Session state (from agent-tracker) | ✅ | ✅ if agent-tracker records Codex |
 | Duplicate-session warning (SessionStart) | ✅ native hook | ✅ via a `codex plugin` (one-time hook-trust approval on first use) |
 | `ares tmux` (crash restore) | ✅ | ❌ (Claude sessions only) |
@@ -149,8 +177,9 @@ Each row is tagged `[claude]` or `[codex]`; resuming or forking automatically ru
 
 Each row shows the machine the session lives on, in **blue** when that's this
 machine and **dark red** when it's another one (resumed there, over ssh). Sessions
-with no lifecycle line (older ones) have no recorded hostname; they're attributed
-to the machine that indexed them, since `.jsonl` transcripts never move between machines.
+with no lifecycle line (older ones, or a copy made by `ares sync` and not resumed here yet) have no recorded
+hostname; they're attributed to the machine that indexed them. A session copied both ways is shown once, from its
+newer copy (this machine's on a tie).
 
 A session resumes in the last folder it ran in (agent-tracker's newest start), or in the current folder when that one no longer exists: `claude --resume <uuid>` finds its transcript from any folder. A session whose transcript is gone from this machine (`[Deleted]`) cannot be resumed; its conversation stays in the index.
 
@@ -159,6 +188,16 @@ The last column, in grey, is the first 8 characters of the session's UUID, follo
 Before searching, `ares resume` re-indexes only the transcripts (and lifecycles) newer than their index entry: ~50 ms of dates for 3,111 transcripts plus the few that changed (measured 2026-11-07), so the picker never lags behind a running Claude session.
 
 Sessions nobody typed in are never listed: `claude -p` and Agent SDK runs, Codex sub-agents and `codex exec`. They stay in the index, so `ares resume --uuid <uuid>` still opens one.
+
+### `ares sync` - copy the transcripts both ways with the NAS
+
+```bash
+ares sync --dry-run                  # the plan: what would be copied, both ways; nothing written
+ares sync                            # copy (the job does it every 5 min): created or extended, never deleted
+ares sync --uuid <uuid>              # also this session, whatever its kind, age or size
+```
+
+Full description: [Continue a Session on the Other Machine](#3-continue-a-session-on-the-other-machine-ares-sync-since-2026-11-22) above; the rules: `DEV_DOC.md` R6.7.
 
 ### `ares reindex` - rebuild the local JSON index
 
@@ -195,13 +234,14 @@ git clone <repo-url> agent-resume
 bash agent-resume/install.sh
 ```
 
-Requires `fzf` and `python3`, and agent-tracker for the session state, the duplicate warning and `ares tmux`; `ssh` (and `tar` there) for the `remote_hosts`. `install.sh` is idempotent, and self-migrating: it removes what the version before 2026-11-20 installed (the 30-min job, the SessionEnd hook, `ares-sync`, the skill `inject-session`). `uninstall.sh` removes everything but `~/opt/agent-resume/data/`. On the VM and the NAS: `bash tools/deploy_remote.sh` from the Mac's checkout (a git bundle over ssh, no GitHub needed).
+Requires `fzf` and `python3`, and agent-tracker for the session state, the duplicate warning and `ares tmux`; `ssh` (and `tar` there) for the `remote_hosts`; job-runner (`~/opt/job-runner/lib.sh`) for the job `agent-resume.sync`. `install.sh` is idempotent, and self-migrating: it removes what the version before 2026-11-20 installed (the 30-min job, the SessionEnd hook, `ares-sync`, the skill `inject-session`). `uninstall.sh` removes everything but `~/opt/agent-resume/data/`. On the VM and the NAS: `bash tools/deploy_remote.sh` from the Mac's checkout (a git bundle over ssh, no GitHub needed).
 
 | Artifact | Destination |
 |---|---|
 | `ares` | `~/opt/agent-resume/bin/`, linked from `~/.local/bin/` as `ares` and the alias `asm` |
 | `session_start.py` (the hook), `codex-plugin/` + `codex-marketplace/`, `install.sh`, `uninstall.sh` | `~/opt/agent-resume/` |
-| settings, index, copies of other machines' indexes | `~/opt/agent-resume/data/{settings.json,indexes/,remote/<host>/}` |
+| settings, index, copies of other machines' indexes, forks kept aside | `~/opt/agent-resume/data/{settings.json,indexes/,remote/<host>/,conflicts/<host>/}` |
+| the job agent-resume.sync: `sync.sh`, `sync.conf`, its plist | `~/opt/agent-resume/`, linked from `~/Library/LaunchAgents/com.jeanlescut.agent-resume.sync.plist` (the Mac, when `sync_hosts` is set) |
 | the SessionStart hook group | `~/.claude/settings.json` (install.sh replaces only its own group) |
 | the same hook for Codex, if detected | plugin `agent-resume@agent-resume-local` in `~/.codex/config.toml` (`codex plugin marketplace add` / `codex plugin add`, idempotent); Codex asks once to trust its hooks |
 
@@ -218,6 +258,10 @@ Created by `install.sh` on first install, never overwritten afterward. All keys 
 | `codex_sessions_dir` | `~/.codex/sessions` | Where Codex CLI writes session files locally |
 | `codex_session_index_file` | `~/.codex/session_index.jsonl` | Codex's own title index (Codex stores titles separately from the transcript, unlike Claude Code) |
 | `codex_enabled` | `null` | `null` = auto-detect (enabled iff `codex_sessions_dir` exists); set `true`/`false` to force it either way |
+| `sync_hosts` | `[]` | ssh names of the machines `ares sync` copies transcripts with (the Mac: `["babisnas"]`); set, `install.sh` installs the 5-min job on the Mac. Each needs this version of agent-resume (`ares sync-serve`) |
+| `sync_since_days` | `30` | the scope: interactive sessions modified in the last N days (203 files, 1.1 GB on the Mac, 2026-11-22) |
+| `sync_max_size_mb` | `200` | a bigger transcript is left out unless named with `--uuid` (the biggest interactive one: 180.6 MB) |
+| `sync_live_seconds` | `60` | a transcript changed less than N s ago is being written: not written by the sync (agent-tracker's running pid also counts) |
 
 ## Important: Extend Session Retention
 
@@ -233,7 +277,7 @@ This must be set on each machine independently. (Codex CLI's own session-retenti
 
 ## Technical Details
 
-- Pure Python (stdlib only, no pip dependencies) for `ares` and its hook; no daemon, no scheduled job
+- Pure Python (stdlib only, no pip dependencies) for `ares` and its hook; no daemon; one scheduled job on the Mac (`ares sync`, every 5 min)
 - Parallel reindexing with 10 concurrent workers
 - Incremental: skips sessions unchanged since last index (mtime comparison)
 - Titles come from `/rename` (custom) or Claude Code's own native `ai-title` - no separate title-generation plugin needed

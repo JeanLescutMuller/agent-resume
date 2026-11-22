@@ -127,12 +127,12 @@ and every codex-specific code path is simply never reached.
 
 # Part 1: Requirements
 
-A unified tool for indexing, searching and resuming Claude Code and Codex CLI sessions through one picker, across folders and machines (a session resumes on its own machine), and a crash restore of the whole tmux setup.
+A unified tool for indexing, searching and resuming Claude Code and Codex CLI sessions through one picker, across folders and machines (since 2026-11-22 a transcript is copied both ways between the Mac and the NAS, R6.7, so it resumes on either), and a crash restore of the whole tmux setup.
 
 ## Use Cases
 
 1. **Find and resume a past session by topic**: "I had a session about profiling hallucination rates, what was the slug?" Search by keywords across prompts and get the session instantly.
-2. **Other machines**: "I was working on this on the NAS earlier": search once from the Mac, pick it, and it resumes on the NAS, over ssh (R6.4).
+2. **Other machines**: "I was working on this on the NAS earlier": its transcript was copied to the Mac by `ares sync` (R6.7), so it resumes here; a session outside the sync's scope is still found from the Mac and resumes on the NAS, over ssh (R6.4).
 3. **Spot what's still open**: `ares resume --state pending` lists the sessions with a start and no end in agent-tracker's lifecycle.
 4. **After a crash, get everything back**: `ares tmux` (R4).
 
@@ -155,7 +155,7 @@ Extracts and stores cleaned session content into a searchable JSON index.
 - `session_id`: full UUID
 - `custom_title`: set by `--name` or `/rename`; if absent, falls back to Claude Code's own native `ai-title` transcript entry; if neither is present, `"[Empty session]"` or `"Untitled session [prompt]"`
 - `initial_working_dir`, `latest_working_dir`: from the transcript's own `cwd`, else agent-tracker's start lines (never decoded from the slug - see D4)
-- `initial_hostname`, `latest_hostname`: the `machine` of the first and the latest start line; `index_hostname`: the machine that indexed it
+- `initial_hostname`, `latest_hostname`: the `machine` of the first and the latest start line (of this machine's agent-tracker: a transcript copy never resumed here has none); `index_hostname`: the machine that indexed this copy
 - `created_at`, `last_active`: timestamps of the first and last message
 - `tmux_session`, `tmux_window`, `tmux_pane`: from the first start line's `pane` (`<tmux session>:<window>.<pane>`)
 - `session_state`: `pending` (a start line with no later end line of the same pid) or `exited`
@@ -267,11 +267,12 @@ The window's name and layout come from its newest Claude session's `last_seen.js
 
 | Component | Type | When invoked |
 |---|---|---|
-| `ares` (`resume`, `tmux`, `reindex`; alias `asm`) | Python script | terminal; on each remote host, `ares reindex` over ssh at each search (R6.4) |
+| `ares` (`resume`, `tmux`, `reindex`, `sync`, `sync-serve`; alias `asm`) | Python script | terminal; on each remote host, `ares reindex` over ssh at each search (R6.4), `ares sync-serve` over ssh at each sync (R6.7) |
+| `sync.sh` (job `agent-resume.sync`) | job-runner entrypoint | the Mac, every 5 min (LaunchAgent `com.jeanlescut.agent-resume.sync`), when `sync_hosts` is set (R6.7) |
 | `session_start.py` | Python script | SessionStart hook, Claude Code and Codex (R6.3) |
 | `codex-plugin/` | Codex plugin | registered as `agent-resume@agent-resume-local` through a local marketplace (`codex plugin`); wires Codex's SessionStart to the script above |
 
-No scheduled job and no SessionEnd hook since 2026-11-20: the index is refreshed at search time (R6.5).
+No SessionEnd hook since 2026-11-20: the index is refreshed at search time (R6.5). One scheduled job since 2026-11-22, on the Mac only: `ares sync` (R6.7).
 
 ### R6.2: `ares reindex`
 
@@ -297,7 +298,7 @@ Since 2026-11-20 (the user), replacing `ares-sync` (an index-only, hub-and-spoke
 - `remote_hosts` (settings): the ssh names of the other machines (the Mac: `["H-Frank-1", "babisnas"]`; empty on the VM and the NAS, which cannot reach the Mac).
 - At each `ares resume`, at the same time as the local refresh, and in parallel for every host (`refresh_all`, `_pull_one`): one `ssh <host>` that runs `~/opt/agent-resume/bin/ares reindex` there (~0.4 s, VM and NAS, 2026-11-20) and sends back its `indexes/` as a `.tar.gz` (`hidden/` left out); it replaces `data/remote/<host>/` whole (a session gone there goes here too): a one-way, read-only copy. Not rsync: the Mac's `/usr/bin/rsync` (openrsync) gets "invalid path" from the NAS's rsync 3.4.1. `ConnectTimeout=3`, `BatchMode=yes`, 15 s per host. A failure leaves the last copy and prints `⚠ <host> unreachable`.
 - Search reads `data/indexes/` and every `data/remote/<host>/` (`index_dirs`); each doc is tagged `_host` (None: this machine).
-- A session of another machine resumes there (`resume_shell_cmd`): `ssh -t <host> 'PATH="$HOME/.local/bin:$PATH"; cd <last folder> 2>/dev/null || cd; claude [--dangerously-skip-permissions] --resume <uuid> ...'`. The permission mode comes from the index (`permission_mode`, since 2026-11-20). Transcripts never move between machines: a project is worked on in its home machine only.
+- A session of another machine resumes there (`resume_shell_cmd`): `ssh -t <host> 'PATH="$HOME/.local/bin:$PATH"; cd <last folder> 2>/dev/null || cd; claude [--dangerously-skip-permissions] --resume <uuid> ...'`. The permission mode comes from the index (`permission_mode`, since 2026-11-20). Since 2026-11-22 this is the fallback for the sessions outside the scope of `ares sync` (R6.7): those in its scope have a transcript copy here and resume here; a session in both indexes is shown once, from the newer copy (this machine's on a tie).
 
 ### R6.5: `ares resume`
 
@@ -307,12 +308,48 @@ Since 2026-11-20 (the user), replacing `ares-sync` (an index-only, hub-and-spoke
 1. The `remote_hosts`' indexes pulled (R6.4), at the same time as step 2.
 2. **Refresh** (`refresh_index`): the dates of all transcripts, index entries and lifecycles first (~50 ms for 3,111 transcripts, measured 2026-11-07 on the Mac), then re-index only the changed ones (2 changed: 15 ms). Silent; a failure leaves the index as it was. `--uuid` refreshes the same way (steps 1-2) before looking up the UUID.
 3. Search (R3), then `fzf` with the matches; the user picks one.
-4. A session of this machine: exec `cd <dir> && claude [--dangerously-skip-permissions] --resume <uuid>` (Claude) or `cd <dir> && codex resume <uuid>` (Codex); `<dir>` = the last folder it ran in, or the current folder when that one no longer exists (D1). Of another machine: the same there, over `ssh -t` (R6.4).
+4. A session whose copy on a sync host is newer than this machine's (R6.7): `ares sync --host <host> --uuid <uuid>` first (`pull_newer_copy`), then resumed here; the pull failing, resumed there over ssh; running there right now: a DUPLICATE SESSION warning. A session of this machine: exec `cd <dir> && claude [--dangerously-skip-permissions] --resume <uuid>` (Claude) or `cd <dir> && codex resume <uuid>` (Codex); `<dir>` = the last folder it ran in, or the current folder when that one no longer exists (D1). Of another machine: the same there, over `ssh -t` (R6.4).
 5. A session whose transcript is gone from this machine (`[Deleted]`): an error; its conversation stays in the index.
 
 ### R6.6: removed on 2026-11-20
 
 `/inject-session` (a skill loading a past session's indexed conversation into the current one, for sessions that could not be resumed: another machine's, or a gone folder) and `ares close` (a one-line pointer to claude-close-keep-screen): every such session now resumes (R6.4, D1).
+
+### R6.7: `ares sync`: transcripts copied both ways (since 2026-11-22)
+
+The user, 2026-11-22: a session started on one machine must continue on the other, with the whole conversation, by a local `claude --resume <uuid>` ("Yes, this is exactly what we need"). Reverses "transcripts never move" (D2).
+
+```text
+ares sync [--host H] [--dry-run] [--since-days N] [--max-size-mb N] [--uuid U[,U…]] [--agent claude|codex]
+  run by the Mac (the hub; it reaches the NAS, the NAS cannot reach it), for each host of sync_hosts in turn:
+  one ssh <host> ~/opt/agent-resume/bin/ares sync-serve      (ConnectTimeout=3, BatchMode=yes)
+  hub ── manifest {scope, the hub's uuids} ──►  host: its scope + those uuids → {uuid: tree, path, size, mtime_ns, tail, live}
+  hub ── hashes [(path, size)] ─────────────►  host: the hash of its 64 KB just before each size (the prefix check)
+  hub ── get (path, a, b) ──────────────────►  host: bytes a..b                      ↓ pull: create, or extend here
+  hub ── put (path, base, n) + n bytes ─────►  host: write_grown, as the hub does    ↑ push: create, or extend there
+  hub ── append_index (Codex titles) ───────►  host: lines appended
+  hub ── done ──────────────────────────────►  host: re-index its new copies, exit; the hub re-indexes its own
+```
+
+| Rule | How |
+|---|---|
+| scope (`sync_manifest`) | interactive sessions (index entry in `indexes/`, not `hidden/`) modified in the last `sync_since_days` (30), up to `sync_max_size_mb` (200); plus `--uuid`, whatever its kind, age or size; plus every uuid in the other side's scope (both sides compare the same sessions) |
+| what travels | the main transcript only: Claude's `projects/<slug>/<uuid>.jsonl`, Codex's `sessions/YYYY/MM/DD/rollout-*.jsonl`, and Codex's `session_index.jsonl` (merged: per id, the other side's lines newer than its newest here appended, never rewritten). Not the `<uuid>/` folder (subagents, tool results), `memory/`, `history.jsonl`, settings or credentials (D5) |
+| where | the source's relative path (its slug folder, which may not exist as a folder on this machine: `claude --resume` finds it by uuid); a uuid already here under another path is extended there. Claude's tree is `~/.claude/projects`, shared by both Claude accounts (`account-*/projects` are links to it): nothing is written in `account-*` |
+| size | up to the last newline: a line being written never travels |
+| prefix check | same size: equal if the tail hashes match; else the longer side hashes its 64 KB just before the shorter's size and compares with the shorter's tail hash |
+| decision (`sync_decide`) | one side only: create the other. One a prefix of the other: extend the shorter, sending only the tail. Neither: **conflict**, both left as they are, the other side's copy fetched into `data/conflicts/<host>/<tree>/<path>.<size>` (once per size), a loud line and the count in the summary. Never a merge of lines |
+| live (`live_kind`) | "running": agent-tracker's open start (R2) with its pid alive and the same start time (2 s slack, as `session_start.py`); "recent": changed less than `sync_live_seconds` (60) ago. A live copy is never written ("live, skipped"); a live source is copied up to its last complete line. Running on both: `⚠ DUPLICATE SESSION on two machines`, nothing copied |
+| writing (`write_grown`) | a temp file `.<name>.ares-tmp` in the same folder (not `*.jsonl`): the destination's first `base` bytes, then the received bytes; refused when the destination changed since the plan (size or mtime_ns), when the result would not be longer than the file, or when the bytes do not end with a newline; then fsync, the source's mtime, `rename`. An interruption leaves the destination as it was and no temp file |
+| index (R6.2) | the copies written are re-indexed on their new machine at once (their mtime is the source's, so the date rule would miss them) |
+| resume (R6.5) | a session in this machine's index and a sync host's: the newer copy is shown (this machine's on a tie); a newer one there is pulled first (`pull_newer_copy`), then resumed here |
+| one at a time | `data/sync.lock` (`flock`); held: `sync: another ares sync is running`, exit 5. `ares resume`'s pull waits up to 60 s |
+| timeouts | the scope of the host within 60 s; the transfer within 60 s + its bytes at 1 MB/s; else the ssh is killed |
+| output | one line per action (`↑`/`↓ new`/`extend` with sizes before → after, `⚠ CONFLICT`, `live, skipped`, `⚠ DUPLICATE SESSION`), then `sync: <host> <counts> (<n> compared, <s> s)`, or `<host> up to date`. Exit 0; 3 a host unreachable (one `⚠` line, about 3 s); 1 an error (a file not written, a broken connection); 5 locked |
+
+The job `agent-resume.sync` (`src/sync.sh`, job-runner): the Mac only, a LaunchAgent every 5 min (`StartInterval` 300, launchd catches up after a sleep), running `ares sync`; its status on the phone dashboard is the `sync:` line; exit 3 (the NAS away) and 5 are `SKIP`, not failures. `install.sh` writes it when `sync_hosts` is set in the Mac's `data/settings.json` and removes it when that is empty; `uninstall.sh` removes it. Dashboard settings: `src/sync.conf` (red after 3 days without a sync).
+
+Not done: `session_start.py` does not warn when the uuid it starts is live on another machine (it would need an ssh at each start; `ares sync` and `ares resume` warn instead). The VM (`H-Frank-1`) is not a sync host: it is being given up (task V7 of `~/dev/data-reorganisation`); adding it is one entry in `sync_hosts`.
 
 ---
 
@@ -322,9 +359,10 @@ Since 2026-11-20 (the user), replacing `ares-sync` (an index-only, hub-and-spoke
 
 | File | Purpose |
 |---|---|
-| `src/ares` | R1/R3/R4/R6.2/R6.4/R6.5: index (both backends + agent-tracker's lifecycle), refresh, other machines, search, fzf, resume; `ares tmux` |
+| `src/ares` | R1/R3/R4/R6.2/R6.4/R6.5/R6.7: index (both backends + agent-tracker's lifecycle), refresh, other machines, search, fzf, resume; `ares tmux`; `ares sync`, `ares sync-serve` |
+| `src/sync.sh`, `src/sync.conf` | R6.7: the job agent-resume.sync (job-runner entrypoint) and its dashboard settings |
 | `src/session_start.py`, `src/codex-plugin/` | R6.3: the hook, and the Codex plugin that registers it for Codex |
-| `test/sandbox_test.sh`, `test/make_fixtures.py`, `test/smoke_test.sh` | tests: `TESTING.md` |
+| `test/sandbox_test.sh`, `test/sync_test.sh`, `test/make_fixtures.py`, `test/smoke_test.sh` | tests: `TESTING.md` |
 | `tools/token_cost.sh`, `tools/deploy_remote.sh` | the code's cost in tokens (skill code-minimization); deploying HEAD to the NAS (a git bundle over ssh; refuses the VM since 2026-11-22) |
 
 ### Hook registration
@@ -344,13 +382,15 @@ Codex (if detected: `codex_enabled`, or `~/.codex/sessions` exists, and `codex` 
 | `~/opt/agent-resume/data/indexes/<uuid>.json` (and `hidden/`: sessions nobody typed in) | `ares reindex`, `ares resume` (refresh) |
 | `~/opt/agent-resume/data/remote/<host>/<uuid>.json` | `ares resume`: that host's `indexes/`, sent as a `.tar.gz` over ssh (read-only copies) |
 | `~/opt/agent-resume/data/settings.json` | user-edited / created by `install.sh` |
+| `~/opt/agent-resume/data/conflicts/<host>/<tree>/<path>.<size>` | `ares sync`: the other side's copy of a fork (R6.7), never inside `projects/` (a stray `*.jsonl` there would be taken for a session) |
+| `~/opt/agent-resume/data/sync.lock` | `ares sync` and `ares resume`'s pull: one sync at a time (`flock`) |
 | `~/opt/agent-tracker/data/sessions/<uuid>/{lifecycle.jsonl,last_seen.json}` | agent-tracker (read only here) |
 
 ### Filesystem structure
 
 | Path | What it is |
 |---|---|
-| `~/.claude/projects/`, `~/.codex/sessions/` | written by Claude Code and Codex CLI; only read |
+| `~/.claude/projects/`, `~/.codex/sessions/` | written by Claude Code and Codex CLI; `ares sync` creates or extends transcripts there (R6.7), never anything else |
 | `~/opt/agent-resume/` | deployment: `bin/ares`, `session_start.py`, `codex-plugin/`, `codex-marketplace/`, `install.sh`/`uninstall.sh`, and `data/` (above) |
 | `~/.local/bin/{ares,asm}` | symlinks into `~/opt/agent-resume/bin/ares` (`asm` = alias) |
 
@@ -384,11 +424,21 @@ So `resume_dir` (one function for both agents) picks **the last folder the sessi
 
 ---
 
-## D2: Other machines: resume where the session lives (2026-11-20)
+## D2: Other machines: from "resume where the session lives" (2026-11-20) to a copy on both (2026-11-22)
 
-Until 2026-11-20 a session of another machine could not be resumed here: its transcript is on that machine only, and copying it (D3 of that time: strategies A-E rejected) would fork it into two diverging copies. ares synced the index only (`ares-sync`, hub and spoke over ssh, a 30-min job, newest file wins) and offered `/inject-session` to load the conversation into a new session. That sync was configured on no machine (`remote_ssh_host` empty everywhere, no sync log).
+Until 2026-11-20 a session of another machine could not be resumed here: its transcript is on that machine only, and copying it (D3 of that time: strategies A-E rejected) would fork it into two diverging copies; besides, `claude --resume` then looked in the current folder's project only (D1). ares synced the index only (`ares-sync`, hub and spoke over ssh, a 30-min job, newest file wins) and offered `/inject-session` to load the conversation into a new session. That sync was configured on no machine (`remote_ssh_host` empty everywhere, no sync log).
 
-The design since (the user, 2026-11-20): **search everywhere, resume where the session lives** (R6.4). Each search pulls a read-only copy of each remote host's index (refreshed there first); a remote session resumes there over `ssh -t`. No transcript ever moves, so there is nothing to reconcile, and it matches the rule that a project is worked on in its home machine only. Cost: ~0.4 s per reachable host at each search, 3 s for an unreachable one. The history of the rejected strategies: `git log -p DEV_DOC.md` before 2026-11-20.
+2026-11-20 (the user): **search everywhere, resume where the session lives** (R6.4). Each search pulls a read-only copy of each remote host's index (refreshed there first); a remote session resumes there over `ssh -t`. No transcript moved, so there was nothing to reconcile. Cost: ~0.4 s per reachable host at each search, 3 s for an unreachable one. The history of the rejected strategies: `git log -p DEV_DOC.md` before 2026-11-20.
+
+**2026-11-22 (the user): reversed, a transcript copy on both machines** (R6.7). The user now works on the Mac and the NAS with two interchangeable Claude accounts and wants to switch machine freely; resuming over ssh needs the other machine on and reachable, a local copy does not. Asked whether sessions could be shared, the user answered "I was expecting you to just recommend to setup the "sync" feature of the ares project", then, to a two-way copy that never deletes, where the newer or longer file wins, with a warning when a session is live on both: "Yes, this is exactly what we need." What changed since the 2026-11-20 objections:
+
+| 2026-11-20 objection | 2026-11-22 |
+|---|---|
+| a copy resumes only in its project folder | `claude --resume <uuid>` finds a transcript in any project folder (D1); tested on the NAS with a Mac slug (D5) |
+| a copy forks into two diverging files | a transcript is append-only JSON lines, written by one machine at a time: two copies are the same file, one shorter. A copy is only extended, after a prefix check; a real fork (both continued) is detected and both kept, never merged (R6.7) |
+| two processes may continue one session | a copy being written is never written; running on both machines is warned about (`⚠ DUPLICATE SESSION`) |
+
+R6.4 stays, as the fallback for the sessions outside the scope of the sync (older, non-interactive, too big): found from the Mac, resumed there over ssh.
 
 ---
 
@@ -411,3 +461,23 @@ Could decode to `/home/jeanlescut/my-project/notes/` or `/home/jeanlescut/my/pro
 The index (R1) must store the original working directory path as an explicit string field so that `asm resume` never needs to decode slugs.
 
 ---
+
+---
+
+## D5: The measurements behind ares sync (2026-11-22, the Mac and the NAS)
+
+**The premise, proven first.** A throwaway session made on the Mac (`claude -p`, Claude Code 2.1.330, "remember the code word PELICAN-47"), its `.jsonl` alone copied to the NAS under the Mac's slug folder (`~/.claude/projects/-private-tmp-…-premise/`, a folder that matches nothing on the NAS), then on the NAS from `/tmp`: `claude -p --resume <uuid> "What was the code word?"` answered `PELICAN-47`. The NAS appended to that same file (270,559 → 355,412 B), and the Mac's file was a byte-prefix of the NAS's (`cmp`). So the main `.jsonl` is enough for the conversation to continue; the new turns go into the copy, in place.
+
+**What travels, and why not the `<uuid>/` folder.** The `<uuid>/` folders of the in-scope sessions hold 1,709.6 MB (subagent transcripts, tool results), more than the transcripts themselves (1,091.0 MB). The main transcript already holds what the model sees again on resume (each subagent's final report, each tool result or its 2 KB preview); the files of a persisted tool result are named by an absolute path of the source machine (`/Users/jeanlescut/…`), which does not exist on the other. Left out. Codex: not installed on the NAS (2026-11-22), so its tree is synced only with a host where `~/.codex/sessions` exists; `codex resume <uuid>` reads the rollout by uuid from any folder (R6.5), and its titles come from `session_index.jsonl`, merged.
+
+| Measured | Value | Sets |
+|---|---|---|
+| Mac: main transcripts | 6,321 files, 4,312.5 MB; 455 interactive, 2,620.7 MB | the default scope: interactive only |
+| interactive, modified in the last 1 / 7 / 30 / 90 days | 31 / 87 / 203 / 424 files; 409.8 / 650.7 / 1,091.0 / 2,416.9 MB | `sync_since_days` 30 |
+| biggest interactive transcript | 180.6 MB (8 over 50 MB) | `sync_max_size_mb` 200: none of today's left out, a runaway file stopped |
+| gaps between consecutive lines of interactive transcripts (last 7 days, 97,478 gaps under 1 h) | median 0.7 s, p90 9.2 s, p99 289.8 s; 2.69 % over 60 s | `sync_live_seconds` 60 for a turn being written; the long tool calls (minutes without a line) are covered by agent-tracker's running pid |
+| the date of every transcript (stat) | 28-81 ms for 6,321 files | the scope costs nothing |
+| ssh throughput Mac → NAS, LAN | 100 MB in 2.3 s (44 MB/s) | the first sync: ~25 s; the deadline assumes 1 MB/s |
+| first dry run Mac ⇄ NAS | 212 sessions compared, 199 ↑ (1.1 GB), 5 ↓ (2.4 MB), 0 conflicts, 1.2 s | |
+| ssh to the NAS | 0.47 s; unreachable: 3 s (`ConnectTimeout`) | a 5-min job costs seconds when the NAS is away |
+

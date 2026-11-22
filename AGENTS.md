@@ -1,31 +1,32 @@
 # agent-resume (`ares`; was agent-session-manager, `asm`)
 
-Development home: Mac (`~/dev/agent-resume` on the Mac; the NAS has no copy: it is installed there with `bash tools/deploy_remote.sh` from here). Why (the user, 2026-11-22, reversing U19's NAS of the same day): the sync between machines (`ares resume` pulling every other machine's index, DEV_DOC.md R6.4) must be run by the Mac. Whenever Jean uses his Mac, the Mac can always reach the NAS (at home or over Tailscale, my-setup `nas-route`); a job scheduled on the NAS has no idea whether the MacBook is reachable, tries to reach it and fails from time to time. So the main sync runs on the MacBook (`remote_hosts` is set on the Mac only; empty on the NAS), and the whole project is developed there. In Jean's words: "for the transcript sync feature between machines, it's much more stable to have a job that run whenever I'm using my Mac. I can always access the NAS, than having a job that is regularly scheduled on the NAS, have no idea if my MacBook is reachable, and try to reach the MacBook but fail from time to time."
+Development home: Mac (`~/dev/agent-resume`; the NAS has no copy, it is installed there with `bash tools/deploy_remote.sh` from here): the sync between machines must be run by the Mac, which always reaches the NAS, while the NAS cannot know whether the Mac is reachable (the user, 2026-11-22; why, in the user's words: `DEV_DOC.md` D2b).
 
-Find and resume past Claude Code and Codex sessions from any folder and any machine (`ares resume`), and after a crash put back the whole tmux setup with a `claude --resume` in each Claude pane (`ares tmux`). One of the projects around agent-tracker (its `DESIGN.md` §10): agent-tracker records, agent-resume finds and resumes, claude-close-keep-screen closes.
+Find and resume past Claude Code and Codex sessions from any folder and machine (`ares resume`), copy transcripts both ways Mac ⇄ NAS (`ares sync`, every 5 min), restore the tmux setup after a crash (`ares tmux`). Around agent-tracker (its `DESIGN.md` §10): it records, agent-resume finds and resumes, claude-close-keep-screen closes.
 
 ## Rules
 
-- **agent-tracker's files are read, never written**: `$AGENT_TRACKER_HOME/data/sessions/<uuid>/{lifecycle.jsonl,last_seen.json}` (default `~/opt/agent-tracker`); their format is agent-tracker's `IMPLEMENTATION.md` §4. A `lifecycle.jsonl` line without its final newline is ignored. → `DEV_DOC.md` R2.
-- **session_state** (`pending`/`exited`) comes from the lifecycle: pending = a start line with no later end line of the same pid (`open_start` in `src/ares`).
-- **The index is refreshed at search time**: `ares resume` re-indexes only the transcripts (or lifecycles) newer than their index entry (`refresh_index`), then searches. No scheduled job, no SessionEnd hook (removed 2026-11-20).
-- **Other machines: search everywhere, resume where the session lives** (the user, 2026-11-20): `remote_hosts` (settings) are refreshed over ssh and their index copied here one way (`data/remote/<host>/`) at each search; a session of another machine resumes there with `ssh -t`. → `DEV_DOC.md` R6.4, D2.
+- **agent-tracker's files are read, never written** (`$AGENT_TRACKER_HOME/data/sessions/<uuid>/`; its `IMPLEMENTATION.md` §4); a `lifecycle.jsonl` line without its final newline is ignored; pending = a start with no later end of the same pid (`open_start`). → `DEV_DOC.md` R2.
+- **The index is refreshed at search time**: `ares resume` re-indexes only the transcripts (or lifecycles) newer than their index entry (`refresh_index`), then searches; `ares sync` re-indexes the copies it writes.
+- **Other machines: a transcript copy on both, else resume where it lives** (the user, 2026-11-22, reversing 2026-11-20): `ares sync`, run by the Mac every 5 min (job `agent-resume.sync`), copies the transcripts in its scope both ways with `sync_hosts` (`ares sync-serve` there). Only created or extended (`write_grown`); a fork keeps both, the other side's in `data/conflicts/<host>/`; a live copy is never written. Outside the scope: `remote_hosts`' indexes copied here at each search, resumed there with `ssh -t`. → `DEV_DOC.md` R6.4, R6.7, D2, D5.
 - **The resume folder**: the last folder the session ran in, else the current one; `claude --resume <uuid>` finds the transcript from any folder (`resume_dir`). → `DEV_DOC.md` D1.
-- **`ares tmux` follows agent-tracker's `IMPLEMENTATION.md` §5 exactly**: since 2026-11-17 from agent-tracker's snapshot (`data/snapshots/<boot_ts>.tsv`: every pane, its folder and command, the iTerm2 windows and tabs; Claude sessions matched by `pane_id`, no stale rule); without one, the old guess (one per pane, stale rule); always `select-layout`, never touch an existing tmux session. → `DEV_DOC.md` R4.
-- **One hook, for Claude Code and Codex** (Codex: the plugin `src/codex-plugin/`, `agent-resume@agent-resume-local`): `src/session_start.py` (SessionStart) prints only the duplicate warning, read from agent-tracker's lifecycle. It always exits 0 and writes no lifecycle (agent-tracker's).
-- **No close here** (claude-close-keep-screen), no `status` script (removed by the user, 2026-11-07), no `/inject-session` (removed by the user, 2026-11-20: every session resumes).
+- **`ares tmux` follows agent-tracker's `IMPLEMENTATION.md` §5 exactly** (its snapshot; never touch an existing tmux session). → `DEV_DOC.md` R4.
+- **One hook** (Claude Code; Codex through `src/codex-plugin/`): `src/session_start.py` prints only the duplicate warning; always exits 0, writes nothing.
+- No close (claude-close-keep-screen), no `status`, no `/inject-session` (removed by the user).
 - Python stdlib only; `src/ares` is one file (Backend registry: `BACKENDS`).
-- `install.sh` is idempotent and self-migrating (it removes what the version before 2026-11-20 installed: the job, the SessionEnd hook, `ares-sync`, `inject-session`). In a sandbox `HOME` it calls no `launchctl` / `systemctl`, and runs `codex` only with `CODEX_HOME=$HOME/.codex`.
+- `install.sh` is idempotent and self-migrating; on the Mac it installs the job `agent-resume.sync` when `sync_hosts` is set, removes it when empty. In a sandbox `HOME`: no `launchctl` / `systemctl`, `codex` only with `CODEX_HOME=$HOME/.codex`.
 
 ## Never
 
-- Run `install.sh`, `uninstall.sh` or `ares tmux` against the real `$HOME` or the default tmux server from a test: every tmux call of a test goes to an explicit socket: run the tests under agent-tracker's `tests/run_with_test_tmux.sh` (the user's rule after a test's `TMUX_TMPDIR=… tmux kill-server`, with `TMUX` set, killed the real tmux server on 2026-11-07 15:30); the tests use a sandbox (`test/sandbox_test.sh`, `TMUX_TMPDIR`, `unset TMUX`).
-- Write a session's `.jsonl` transcript or copy it between machines: a session is resumed on its own machine (over ssh).
+- Run `install.sh`, `uninstall.sh` or `ares tmux` against the real `$HOME` or tmux server from a test: tests run in a sandbox, under agent-tracker's `tests/run_with_test_tmux.sh` (a test killed the real tmux server on 2026-11-07).
+- Write a transcript other than through `write_grown` (create or extend from the other copy), or shorten, replace, merge or delete one; write into `~/.claude/account-*/` (their `projects` links to the shared `~/.claude/projects`).
 
 ## Test, deploy
 
 ```bash
 bash test/sandbox_test.sh          # everything, in a sandbox HOME + sandbox tmux server; log path printed at the end
+bash test/sync_test.sh             # ares sync alone (also run by sandbox_test.sh): two sandbox homes, a fake ssh
+ares sync --dry-run                # the plan of a real sync (read-only), from the Mac
 bash test/smoke_test.sh --offline  # health check of a real install (read-only)
 bash install.sh                    # deploy to ~/opt/agent-resume on the Mac
 bash tools/deploy_remote.sh        # deploy HEAD to the NAS (a git bundle over ssh: no push needed; refuses the VM, 2026-11-22)
@@ -39,12 +40,11 @@ bash tools/token_cost.sh           # the code's cost in tokens (skill code-minim
 | Claude session | one conversation of Claude Code (or Codex), named by its UUID | "session" alone, when a tmux session could be meant |
 | tmux session · window · pane | tmux's own words; a pane is named by its `%id` and shown as `<tmux session>:<window>.<pane>` | |
 | index · index entry | `~/opt/agent-resume/data/indexes/`, one `<uuid>.json` per Claude session (title, folders, hosts, state, the whole conversation) | cache, catalog |
-| remote host · remote copy | a machine in `remote_hosts` (its ssh name) · `data/remote/<host>/`, the read-only copy of its index | hub, spoke, sync (`ares-sync`, removed 2026-11-20) |
-| lifecycle | agent-tracker's `lifecycle.jsonl` of a Claude session: one line per start and end | sidecar (asm's former files) |
-| last seen | the `ts` of agent-tracker's `last_seen.json`: last time the statusline ran for that Claude session | heartbeat |
-| boot · previous boot | one run of the Mac, named by its start time `boot_ts` · the newest `boot_ts` in agent-tracker's files that is not this boot | |
-| snapshot | agent-tracker's `data/snapshots/<boot_ts>.tsv`: the terminal layout of a boot (tmux panes, tmux clients, iTerm2 windows and tabs), at most ~1 min old | |
-| stale | without a snapshot only: a Claude session of the previous boot whose last seen is more than 2 min older than that boot's newest last seen (or has none): `ares tmux` restores it only with `--all` | |
+| remote host · remote copy | a machine in `remote_hosts` (its ssh name) · `data/remote/<host>/`, the read-only copy of its index | hub, spoke, `ares-sync` (the index-only sync removed 2026-11-20) |
+| sync · sync host | since 2026-11-22 `ares sync`: transcripts copied both ways between the Mac (the hub) and a machine of `sync_hosts` (a sync host); not the index-only `ares-sync` of before 2026-11-20 | rsync, mirror (nothing is deleted) |
+| transcript copy | a session's `.jsonl` on another machine than the one that started it, made by ares sync | replica, clone |
+| sync plan | what one `ares sync` does per host: new, extend, conflict, live (skipped), duplicate; `--dry-run` prints only that | |
+| conflict · live · DUPLICATE SESSION | two copies neither a prefix of the other (a fork), kept aside · a copy being written on its side (`running` pid or `recent` change), never written · running on both machines: a warning | merge |
 | agent-tracker · agent-resume · claude-close-keep-screen | records + visibility · search and resume, command `ares` (alias `asm`) · closing Claude sessions | asm, agent-session-manager (except when describing the past) |
 
 ## Where to look
@@ -52,5 +52,5 @@ bash tools/token_cost.sh           # the code's cost in tokens (skill code-minim
 | Need | File |
 |---|---|
 | what it does, for the user; commands and settings | `README.md` |
-| requirements R1–R7, design notes D0–D4 | `DEV_DOC.md` |
+| requirements R1–R7, design notes D0–D5 | `DEV_DOC.md` |
 | how to run the tests | `TESTING.md` |

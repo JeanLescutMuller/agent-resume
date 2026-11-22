@@ -5,6 +5,7 @@ ares - agent-resume (was asm, Agent Session Manager): find and resume past agent
 Index architecture:
   reindex → builds JSON index from local .jsonl files ($AGENT_RESUME_HOME/data/indexes/)
   resume  → refreshes the index entries whose transcript changed, then searches it
+  sync    → copies the transcripts both ways with the sync_hosts (create or extend only; `ares sync-serve` there)
   tmux    → after a crash, puts back the tmux sessions and Claude sessions of the previous boot,
             and the iTerm2 windows, read from agent-tracker's files ($AGENT_TRACKER_HOME/data/snapshots/<boot_ts>.tsv,
             data/sessions/<uuid>/)
@@ -13,6 +14,7 @@ Commands:
   ares resume [OPTIONS] [KEYWORD...]   Find and resume a past Claude Code or Codex session
   ares tmux [--dry-run] [--all] [--no-iterm]   Restore the previous boot's tmux sessions
   ares reindex                         Re-index all sessions now
+  ares sync [--dry-run] [--host H] [--uuid U]   Copy transcripts both ways with the sync_hosts
 
   ares --version                       Show version
   ares --help                          Show this help
@@ -618,10 +620,9 @@ def index_one(uuid, jsonl_path, backend):
         "latest_working_dir": latest_working_dir,
         "initial_hostname": initial_hostname,
         "latest_hostname": latest_hostname,
-        # Ground truth for "which machine was this session on": .jsonl files
-        # are never synced between machines, so whoever indexes one is by
-        # definition its host. Fills the gap for sessions with no lifecycle
-        # lifecycle line (older ones), where the two fields above are null.
+        # The machine that indexed this copy of the transcript (since 2026-11-22 a transcript may be on several:
+        # ares sync). Fills the gap for sessions with no lifecycle line (older ones, or a copy never resumed
+        # here), where the two fields above are null.
         "index_hostname": LOCAL_HOSTNAME or None,
         "created_at": transcript.created_at,
         "last_active": transcript.last_active,
@@ -923,8 +924,8 @@ def host_block(doc):
             break
 
     # Sessions predating the lifecycle hook have no lifecycle and, until they get
-    # reindexed, no index_hostname either - but if their .jsonl is still on this
-    # disk they are ours, since .jsonl files are never synced between machines.
+    # reindexed, no index_hostname either - but if their .jsonl is on this disk
+    # they resume here (a copy made by ares sync included).
     if not host and not doc.get("_source_missing"):
         host = doc.get("_host") or LOCAL_HOSTNAME
     if not host:
@@ -1274,9 +1275,10 @@ def cmd_reindex(max_sessions, force, single_uuid):
 
 
 # -- Other machines ------------------------------------------------------------
-# Since 2026-11-20 (the user): no sync. Each search refreshes every remote host's own index there and copies it here
-# one way (remote/<host>/), over one ssh call; a session of another machine resumes there, over ssh (resume_shell_cmd). Transcripts
-# never move: a project is worked on in its home machine only.
+# Since 2026-11-20 (the user): each search refreshes every remote host's own index there and copies it here one way
+# (remote/<host>/), over one ssh call; a session only there resumes there, over ssh (resume_shell_cmd). Since
+# 2026-11-22 the transcripts in the scope of ares sync are also copied here (below): those resume here; this pull
+# stays the way to find and resume the others (older, non-interactive, too big).
 
 def _pull_one(host):
     """Refresh the index on host and copy it into remote/<host>/ (replaced whole: a session gone there goes here
@@ -1707,7 +1709,8 @@ def sync_host(host, since_days, max_mb, s_named, l_trees, dry_run):
                 c[kind + "_bytes"] += src["size"] - base
                 arrow = "↓" if kind == "pull" else "↑"
                 print(f"{host}  {arrow} {'extend' if dst else 'new':6}  {where}  {fmt_bytes(base)} → "
-                      f"{fmt_bytes(src['size'])}" + (" (live there)" if src["live"] else ""))
+                      f"{fmt_bytes(src['size'])}" + (f" (live {'there' if kind == 'pull' else 'here'}: its complete lines so far)"
+                                                  if src["live"] else ""))
             elif kind == "conflict":
                 c["conflict"] += 1
                 print(f"\033[38;5;208m{host}  ⚠ CONFLICT  {where}: here {fmt_bytes(l['size'])}, there "
@@ -2396,6 +2399,7 @@ TOP_DESCRIPTION = f"""ares {VERSION} - agent-resume (was asm): find and resume a
             ($AGENT_RESUME_HOME/data/indexes/, data/remote/<host>/); another machine's session resumes there (ssh)
   tmux    → after a crash, restores the previous boot's tmux sessions and Claude sessions
   reindex → builds the JSON index from local .jsonl files
+  sync    → copies the transcripts both ways with the sync_hosts (created or extended, never shortened or deleted)
 
 `asm` is an alias of `ares`. Closing a running session: claude-close-keep-screen."""
 
