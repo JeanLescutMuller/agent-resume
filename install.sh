@@ -21,7 +21,8 @@
 # edit_hooks: sourced, it stops before "Installing agent-resume..." and changes nothing.
 #
 # First install:  git clone <repo-url> agent-resume && bash agent-resume/install.sh
-# Re-install:     bash ~/dev/agent-resume/install.sh   (NAS: bash ~/dev/agent-resume/tools/deploy_remote.sh; not the VM any more)
+# Re-install:     NAS (the development home): bash ~/dev/agent-resume/install.sh; Mac: dev-install agent-resume (my-setup,
+#                 from GitHub); not the VM any more
 
 set -euo pipefail
 
