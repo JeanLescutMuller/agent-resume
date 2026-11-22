@@ -1722,7 +1722,9 @@ def sync_host(host, since_days, max_mb, s_named, l_trees, dry_run):
                       f"{host}; nothing copied\033[0m")
             else:
                 c["live"] += 1
-                print(f"{host}  live, skipped  {where} (being written on {'this machine' if l and l['live'] else host})")
+                dst_here = bool(l and r and r["size"] > l["size"])   # the copy that would be written
+                print(f"{host}  live, skipped  {where} (the copy {'here' if dst_here else 'on ' + host} is being "
+                      f"written: {(l if dst_here else r)['live']})")
         killer.cancel()
         killer = threading.Timer(SYNC_HELLO_TIMEOUT_S + (c["pull_bytes"] + c["push_bytes"]) / SYNC_MIN_RATE,
                                  proc.kill)

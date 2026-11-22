@@ -145,7 +145,7 @@ cat "$S/dry.out" >> "$LOG"
 check "dry run exits 0 (a duplicate is a warning)" test "$rc" = 0
 check "dry run changes no file" test "$S0" = "$(snap)"
 check "plan: ↑ new 1, ↓ new 2, ↑ extend 3, ↓ extend 4" bash -c "grep -q '↑ new .*$(U 1)' '$S/dry.out' && grep -q '↓ new .*$(U 2)' '$S/dry.out' && grep -q '↑ extend .*$(U 3)' '$S/dry.out' && grep -q '↓ extend .*$(U 4)' '$S/dry.out'"
-check "plan: CONFLICT 5, live 6 (running here) and 14 (changed just now there), DUPLICATE SESSION 11" bash -c "grep -q 'CONFLICT .*$(U 5)' '$S/dry.out' && grep -q 'live, skipped .*$(U 6).*this machine' '$S/dry.out' && grep -q 'live, skipped .*$(U 14).*fakehost' '$S/dry.out' && grep -q 'DUPLICATE SESSION on two machines: $(U 11)' '$S/dry.out'"
+check "plan: CONFLICT 5, live 6 (running here) and 14 (changed just now there), DUPLICATE SESSION 11" bash -c "grep -q 'CONFLICT .*$(U 5)' '$S/dry.out' && grep -q 'live, skipped .*$(U 6).*here is being written: running' '$S/dry.out' && grep -q 'live, skipped .*$(U 14).*on fakehost is being written: recent' '$S/dry.out' && grep -q 'DUPLICATE SESSION on two machines: $(U 11)' '$S/dry.out'"
 check "plan: 7 (claude -p), 8 (40 days) not in it; 9 left out for its size" bash -c "! grep -q '$(U 7)\|$(U 8)\|$(U 9)' '$S/dry.out' && grep -q 'over 2 MB, left out' '$S/dry.out'"
 check "the last line is the summary, 'sync: fakehost ...'" bash -c "tail -1 '$S/dry.out' | grep -q '^sync: fakehost .*dry run'"
 
