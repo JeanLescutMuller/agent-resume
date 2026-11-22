@@ -1,6 +1,6 @@
 # agent-resume (`ares`; was agent-session-manager, `asm`)
 
-Development home: NAS (`~/dev/agent-resume` on the NAS, since 2026-11-22; no copy on the Mac: `tm agent-resume` opens it). Why (U19, the user, 2026-11-22): the NAS by default; its Mac parts are installed on the Mac from GitHub with one command: `dev-install agent-resume` (my-setup).
+Development home: Mac (`~/dev/agent-resume` on the Mac; the NAS has no copy: it is installed there with `bash tools/deploy_remote.sh` from here). Why (the user, 2026-11-22, reversing U19's NAS of the same day): the sync between machines (`ares resume` pulling every other machine's index, DEV_DOC.md R6.4) must be run by the Mac. Whenever Jean uses his Mac, the Mac can always reach the NAS (at home or over Tailscale, my-setup `nas-route`); a job scheduled on the NAS has no idea whether the MacBook is reachable, tries to reach it and fails from time to time. So the main sync runs on the MacBook (`remote_hosts` is set on the Mac only; empty on the NAS), and the whole project is developed there. In Jean's words: "for the transcript sync feature between machines, it's much more stable to have a job that run whenever I'm using my Mac. I can always access the NAS, than having a job that is regularly scheduled on the NAS, have no idea if my MacBook is reachable, and try to reach the MacBook but fail from time to time."
 
 Find and resume past Claude Code and Codex sessions from any folder and any machine (`ares resume`), and after a crash put back the whole tmux setup with a `claude --resume` in each Claude pane (`ares tmux`). One of the projects around agent-tracker (its `DESIGN.md` §10): agent-tracker records, agent-resume finds and resumes, claude-close-keep-screen closes.
 
@@ -27,8 +27,8 @@ Find and resume past Claude Code and Codex sessions from any folder and any mach
 ```bash
 bash test/sandbox_test.sh          # everything, in a sandbox HOME + sandbox tmux server; log path printed at the end
 bash test/smoke_test.sh --offline  # health check of a real install (read-only)
-bash install.sh                    # deploy to ~/opt/agent-resume on the NAS, from this clone
-dev-install agent-resume           # on the Mac: deploy what is pushed to GitHub (my-setup; its smoke test: dev-install --run test/smoke_test.sh agent-resume --offline)
+bash install.sh                    # deploy to ~/opt/agent-resume on the Mac
+bash tools/deploy_remote.sh        # deploy HEAD to the NAS (a git bundle over ssh: no push needed; refuses the VM, 2026-11-22)
 bash tools/token_cost.sh           # the code's cost in tokens (skill code-minimization)
 ```
 

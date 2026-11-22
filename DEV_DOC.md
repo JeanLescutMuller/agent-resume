@@ -325,7 +325,7 @@ Since 2026-11-20 (the user), replacing `ares-sync` (an index-only, hub-and-spoke
 | `src/ares` | R1/R3/R4/R6.2/R6.4/R6.5: index (both backends + agent-tracker's lifecycle), refresh, other machines, search, fzf, resume; `ares tmux` |
 | `src/session_start.py`, `src/codex-plugin/` | R6.3: the hook, and the Codex plugin that registers it for Codex |
 | `test/sandbox_test.sh`, `test/make_fixtures.py`, `test/smoke_test.sh` | tests: `TESTING.md` |
-| `tools/token_cost.sh` | the code's cost in tokens (skill code-minimization); deploying: NAS `bash install.sh` here, Mac `dev-install agent-resume` (`tools/deploy_remote.sh`, HEAD from the Mac to the NAS, removed 2026-11-22: the NAS is the development home) |
+| `tools/token_cost.sh`, `tools/deploy_remote.sh` | the code's cost in tokens (skill code-minimization); deploying HEAD to the NAS (a git bundle over ssh; refuses the VM since 2026-11-22) |
 
 ### Hook registration
 
@@ -391,6 +391,10 @@ Until 2026-11-20 a session of another machine could not be resumed here: its tra
 The design since (the user, 2026-11-20): **search everywhere, resume where the session lives** (R6.4). Each search pulls a read-only copy of each remote host's index (refreshed there first); a remote session resumes there over `ssh -t`. No transcript ever moves, so there is nothing to reconcile, and it matches the rule that a project is worked on in its home machine only. Cost: ~0.4 s per reachable host at each search, 3 s for an unreachable one. The history of the rejected strategies: `git log -p DEV_DOC.md` before 2026-11-20.
 
 ---
+
+## D2b: Why the Mac is the development home (the user, 2026-11-22)
+
+The cross-machine part (R6.4) is pulled by the machine where Jean works, the Mac: it always reaches the NAS (home address, else Tailscale: my-setup `nas-route`), while the NAS cannot know whether the MacBook is reachable (asleep, away, Remote Login off) and would fail from time to time if it ran the sync on a schedule. So `remote_hosts` is set on the Mac only, the main sync runs on the MacBook, and the whole project is developed there (`AGENTS.md`, first lines). Same day, U19 had put it on the NAS by the rule "installed on both machines → NAS"; the user reversed it for this reason. The NAS is deployed from the Mac: `bash tools/deploy_remote.sh`.
 
 ## D4: Why slug decoding is unreliable and paths must be stored explicitly
 

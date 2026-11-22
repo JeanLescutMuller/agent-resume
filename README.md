@@ -195,7 +195,7 @@ git clone <repo-url> agent-resume
 bash agent-resume/install.sh
 ```
 
-Requires `fzf` and `python3`, and agent-tracker for the session state, the duplicate warning and `ares tmux`; `ssh` (and `tar` there) for the `remote_hosts`. `install.sh` is idempotent, and self-migrating: it removes what the version before 2026-11-20 installed (the 30-min job, the SessionEnd hook, `ares-sync`, the skill `inject-session`). `uninstall.sh` removes everything but `~/opt/agent-resume/data/`. On the NAS (the development home since 2026-11-22): `bash ~/dev/agent-resume/install.sh`; on the Mac: `dev-install agent-resume` (my-setup: from GitHub).
+Requires `fzf` and `python3`, and agent-tracker for the session state, the duplicate warning and `ares tmux`; `ssh` (and `tar` there) for the `remote_hosts`. `install.sh` is idempotent, and self-migrating: it removes what the version before 2026-11-20 installed (the 30-min job, the SessionEnd hook, `ares-sync`, the skill `inject-session`). `uninstall.sh` removes everything but `~/opt/agent-resume/data/`. On the VM and the NAS: `bash tools/deploy_remote.sh` from the Mac's checkout (a git bundle over ssh, no GitHub needed).
 
 | Artifact | Destination |
 |---|---|
