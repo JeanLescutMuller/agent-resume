@@ -349,7 +349,7 @@ ares sync [--host H] [--dry-run] [--since-days N] [--max-size-mb N] [--uuid U[,U
 
 The job `agent-resume.sync` (`src/sync.sh`, job-runner): the Mac only, a LaunchAgent every 5 min (`StartInterval` 300, launchd catches up after a sleep), running `ares sync`; its status on the phone dashboard is the `sync:` line; exit 3 (the NAS away) and 5 are `SKIP`, not failures. `install.sh` writes it when `sync_hosts` is set in the Mac's `data/settings.json` and removes it when that is empty; `uninstall.sh` removes it. Dashboard settings: `src/sync.conf` (red after 3 days without a sync).
 
-Not done: `session_start.py` does not warn when the uuid it starts is live on another machine (it would need an ssh at each start; `ares sync` and `ares resume` warn instead). The VM was never a sync host; it was retired on 2026-11-23 (task VR of `~/dev/data-reorganisation`). Another machine is one entry in `sync_hosts`.
+Not done: `session_start.py` does not warn when the uuid it starts is live on another machine (it would need an ssh at each start; `ares sync` and `ares resume` warn instead). The VM was never a sync host; it was retired on 2026-11-23 (task VR of `~/dev/infra/data-reorganisation`). Another machine is one entry in `sync_hosts`.
 
 ---
 
