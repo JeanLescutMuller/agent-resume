@@ -8,7 +8,7 @@
 # Usage: bash test/test_restore_rules.sh       Reads: src/ares. Writes: a mktemp sandbox only.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-GUARD=/Users/jeanlescut/dev/agent-tracker/tests/run_with_test_tmux.sh
+GUARD=/Users/jeanlescut/dev/agents/agent-tracker/tests/run_with_test_tmux.sh
 [ -n "${TEST_TMUX_SOCKET:-}" ] || exec bash "$GUARD" bash "$0" "$@"
 S=$(mktemp -d)
 export HOME="$S/home" CLAUDE_CONFIG_DIR="$S/home/.claude" AGENT_TRACKER_HOME="$S/home/opt/agent-tracker"

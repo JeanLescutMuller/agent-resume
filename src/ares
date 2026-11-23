@@ -1032,6 +1032,28 @@ def pick_session(opts):
 # So a session no longer has to resume in the folder of its transcript's project slug (decoded from the slug until
 # 2026-11-20): it resumes in the last folder it ran in (the user, 2026-11-20).
 
+_DEV_RE = re.compile(r"^(?P<base>.*?/dev)/(?P<repo>[^/]+)(?P<rest>(?:/.*)?)$")
+_DEV_CATEGORIES = ("agents", "infra", "professional", "personal")
+
+
+def relocated_dir(wd):
+    """`wd` when it exists, else the same repo folder in the other ~/dev layout (flat ~/dev/<repo> before the
+    projects restructure, ~/dev/<category>/<repo> after; both are tried while the move happens), else None."""
+    if not wd:
+        return None
+    if os.path.isdir(wd):
+        return wd
+    m = _DEV_RE.match(wd)
+    if m and m["repo"] not in _DEV_CATEGORIES:
+        for cand in sorted(glob.glob(f"{m['base']}/*/{m['repo']}{m['rest']}")):
+            if os.path.isdir(cand):
+                return cand
+    m = re.match(r"^(?P<base>.*?/dev)/(?:%s)/(?P<repo>[^/]+)(?P<rest>(?:/.*)?)$" % "|".join(_DEV_CATEGORIES), wd)
+    if m and os.path.isdir(f"{m['base']}/{m['repo']}{m['rest']}"):
+        return f"{m['base']}/{m['repo']}{m['rest']}"
+    return None
+
+
 def resume_dir(doc):
     """The folder a session resumes in: the last one it ran in (agent-tracker's newest start, else the transcript's
     first cwd) when it still exists, else the current folder. A session of another machine: that folder as is, else
@@ -1039,7 +1061,16 @@ def resume_dir(doc):
     wd = doc.get("latest_working_dir") or doc.get("initial_working_dir")
     if doc.get("_host"):
         return wd or "~"
-    return wd if wd and os.path.isdir(wd) else os.getcwd()
+    return relocated_dir(wd) or os.getcwd()
+
+
+def _remote_alt_cd(wd):
+    """` || cd <the same repo in the other ~/dev layout>` for a flat folder under a `dev` folder, tried on the remote
+    machine (the category folder is a glob its shell expands); else ''. Both layouts work while the move happens."""
+    m = _DEV_RE.match(wd)
+    if m and m["repo"] not in _DEV_CATEGORIES and not wd.startswith("~"):
+        return f" || cd {shlex.quote(m['base'])}/*/{shlex.quote(m['repo'] + m['rest'])} 2>/dev/null"
+    return ""
 
 
 def resume_shell_cmd(doc, agent_cmd):
@@ -1047,10 +1078,11 @@ def resume_shell_cmd(doc, agent_cmd):
     one of another machine, the same there over `ssh -t` (its own folder test: a gone folder falls back to ~).
     `claude` is my-setup's account selector on every machine (~/.local/bin/claude, 2026-11-20)."""
     host = doc.get("_host")
-    wd = shlex.quote(resume_dir(doc))
+    wd_raw = resume_dir(doc)
+    wd = shlex.quote(wd_raw)
     if not host:
         return f"cd {wd} && {agent_cmd}"
-    remote = f'PATH="$HOME/.local/bin:$PATH"; cd {wd} 2>/dev/null || cd; {agent_cmd}'
+    remote = f'PATH="$HOME/.local/bin:$PATH"; cd {wd} 2>/dev/null{_remote_alt_cd(wd_raw)} || cd; {agent_cmd}'
     return f"ssh -t {shlex.quote(host)} {shlex.quote(remote)}"
 
 
@@ -2029,8 +2061,7 @@ def tmux_plan(include_stale, this_boot):
         # `cd <dir> && claude --resume <uuid>`, in the last folder the session ran in (as `ares resume`):
         # agent-tracker's start cwd of that run, else its last seen cwd, else ~ (any folder works: resume_dir).
         wd = start.get("cwd") or seen.get("cwd")
-        if not (wd and os.path.isdir(wd)):
-            wd = HOME
+        wd = relocated_dir(wd) or HOME
         r["cmd"] = f"cd {shlex.quote(wd)} && claude --resume {shlex.quote(r['uuid'])}"
         l_cand.append(r)
 
@@ -2173,8 +2204,7 @@ def _is_claude(p):
 
 def _pane_dir(p):
     """The folder a planned pane's shell starts in: its saved folder when it still exists, else ~."""
-    wd = (p or {}).get("cwd")
-    return wd if wd and os.path.isdir(wd) else HOME
+    return relocated_dir((p or {}).get("cwd")) or HOME
 
 
 def _applescript_str(s):

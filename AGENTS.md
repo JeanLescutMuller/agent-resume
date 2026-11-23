@@ -1,6 +1,6 @@
 # agent-resume (`ares`; was agent-session-manager, `asm`)
 
-Development home: Mac (`~/dev/agent-resume`; the NAS has no copy, it is installed there with `bash tools/deploy_remote.sh` from here): the sync between machines must be run by the Mac, which always reaches the NAS, while the NAS cannot know whether the Mac is reachable (the user, 2026-11-22; why, in the user's words: `DEV_DOC.md` D2b).
+Development home: Mac (`~/dev/agents/agent-resume`; the NAS has no copy, it is installed there with `bash tools/deploy_remote.sh` from here): the sync between machines must be run by the Mac, which always reaches the NAS, while the NAS cannot know whether the Mac is reachable (the user, 2026-11-22; why, in the user's words: `DEV_DOC.md` D2b).
 
 Find and resume past Claude Code and Codex sessions from any folder and machine (`ares resume`), copy transcripts both ways Mac ⇄ NAS (`ares sync`, every 5 min), restore the tmux setup after a crash (`ares tmux`). Around agent-tracker (its `DESIGN.md` §10): it records, agent-resume finds and resumes, claude-close-keep-screen closes.
 

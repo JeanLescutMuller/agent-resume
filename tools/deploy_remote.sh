@@ -5,7 +5,7 @@
 # /tmp (left for the OS); locally, the install logs in $LOG_DIR (default: ~/opt/agent-resume/logs/deploy_remote/).
 # Usage: bash tools/deploy_remote.sh [host...]   (default: babisnas)
 # Never the VM H-Frank-1 (refused): it is being given up, and its deploys kept switching services back on there
-# (task V7 of ~/dev/data-reorganisation, 2026-11-22).
+# (task V7 of ~/dev/infra/data-reorganisation, 2026-11-22).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 LOG_DIR=${LOG_DIR:-$HOME/opt/agent-resume/logs/deploy_remote}
