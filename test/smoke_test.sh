@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # smoke_test.sh - Non-destructive health check for an agent-resume (ares) install.
 #
-# Run this on each machine (Mac, VM, NAS) to confirm indexing, the SessionStart hook and the other machines
+# Run this on each machine (Mac, NAS) to confirm indexing, the SessionStart hook and the other machines
 # (remote_hosts) are actually working, not just installed. Read-only / additive:
 #   - never deletes or overwrites real index files, and never writes agent-tracker's files
 #     (the duplicate-warning check uses a temporary $AGENT_TRACKER_HOME of its own)

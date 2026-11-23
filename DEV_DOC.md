@@ -295,7 +295,7 @@ Removed on 2026-11-20: the "Cross-machine resume" and "Working directory changed
 
 Since 2026-11-20 (the user), replacing `ares-sync` (an index-only, hub-and-spoke sync over ssh with a 30-min job, configured on no machine):
 
-- `remote_hosts` (settings): the ssh names of the other machines (the Mac: `["H-Frank-1", "babisnas"]`; empty on the VM and the NAS, which cannot reach the Mac).
+- `remote_hosts` (settings): the ssh names of the other machines (the Mac: `["babisnas"]`; empty on the NAS, which cannot reach the Mac).
 - At each `ares resume`, at the same time as the local refresh, and in parallel for every host (`refresh_all`, `_pull_one`): one `ssh <host>` that runs `~/opt/agent-resume/bin/ares reindex` there (~0.4 s, VM and NAS, 2026-11-20) and sends back its `indexes/` as a `.tar.gz` (`hidden/` left out); it replaces `data/remote/<host>/` whole (a session gone there goes here too): a one-way, read-only copy. Not rsync: the Mac's `/usr/bin/rsync` (openrsync) gets "invalid path" from the NAS's rsync 3.4.1. `ConnectTimeout=3`, `BatchMode=yes`, 15 s per host. A failure leaves the last copy and prints `⚠ <host> unreachable`.
 - Search reads `data/indexes/` and every `data/remote/<host>/` (`index_dirs`); each doc is tagged `_host` (None: this machine).
 - A session of another machine resumes there (`resume_shell_cmd`): `ssh -t <host> 'PATH="$HOME/.local/bin:$PATH"; cd <last folder> 2>/dev/null || cd; claude [--dangerously-skip-permissions] --resume <uuid> ...'`. The permission mode comes from the index (`permission_mode`, since 2026-11-20). Since 2026-11-22 this is the fallback for the sessions outside the scope of `ares sync` (R6.7): those in its scope have a transcript copy here and resume here; a session in both indexes is shown once, from the newer copy (this machine's on a tie).
@@ -349,7 +349,7 @@ ares sync [--host H] [--dry-run] [--since-days N] [--max-size-mb N] [--uuid U[,U
 
 The job `agent-resume.sync` (`src/sync.sh`, job-runner): the Mac only, a LaunchAgent every 5 min (`StartInterval` 300, launchd catches up after a sleep), running `ares sync`; its status on the phone dashboard is the `sync:` line; exit 3 (the NAS away) and 5 are `SKIP`, not failures. `install.sh` writes it when `sync_hosts` is set in the Mac's `data/settings.json` and removes it when that is empty; `uninstall.sh` removes it. Dashboard settings: `src/sync.conf` (red after 3 days without a sync).
 
-Not done: `session_start.py` does not warn when the uuid it starts is live on another machine (it would need an ssh at each start; `ares sync` and `ares resume` warn instead). The VM (`H-Frank-1`) is not a sync host: it is being given up (task V7 of `~/dev/data-reorganisation`); adding it is one entry in `sync_hosts`.
+Not done: `session_start.py` does not warn when the uuid it starts is live on another machine (it would need an ssh at each start; `ares sync` and `ares resume` warn instead). The VM was never a sync host; it was retired on 2026-11-23 (task VR of `~/dev/data-reorganisation`). Another machine is one entry in `sync_hosts`.
 
 ---
 
@@ -363,7 +363,7 @@ Not done: `session_start.py` does not warn when the uuid it starts is live on an
 | `src/sync.sh`, `src/sync.conf` | R6.7: the job agent-resume.sync (job-runner entrypoint) and its dashboard settings |
 | `src/session_start.py`, `src/codex-plugin/` | R6.3: the hook, and the Codex plugin that registers it for Codex |
 | `test/sandbox_test.sh`, `test/sync_test.sh`, `test/make_fixtures.py`, `test/smoke_test.sh` | tests: `TESTING.md` |
-| `tools/token_cost.sh`, `tools/deploy_remote.sh` | the code's cost in tokens (skill code-minimization); deploying HEAD to the NAS (a git bundle over ssh; refuses the VM since 2026-11-22) |
+| `tools/token_cost.sh`, `tools/deploy_remote.sh` | the code's cost in tokens (skill code-minimization); deploying HEAD to the NAS (a git bundle over ssh) |
 
 ### Hook registration
 

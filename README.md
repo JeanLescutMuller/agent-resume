@@ -9,7 +9,7 @@ flowchart LR
   R["ares"] --> RS["ares resume<br/>(refresh changed entries, search, resume)"]
   R --> RT["ares tmux<br/>(after a crash)"]
   R --> X["index<br/>~/opt/agent-resume/data/indexes/"]
-  RS -->|ssh: reindex there, its index sent back| V["other machines<br/>(remote_hosts: VM, NAS)"]
+  RS -->|ssh: reindex there, its index sent back| V["other machines<br/>(remote_hosts: NAS)"]
   R --> SY["ares sync<br/>(the Mac, every 5 min)"]
   SY <-->|ssh: transcripts created or extended, both ways| N["sync_hosts<br/>(the NAS)"]
 ```
@@ -36,7 +36,7 @@ ares indexes **all** local sessions across **all** project directories into a si
 
 ### 2. Sessions of Other Machines (optional)
 
-List the other machines in `remote_hosts` (`~/opt/agent-resume/data/settings.json`, their ssh names, e.g. `["H-Frank-1", "babisnas"]`). Then each `ares resume`, at the same time as it refreshes this machine's index:
+List the other machines in `remote_hosts` (`~/opt/agent-resume/data/settings.json`, their ssh names, e.g. `["babisnas"]`). Then each `ares resume`, at the same time as it refreshes this machine's index:
 
 - runs `ares reindex` on each of them over ssh (~0.4 s), then sends its index back (a `.tar.gz`, in the same ssh call), one way, into `~/opt/agent-resume/data/remote/<host>/` (read-only copies; their non-interactive entries left out);
 - searches them with this machine's sessions, in one picker;
@@ -234,7 +234,7 @@ git clone <repo-url> agent-resume
 bash agent-resume/install.sh
 ```
 
-Requires `fzf` and `python3`, and agent-tracker for the session state, the duplicate warning and `ares tmux`; `ssh` (and `tar` there) for the `remote_hosts`; job-runner (`~/opt/job-runner/lib.sh`) for the job `agent-resume.sync`. `install.sh` is idempotent, and self-migrating: it removes what the version before 2026-11-20 installed (the 30-min job, the SessionEnd hook, `ares-sync`, the skill `inject-session`). `uninstall.sh` removes everything but `~/opt/agent-resume/data/`. On the VM and the NAS: `bash tools/deploy_remote.sh` from the Mac's checkout (a git bundle over ssh, no GitHub needed).
+Requires `fzf` and `python3`, and agent-tracker for the session state, the duplicate warning and `ares tmux`; `ssh` (and `tar` there) for the `remote_hosts`; job-runner (`~/opt/job-runner/lib.sh`) for the job `agent-resume.sync`. `install.sh` is idempotent, and self-migrating: it removes what the version before 2026-11-20 installed (the 30-min job, the SessionEnd hook, `ares-sync`, the skill `inject-session`). `uninstall.sh` removes everything but `~/opt/agent-resume/data/`. On the NAS: `bash tools/deploy_remote.sh` from the Mac's checkout (a git bundle over ssh, no GitHub needed).
 
 | Artifact | Destination |
 |---|---|
@@ -254,7 +254,7 @@ Created by `install.sh` on first install, never overwritten afterward. All keys 
 | `local_projects_dir` | `~/.claude/projects` | Where Claude Code writes session files locally |
 | `local_index_dir` | `~/opt/agent-resume/data/indexes` | Where `ares reindex` writes the JSON index locally |
 | `ignore_path_substrings` | `[]` | List of substrings; any `.jsonl` whose path contains one is skipped entirely during reindex. Use this to exclude sessions from a specific tool, bot, or scratch directory (e.g. `["/agent-scratch/"]`) without a code change. |
-| `remote_hosts` | `[]` | ssh names of the other machines whose sessions `ares resume` also shows, and resumes there (the Mac: `["H-Frank-1", "babisnas"]`). Each needs agent-resume installed in `~/opt/agent-resume`. |
+| `remote_hosts` | `[]` | ssh names of the other machines whose sessions `ares resume` also shows, and resumes there (the Mac: `["babisnas"]`). Each needs agent-resume installed in `~/opt/agent-resume`. |
 | `codex_sessions_dir` | `~/.codex/sessions` | Where Codex CLI writes session files locally |
 | `codex_session_index_file` | `~/.codex/session_index.jsonl` | Codex's own title index (Codex stores titles separately from the transcript, unlike Claude Code) |
 | `codex_enabled` | `null` | `null` = auto-detect (enabled iff `codex_sessions_dir` exists); set `true`/`false` to force it either way |

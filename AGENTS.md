@@ -29,7 +29,7 @@ bash test/sync_test.sh             # ares sync alone (also run by sandbox_test.s
 ares sync --dry-run                # the plan of a real sync (read-only), from the Mac
 bash test/smoke_test.sh --offline  # health check of a real install (read-only)
 bash install.sh                    # deploy to ~/opt/agent-resume on the Mac
-bash tools/deploy_remote.sh        # deploy HEAD to the NAS (a git bundle over ssh: no push needed; refuses the VM, 2026-11-22)
+bash tools/deploy_remote.sh        # deploy HEAD to the NAS (a git bundle over ssh: no push needed)
 bash tools/token_cost.sh           # the code's cost in tokens (skill code-minimization)
 ```
 
