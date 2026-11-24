@@ -87,7 +87,7 @@ cat > "$HOME/.claude/settings.json" <<'EOF'
                    {"matcher": "", "hooks": [{"type": "command", "command": "agent-tracker hook start"}]}],
   "SessionEnd":   [{"matcher": "", "hooks": [{"type": "command", "command": "bash \"$HOME/opt/agent-resume/session_end.sh\""}]},
                    {"matcher": "", "hooks": [{"type": "command", "command": "agent-tracker hook end"}]}],
-  "Stop":         [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/opt/agent-chrome/kit/hook.py"}]}]}}
+  "Stop":         [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/opt/chrome-gateways/agent-gateway/hook.py"}]}]}}
 EOF
 bash "$REPO/install.sh" >>"$LOG" 2>&1 && bash "$REPO/install.sh" >>"$LOG" 2>&1; check "install.sh exits 0 twice" test $? -eq 0
 check "the former job, files and links are gone; the data stays" python3 - <<EOF
@@ -121,7 +121,7 @@ cmds = lambda ev: [x["command"] for g in h.get(ev, []) for x in g["hooks"]]
 assert sum("agent-resume/session_start.py" in c for c in cmds("SessionStart")) == 1, cmds("SessionStart")
 assert cmds("SessionEnd") == ["agent-tracker hook end"], cmds("SessionEnd")
 assert "agent-tracker hook start" in cmds("SessionStart")
-assert cmds("Stop") == ["python3 ~/opt/agent-chrome/kit/hook.py"]
+assert cmds("Stop") == ["python3 ~/opt/chrome-gateways/agent-gateway/hook.py"]
 EOF
 check "no launchctl / systemctl / loginctl call (sandbox)" bash -c "! grep -qE '^(launchctl|systemctl|loginctl)\|' '$FAKE_LOG' 2>/dev/null"
 check "codex, with CODEX_HOME in the sandbox: agent-resume@agent-resume-local added" \
