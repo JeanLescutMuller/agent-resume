@@ -1002,7 +1002,9 @@ def pick_session(opts):
                 "--no-multi",
             ],
             input=fzf_input,
-            capture_output=True,
+            # stdout only: fzf < 0.42 (the NAS's Debian 0.38) draws its --height picker on stderr,
+            # so a captured stderr left it running invisibly (2026-11-24)
+            stdout=subprocess.PIPE,
             text=True,
         )
     except FileNotFoundError:
