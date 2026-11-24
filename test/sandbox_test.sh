@@ -305,6 +305,7 @@ check "no keywords: --max-scan 2 keeps the 2 most recent of all" \
 cat > "$S/fakebin/fzf" <<'EOF'
 #!/bin/bash
 cat > "$FAKE_FZF_IN"
+echo "FAKE-FZF-PICKER" >&2   # fzf < 0.42 (the NAS's 0.38) draws its --height picker on stderr
 [ -n "${FAKE_FZF_CANCEL:-}" ] && exit 130
 head -n 1 "$FAKE_FZF_IN"
 EOF
@@ -316,7 +317,9 @@ check "CLI: --host --agent -u reach the search (fzf gets c2 only); a codex sessi
 out=$(ares resume --state pending --tmux work --print-cmd FILTRWORD 2>>"$LOG")
 check "CLI: --state --tmux reach the search (fzf gets c1 only); claude --resume with its title" \
     bash -c "[ '$(fzf_uuids)' = 'c1 ' ] && grep -qF \"cd $S/proj && claude --resume $C1 '/rename Filter 1'\" <<<\"\$1\"" _ "$out"
-ares resume --print-cmd NUMBER Filtrword 2>>"$LOG" >/dev/null
+ares resume --print-cmd NUMBER Filtrword 2>"$S/picker.err" >/dev/null; cat "$S/picker.err" >>"$LOG"
+check "the picker reaches the terminal: fzf's stderr is not captured (an fzf < 0.42 drew it there: invisible on the NAS)" \
+    grep -q FAKE-FZF-PICKER "$S/picker.err"
 check "CLI: several keywords, any order and case, no filter -> fzf gets c1 c2 c3 (c3 shown, though not resumable)" \
     test "$(fzf_uuids)" = "c1 c2 c3 "
 check "--fork, claude: claude --resume <uuid> --fork-session" \

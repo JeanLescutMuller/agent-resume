@@ -475,6 +475,22 @@ cleanup_dup
 trap - EXIT
 
 # ---------------------------------------------------------------------------
+section "Picker (ares resume with this machine's real fzf, in a pseudo-terminal)"
+
+# The NAS's fzf 0.38 drew its picker on stderr, which ares captured: `ares resume` looked stuck there (2026-11-24).
+# --offline: an ssh that fails at once, so the pull of remote_hosts never reaches the network.
+PTY_BIN=$(mktemp -d)
+printf '#!/bin/sh\nexit 255\n' >"$PTY_BIN/ssh"; chmod +x "$PTY_BIN/ssh"
+$OFFLINE && pty_path="$PTY_BIN:$PATH" || pty_path="$PATH"
+pty_out=$(PATH="$pty_path" python3 "$REPO_ROOT/test/picker_pty.py" "$(command -v ares)" 30 2>&1); rc=$?
+rm -f "$PTY_BIN/ssh"; rmdir "$PTY_BIN"
+case $rc in
+    0) pass "ares resume shows its picker on the terminal (fzf $(fzf --version 2>/dev/null | cut -d' ' -f1))" ;;
+    2) warn "no session to show: the picker was not checked" ;;
+    *) fail "ares resume showed no picker within 30 s (fzf $(fzf --version 2>/dev/null | cut -d' ' -f1)); its terminal ended with: ${pty_out//$'\n'/ }" ;;
+esac
+
+# ---------------------------------------------------------------------------
 section "Summary"
 
 echo ""
